@@ -1,6 +1,6 @@
 # BMSIP 2026 Internship
 
-## Project: Immune changes in tumor tissue and lymph nodes associated with aggressive non-small cell lung cancer (NSCLC)
+**Project: Immune changes in tumor tissue and lymph nodes associated with aggressive non-small cell lung cancer (NSCLC)**
 
 PIs: Dr. Campbell and Dr. Sarah Mazzilli
 
