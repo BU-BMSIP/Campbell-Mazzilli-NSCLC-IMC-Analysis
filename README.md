@@ -1,5 +1,6 @@
 # BMSIP 2026 Internship
-**Project:** Immune changes in tumor tissue and lymph nodes associated with aggressive non-small cell lung cancer (NSCLC)  
+**Project:** Immune changes in tumor tissue and lymph nodes associated with 
+aggressive non-small cell lung cancer (NSCLC)  
 **PIs:** Dr. Josh Campbell & Dr. Sarah Mazzilli  
 **Interns:** Vaidehi Gupta & Tazein Shah  
 **Start Date:** May 11, 2026  
