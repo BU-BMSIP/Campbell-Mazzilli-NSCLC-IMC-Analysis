@@ -1,0 +1,204 @@
+---
+title: "Raw IMC Data QC: Pixel Intensity Distributions"
+author: ""
+date: "05-27-2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 14, fig.height = 8)
+set.seed(42)
+```
+
+## Overview
+
+This notebook visualizes pixel-level ion count distributions from raw
+IMC TXT files — **before any steinbock preprocessing**. Each TXT file is
+one ROI; rows are pixels, columns are already labeled with both protein
+name and metal tag (e.g. `SMA(Pr141Di)`), so no external panel file is
+needed.
+
+------------------------------------------------------------------------
+
+## 1. Load Libraries
+
+```{r libraries}
+library(tidyverse)
+library(ggridges)
+
+dir.create("images", showWarnings = FALSE)
+```
+
+------------------------------------------------------------------------
+
+## 2. Read All TXT Files and Combine
+
+TXT files live in the raw data directory, one per ROI. Column names
+already contain the protein name and metal tag (e.g. `SMA(Pr141Di)`), so
+no renaming is needed. We drop acquisition metadata and non-biological
+channels, apply arcsinh transformation (cofactor = 1), and stack
+everything into a single long-format tibble.
+
+```{r read-txt}
+cofactor <- 1
+
+txt_files <- list.files(
+  path       = "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/Data/Imaging/IMC/Tumor/PardeeTumorAblations/Patient_14T",
+  pattern    = "\\.txt$",
+  recursive  = TRUE,
+  full.names = TRUE
+)
+
+# acquisition metadata and non-biological channels to drop
+exclude_cols <- c("Start_push", "End_push", "Pushes_duration",
+                  "X", "Y", "Z",
+                  "DNA191(Ir191Di)", "DNA193(Ir193Di)", "Membrane(Pt196Di)")
+
+raw_pixels <- map_dfr(txt_files, function(f) {
+  df <- read_tsv(f, show_col_types = FALSE)
+
+  # downsample to 50k pixels per ROI before any heavy operations
+  df <- df %>% slice_sample(n = 50000)
+
+  # drop metadata and non-biological channels
+  df <- df %>% select(-any_of(exclude_cols))
+
+  # arcsinh transform all remaining numeric columns
+  df <- df %>% mutate(across(where(is.numeric), ~asinh(. / cofactor)))
+
+  # tag with ROI label and patient ID parsed from filename
+  fname      <- tools::file_path_sans_ext(basename(f))
+  df$roi     <- fname
+  df$patient <- str_extract(fname, "^[^_]+")  # everything before first underscore
+  df
+})
+
+cat("Total pixels loaded:", nrow(raw_pixels), "\n")
+cat("Patients found:", n_distinct(raw_pixels$patient), "\n")
+cat("ROIs found:", n_distinct(raw_pixels$roi), "\n")
+```
+
+------------------------------------------------------------------------
+
+## 3. Pivot to Long Format
+
+```{r pivot}
+plot_long <- raw_pixels %>%
+  pivot_longer(
+    cols      = -c(roi, patient),
+    names_to  = "marker",
+    values_to = "intensity"
+  )
+
+single_roi <- unique(plot_long$roi)[1]
+```
+
+------------------------------------------------------------------------
+
+## 4. Histograms: All Channels, One ROI
+
+A quick per-channel histogram faceted view for a single ROI to get an
+overview of the intensity landscape.
+
+```{r histogram-single-roi, fig.height=12}
+single_roi <- unique(plot_long$roi)[1]
+
+plot_long %>%
+  filter(roi == single_roi) %>%
+  ggplot(aes(x = intensity)) +
+  geom_histogram(bins = 60, fill = "steelblue", color = "white", linewidth = 0.2) +
+  facet_wrap(~marker, scales = "free_y", ncol = 6) +
+  labs(
+    title    = paste0("Pixel intensity distributions (arcsinh) — ", single_roi),
+    subtitle = "Each panel = one protein marker; x-axis = arcsinh(count / 1)",
+    x        = "arcsinh intensity",
+    y        = "Pixel count"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    strip.text  = element_text(face = "bold", size = 8),
+    axis.text.x = element_text(size = 7)
+  )
+```
+
+------------------------------------------------------------------------
+
+## 5. Density Plots: Selected Markers Across All ROIs
+
+Ridge plots let you compare intensity distributions across ROIs for a
+few markers of interest, which is useful for spotting between-ROI batch
+effects or acquisition issues.
+
+```{r ridgeplot, fig.height=20}
+p <- plot_long %>%
+  ggplot(aes(x = intensity, y = roi, fill = patient)) +
+  geom_density_ridges(alpha = 0.6, scale = 1.2, rel_min_height = 0.01) +
+  facet_wrap(~marker, scales = "free_x", ncol = 4) +
+  labs(
+    title    = "Per-ROI pixel intensity distributions (all markers)",
+    subtitle = "arcsinh(count / 1); each ridge = one ROI, color = patient",
+    x        = "arcsinh intensity",
+    y        = NULL,
+    fill     = "Patient"
+  ) +
+  theme_ridges(font_size = 9) +
+  theme(strip.text = element_text(face = "bold", size = 7))
+
+p
+ggsave("images/02_ridgeplot_all_markers.png", plot = p, width = 14, height = 40, dpi = 150)
+```
+
+------------------------------------------------------------------------
+
+## 6. Density Overlay: All Channels for One ROI
+
+An alternative view: all markers overlaid in a single density plot to
+compare the signal spread across channels. Useful for spotting channels
+with no signal or unusually high background.
+
+```{r density-overlay, fig.height=5}
+plot_long %>%
+  filter(roi == single_roi) %>%
+  ggplot(aes(x = intensity, color = marker)) +
+  geom_density(linewidth = 0.5, alpha = 0.8) +
+  labs(
+    title    = paste0("All-channel density overlay — ", single_roi),
+    subtitle = "Channels with no biological signal will hug x = 0",
+    x        = "arcsinh intensity",
+    y        = "Density"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "right",
+        legend.text     = element_text(size = 7),
+        legend.key.size = unit(0.4, "cm"))
+```
+
+------------------------------------------------------------------------
+
+## 7. Summary Table: Per-Channel Median and % Zero Pixels
+
+A numeric summary to flag channels with very low signal (high % zero
+pixels) or unexpected medians — useful for early QC before committing to
+preprocessing.
+
+```{r summary-table}
+plot_long %>%
+  group_by(marker) %>%
+  summarise(
+    median_intensity = round(median(intensity, na.rm = TRUE), 3),
+    pct_zero         = round(mean(intensity == 0, na.rm = TRUE) * 100, 1),
+    max_intensity    = round(max(intensity, na.rm = TRUE), 2),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(pct_zero)) %>%
+  knitr::kable(caption = "Per-channel pixel intensity summary (arcsinh-transformed)")
+```
