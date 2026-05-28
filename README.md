@@ -13,7 +13,7 @@ and spatial cellular niches within the tumor microenvironment, compare findings
 across disease stages (IA vs. IB–IIIA), and correlate tumor immune features with 
 previously characterized lymph node findings.
 
-## Timeline
+## Timeline (subject to change)
 **Week 1-2 — Data Exploration**
 - Review pre-print biological background and IMC methodology
 - Visualize raw data using MCDViewer (subset of ROIs)
