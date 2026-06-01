@@ -17,8 +17,10 @@ previously characterized lymph node findings.
 ## Timeline (subject to change)
 **Week 1-2 — Data Exploration**
 - Review pre-print biological background and IMC methodology
-- Visualize raw data using MCDViewer (subset of ROIs)
-- Generate histograms and density plots, check for artifacts
+- Visualize the raw data using ggplot 
+  - Generate histograms and density plots of raw pixel intensity, check for artifacts
+  - Note: Originally we were going to visualize the data with MCDViewer, but it is a Windows-only application,
+    so we switched to ggplot in R because it's easier to use.
 
 **Week 3-5 — Preprocessing & QC**
 - Run steinbock pipeline on tumor samples (preprocessing → segmentation → feature extraction)
