@@ -1,0 +1,432 @@
+---
+title: 'Patient 14 Post-Steinbock Visualization -> Arcsinh'
+author: ''
+date: "06-10-2026"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 14, fig.height = 8)
+
+set.seed(42)
+```
+
+## Overview
+
+This notebook is to visualize the post-steinbock IMC results, checking the cell segmentation, single-cell expression of the ROIs across patient 14, and the pixel visualization.
+
+**With arcsinh transformation**
+
+1.  Visual overlay of mask outlines on composite channel images
+2.  Spatial pixel-level heatmaps of selected markers across all ROIs
+3.  Distribution of cell areas per ROI (to catch over/under-segmentation)
+4.  Fraction of image area covered by cells per ROI
+5.  Single-cell expression of all ROIs in heatmap form
+
+------------------------------------------------------------------------
+
+## 1. Load Libraries
+
+```{r libraries}
+library(imcRtools)
+library(cytomapper)
+library(tidyverse)
+library(dittoSeq)
+library(viridis)
+library(scater)
+library(patchwork)
+library(RColorBrewer)
+```
+
+------------------------------------------------------------------------
+
+## 2. Read in Steinbock Data
+
+```{r read-data}
+steinbock_path <- "/restricted/projectnb/camplab/home/tshah20/tumor_IMC/patient14_steinbock"
+
+spe <- read_steinbock(steinbock_path)
+spe
+```
+
+```{r process-spe}
+# set informative column names: image_cellID
+colnames(spe) <- paste0(spe$sample_id, "_", spe$ObjectNumber)
+
+# extract patient and ROI from sample_id
+spe$patient_id <- str_extract(spe$sample_id, "^[^_]+")
+spe$ROI        <- spe$sample_id
+
+# arcsinh transform (cofactor = 1, standard for IMC)
+assay(spe, "exprs") <- asinh(counts(spe) / 1)
+
+# flag biological channels (exclude DNA and membrane channels used for segmentation)
+rowData(spe)$use_channel <- !grepl("DNA191|DNA193|Membrane", rownames(spe))
+
+cat("Cells loaded:", ncol(spe), "\n")
+cat("ROIs:", n_distinct(spe$sample_id), "\n")
+cat("Channels:", nrow(spe), "\n")
+
+# confirm colData column names for image dimensions
+cat("\ncolData columns:\n")
+print(colnames(colData(spe)))
+```
+
+------------------------------------------------------------------------
+
+## 3. Load Multichannel Images and Segmentation Masks
+
+```{r load-images}
+images <- loadImages(file.path(steinbock_path, "img/"))
+masks  <- loadImages(file.path(steinbock_path, "masks_deepcell/"), as.is = TRUE)
+
+# read panel to get only the channels written to the image stack (keep == 1)
+panel         <- read.csv(file.path(steinbock_path, "panel_GATA3.csv"))
+kept_channels <- panel$name[panel$keep == 1]
+
+cat("Channels in images:", length(channelNames(images)), "\n")
+cat("Kept channels in panel:", length(kept_channels), "\n")
+
+# assign channel names from panel kept channels only
+channelNames(images) <- kept_channels
+
+# link images and masks to SPE via sample_id
+mcols(images)$sample_id <- names(images)
+mcols(masks)$sample_id  <- names(masks)
+
+cat("Images loaded:", length(images), "\n")
+cat("Masks loaded:", length(masks), "\n")
+cat("\nChannel names:\n")
+print(channelNames(images))
+```
+
+------------------------------------------------------------------------
+
+## 4. Normalize Images for Display
+
+Pixel intensities are normalized per image to [0, 1], then clipped at
+0.2 to bring out dim signals. (Does not affect downstream, only visuals)
+
+```{r normalize}
+images_norm <- cytomapper::normalize(images, separateImages = TRUE)
+images_norm <- cytomapper::normalize(images_norm, inputRange = c(0, 0.2))
+```
+
+------------------------------------------------------------------------
+
+## 5. Overlay Cell Masks on Composite Images
+
+For patient 14, we load all the ROIs with the mask outlines overlaid:
+
+- EpCAM marks tumor/epithelial cells
+- CD68 marks macrophages
+- Membrane marks cell boundaries
+- DNA191 anchors nuclei
+
+```{r plot-masks, fig.height=12}
+img_ids <- seq_len(length(images_norm))
+
+plotPixels(
+  images_norm[img_ids],
+  mask           = masks[img_ids],
+  img_id         = "sample_id",
+  missing_colour = "white",
+  colour_by = c("DNA191", "EpCAM", "CD68", "Membrane"),
+  colour    = list(
+    DNA191   = c("black", "blue"),
+    EpCAM    = c("black", "green"),
+    CD68     = c("black", "yellow"),
+    Membrane = c("black", "red")
+  ),
+  image_title = list(position = "topleft", cex = 1),
+  legend      = list(colour_by.title.cex = 0.8, colour_by.labels.cex = 0.8)
+)
+
+dev.copy(png, "images/05_mask_overlay_all_rois.png", width = 2800, height = 2800, res = 200)
+dev.off()
+```
+
+My plot looks very different from patient 12, but the cell segmentation worked and the differences seem more biological vs technical. Cells of similar types also cluster together which is a good sign.
+
+------------------------------------------------------------------------
+
+## 6. Spatial Pixel Heatmaps: All ROIs
+
+The post-steinbock files (in raw/ folder) are scaled 0-100 through the steinbock.sh code. Here we plot them at their X/Y coordinates, which provides a spatial map of marker expression across the tissue for each ROI.
+
+Pixels are downsampled to every 3rd coordinate to reduce rendering time.
+
+Markers are selected to highlight the major cell compartments: tumor (EpCAM), stroma (SMA),
+myeloid (CD68, CD163, CD1c), T cell exhaustion (FoxP3, TIM3, PD1), and a combined lineage marker (TTF1orCD16).
+
+```{r spatial-pixel-setup}
+raw_filtered_path <- "/restricted/projectnb/camplab/home/tshah20/tumor_IMC/patient14_steinbock/raw/"
+
+# read all ROI TXT files and combine
+txt_files <- list.files(raw_filtered_path, pattern = "\\.txt$", full.names = TRUE)
+
+all_rois_filtered <- map_dfr(txt_files, function(f) {
+  df <- read.delim(f, check.names = FALSE)
+  df$roi <- tools::file_path_sans_ext(basename(f))
+  df
+})
+
+cat("Total pixels loaded:", nrow(all_rois_filtered), "\n")
+cat("ROIs found:", n_distinct(all_rois_filtered$roi), "\n")
+```
+
+```{r spatial-pixel-pivot}
+focused_markers_spatial <- c(
+  "EpCAM(Nd144Di)",
+  "SMA(Pr141Di)",
+  "FoxP3(Dy162Di)",
+  "CD68(Tb159Di)",
+  "CD163(Sm147Di)",
+  "CD1c(Sm154Di)",
+  "TIM3(Nd143Di)",
+  "PD1(Ho165Di)",
+  "TTF1orCD16(Pt194Di)"
+)
+
+# downsample to every 3rd pixel per ROI for rendering
+set.seed(42)
+all_rois_sub <- all_rois_filtered %>%
+  filter(X %% 3 == 0, Y %% 3 == 0)
+
+cat("Downsampled pixels:", nrow(all_rois_sub), "\n")
+
+# pivot to long format and clean marker names for facet labels
+all_rois_long <- all_rois_sub %>%
+  select(X, Y, roi, all_of(focused_markers_spatial)) %>%
+  pivot_longer(
+    cols      = -c(X, Y, roi),
+    names_to  = "marker",
+    values_to = "intensity"
+  ) %>%
+  mutate(marker = str_extract(marker, "^[^(]+"))
+```
+
+```{r spatial-pixel-plot, fig.height=14, fig.width=12}
+rois <- unique(all_rois_long$roi)
+
+plots <- map(rois, function(r) {
+  ggplot(filter(all_rois_long, roi == r),
+         aes(x = X, y = Y, fill = intensity)) +
+    geom_tile() +
+    scale_fill_viridis_c(option = "viridis") +
+    facet_wrap(~marker, ncol = 3) +
+    labs(
+      title    = paste0("Patient 14T — ", r, " (Filtered Pixels)"),
+      subtitle = "Filtered values, 0-100 scaled, downsampled every 3rd pixel",
+      fill     = "Intensity\n(0-100)"
+    ) +
+    theme_void(base_size = 9) +
+    theme(
+      strip.text      = element_text(size = 8, face = "bold"),
+      legend.position = "bottom"
+    )
+})
+
+# print all plots in notebook
+walk(plots, print)
+
+# save each ROI as its own PNG
+walk2(plots, rois, function(p, r) {
+  ggsave(
+    paste0("images/06_", r, "_spatial_pixel_heatmap.png"),
+    plot   = p,
+    width  = 12,
+    height = 14,
+    dpi    = 150
+  )
+})
+```
+
+CD163 and PD1 seems pretty noisy across all the ROIs --> is that expected?
+
+------------------------------------------------------------------------
+
+## 7. Expression Heatmap: Sampled Cells Across All ROIs
+
+A heatmap of arcsinh-transformed marker expression across a random
+sample of cells, annotated by ROI. This gives a high-level overview of
+marker co-expression patterns and whether any ROIs show systematically
+different expression profiles before phenotyping.
+
+The color scale represents arcsinh-transformed mean pixel intensity per cell, ranging from 0 (dark purple) to 5 (yellow).
+
+```{r heatmap, fig.height=10, fig.width=10}
+cur_cells  <- sample(seq_len(ncol(spe)), min(2000, ncol(spe)))
+cell_order <- order(spe[, cur_cells]$sample_id)
+
+p_heatmap <- dittoHeatmap(
+  spe[, cur_cells[cell_order]],
+  genes          = rownames(spe)[rowData(spe)$use_channel],
+  assay          = "exprs",
+  cluster_cols   = FALSE,
+  scale          = "none",
+  heatmap.colors = viridis(100),
+  annot.by       = "sample_id",
+  annotation_colors = list(
+    sample_id = setNames(
+      colorRampPalette(brewer.pal(4, "Set1"))(n_distinct(spe$sample_id)),
+      unique(spe$sample_id)
+    )
+  )
+)
+
+png("images/07_expression_heatmap.png", width = 2400, height = 3000, res = 200)
+grid::grid.newpage()
+grid::grid.draw(p_heatmap$gtable)
+dev.off()
+```
+
+------------------------------------------------------------------------
+
+## 8. Cell Area Distribution per ROI
+
+Small cells are likely segmentation artifacts — partial cell slices or noise. The distribution below helps select a sensible area cutoff.
+
+**How to determine the exact cutoff?**
+
+```{r cell-area, fig.height=6}
+cat("Cells before area filter:", ncol(spe), "\n")
+
+dittoPlot(spe,
+          var      = "area",
+          group.by = "sample_id",
+          plots    = "boxplot") +
+  ylab("Cell area (pixels)") +
+  xlab("") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggtitle("Cell area distribution per ROI (pre-filter)")
+```
+
+```{r filter-cells, fig.height=6}
+area_threshold <- 5
+spe <- spe[, spe$area >= area_threshold]
+
+cat("Cells after area filter (>=", area_threshold, "px):", ncol(spe), "\n")
+
+dittoPlot(spe,
+          var      = "area",
+          group.by = "sample_id",
+          plots    = "boxplot") +
+  ylab("Cell area (pixels)") +
+  xlab("") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggtitle("Cell area distribution per ROI (post-filter)")
+```
+
+------------------------------------------------------------------------
+
+## 9. Fraction of Image Area Covered by Cells
+
+High cell coverage (~70-90%) is expected for dense tissue sections. Sparse coverage may indicate tissue loss or large acellular regions (e.g., vessels, necrosis).
+
+```{r cell-coverage, fig.height=5}
+cell_density <- colData(spe) %>%
+  as.data.frame() %>%
+  group_by(sample_id) %>%
+  summarise(
+    cell_area    = sum(area),
+    no_pixels    = unique(width_px) * unique(height_px),
+    covered_area = cell_area / no_pixels,
+    .groups      = "drop"
+  )
+
+ggplot(cell_density, aes(x = sample_id, y = covered_area)) +
+  geom_point(size = 3, color = "steelblue") +
+  geom_hline(yintercept = 0.7, linetype = "dashed", color = "grey50") +
+  ylim(0, 1) +
+  ylab("Fraction of image area covered by cells") +
+  xlab("") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggtitle("Image area covered by cells per ROI")
+```
+
+------------------------------------------------------------------------
+
+## 10. Dimensionality Reduction: UMAP and tSNE
+
+UMAP/tSNE projects cells to 2D --> looking to see if the ROIs mix well
+
+Marker expression is overlaid to verify that the embeddings separate biologically meaningful populations aka the differences between patient expressions
+
+```{r dimred, fig.height=12, fig.width=14}
+set.seed(220225)
+cell_sub <- sample(seq_len(ncol(spe)), min(10000, ncol(spe)))
+spe_sub  <- spe[, cell_sub]
+
+spe_sub <- runUMAP(spe_sub, subset_row = rowData(spe_sub)$use_channel, exprs_values = "exprs")
+spe_sub <- runTSNE(spe_sub, subset_row = rowData(spe_sub)$use_channel, exprs_values = "exprs")
+
+# define ROI colors
+roi_colors <- setNames(
+  colorRampPalette(brewer.pal(4, "Set1"))(n_distinct(spe$sample_id)),
+  unique(spe$sample_id)
+)
+
+p1 <- dittoDimPlot(spe_sub, var = "sample_id", reduction.use = "UMAP", size = 0.2) +
+  scale_color_manual(values = roi_colors) +
+  ggtitle("ROI on UMAP")
+
+p2 <- dittoDimPlot(spe_sub, var = "sample_id", reduction.use = "TSNE", size = 0.2) +
+  scale_color_manual(values = roi_colors) +
+  ggtitle("ROI on tSNE")
+
+(p1 + p2)
+```
+
+```{r dimred-markers, fig.height=12, fig.width=14}
+p3 <- dittoDimPlot(spe_sub, var = "EpCAM", reduction.use = "UMAP",
+                   assay = "exprs", size = 0.2) +
+  scale_color_viridis(name = "EpCAM") +
+  ggtitle("EpCAM on UMAP")
+
+p4 <- dittoDimPlot(spe_sub, var = "SMA", reduction.use = "UMAP",
+                   assay = "exprs", size = 0.2) +
+  scale_color_viridis(name = "SMA") +
+  ggtitle("SMA on UMAP")
+
+p5 <- dittoDimPlot(spe_sub, var = "CD45RO", reduction.use = "UMAP",
+                   assay = "exprs", size = 0.2) +
+  scale_color_viridis(name = "CD45RO") +
+  ggtitle("CD45RO on UMAP")
+
+p6 <- dittoDimPlot(spe_sub, var = "CD68", reduction.use = "UMAP",
+                   assay = "exprs", size = 0.2) +
+  scale_color_viridis(name = "CD68") +
+  ggtitle("CD68 on UMAP")
+
+(p3 + p4) / (p5 + p6)
+```
+
+------------------------------------------------------------------------
+
+## 11. Save Filtered SPE
+
+```{r save-spe}
+saveRDS(spe, file.path(steinbock_path, "spe_segmentation_qc.rds"))
+cat("Saved filtered SPE to", file.path(steinbock_path, "spe_segmentation_qc.rds"), "\n")
+```
+
+------------------------------------------------------------------------
+
+## Session Info
+
+```{r session-info}
+sessionInfo()
+```
