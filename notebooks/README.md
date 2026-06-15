@@ -7,6 +7,5 @@ Analysis notebooks for the IMC spatial proteomics project (Xi et al. NSCLC datas
 ```         
 notebooks/
 ├── pre_steinbock_analysis/     # Pixel-level QC prior to steinbock preprocessing
-├── post_steinbock_analysis/    # Cell-level QC and downstream analysis after steinbock + Mesmer segmentation
-└── p12_imc_pixel_dist.Rmd      # Pixel intensity distribution exploration for Patient 12 (exploratory)
+└── post_steinbock_analysis/    # Cell-level QC and downstream analysis after steinbock + Mesmer segmentation
 ```
