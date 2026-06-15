@@ -1,0 +1,437 @@
+---
+title: "Patient 12 - Pixel Filtering Comparison"
+author: "Vaidehi Gupta"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+# Setup
+```{r}
+library(ggplot2)
+library(ggridges)
+library(dplyr)
+library(reshape2)
+
+set.seed(42)
+```
+
+# Load Data
+```{r}
+data_dir_raw <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/Data/Imaging/IMC/Tumor/PardeeTumorAblations/Patient_12T/"
+
+data_dir_filtered <- "/restricted/projectnb/camplab/home/vgupta7/tumor_imc/patient12_steinbock/raw_filtered/"
+```
+
+# List files
+```{r}
+txt_files_raw      <- list.files(data_dir_raw, pattern = "\\.txt$", full.names = TRUE)
+txt_files_filtered <- list.files(data_dir_filtered, pattern = "\\.txt$", full.names = TRUE)
+
+cat("Raw files found:", length(txt_files_raw), "\n")
+cat("Filtered files found:", length(txt_files_filtered), "\n")
+```
+
+# Set marker columns (skip first 6 metadata columns)
+```{r}
+marker_cols <- colnames(read.delim(txt_files_raw[1], check.names = FALSE))[7:47]
+```
+
+# Load, sample, and reshape a set of ROI txt files
+```{r}
+load_rois <- function(txt_files, label, n_sample = 50000) {
+  all_rois <- lapply(seq_along(txt_files), function(i) {
+    df         <- read.delim(txt_files[i], check.names = FALSE)
+    df_markers <- df[, marker_cols]
+    df_sample  <- df_markers[sample(nrow(df_markers), n_sample), ]
+    df_sample$ROI <- paste0("ROI_", i)
+    df_sample
+  })
+  pixels <- do.call(rbind, all_rois)
+  pixels_long <- melt(pixels, id.vars = "ROI",
+                      variable.name = "marker",
+                      value.name    = "intensity")
+  pixels_long$dataset <- label
+  pixels_long
+}
+```
+
+# Load both raw and filtered datasets
+```{r}
+pixels_raw      <- load_rois(txt_files_raw,      label = "Raw")
+pixels_filtered <- load_rois(txt_files_filtered, label = "Filtered")
+```
+
+# Add asinh transformation to both
+```{r}
+pixels_raw      <- pixels_raw      %>% mutate(intensity_asinh = asinh(intensity / 1))
+pixels_filtered <- pixels_filtered %>% mutate(intensity_asinh = asinh(intensity / 1))
+```
+
+# Combined dataset for before/after comparison plots
+```{r}
+pixels_combined <- bind_rows(pixels_raw, pixels_filtered) %>%
+  mutate(dataset = factor(dataset, levels = c("Raw", "Filtered")))
+
+cat("Raw pixels loaded:     ", nrow(pixels_raw), "\n")
+cat("Filtered pixels loaded:", nrow(pixels_filtered), "\n")
+```
+
+# Section 1: Raw Pixels, No Transformation
+
+## Histograms (ROI 1)
+```{r fig.width=14, fig.height=16}
+roi1_raw <- pixels_raw %>% filter(ROI == "ROI_1")
+
+ggplot(roi1_raw, aes(x = intensity)) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "white", size = 0.1, alpha = 0.8) +
+  facet_wrap(~ marker, scales = "free", ncol = 5) +
+  labs(
+    title    = "Pixel Intensity Landscape: Patient 12 (ROI 1)",
+    subtitle = "Raw values, no transformation",
+    x        = "Raw Intensity",
+    y        = "Pixel Count"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    strip.text       = element_text(face = "bold", size = 9),
+    panel.grid.minor = element_blank(),
+    axis.text.x      = element_text(size = 8),
+    axis.text.y      = element_text(size = 8)
+  )
+```
+
+## Density Ridge Plot (All ROIs)
+```{r fig.width=14, fig.height=22}
+ggplot(pixels_raw, aes(x = intensity, y = ROI, fill = ROI)) +
+  geom_density_ridges(alpha = 0.8, scale = 0.9, rel_min_height = 0.01, show.legend = FALSE) +
+  facet_wrap(~ marker, scales = "free_x", ncol = 5) +
+  labs(
+    title    = "Patient 12 - Pixel Intensity Distributions per Marker",
+    subtitle = "Raw values, no transformation",
+    x        = "Raw Intensity",
+    y        = "Region of Interest (ROI)"
+  ) +
+  theme_ridges(font_size = 10) +
+  theme(
+    strip.text   = element_text(face = "bold", size = 9),
+    axis.text.y  = element_text(size = 8),
+    axis.title   = element_text(size = 11, face = "bold"),
+    axis.title.x = element_text(hjust = 0.5),
+    axis.title.y = element_text(hjust = 0.5, angle = 90)
+  )
+```
+Without any transformation, the raw histograms look very squished with a huge spike near zero and a long right tail.
+
+# Focused Marker List (for Section 2)
+```{r}
+focused_markers <- c(
+  "TIM3(Nd143Di)",
+  "EpCAM(Nd144Di)",
+  "SMA(Pr141Di)",
+  "CD19(Nd142Di)",
+  "CD15(Sm149Di)",
+  "CD1c(Sm154Di)",
+  "CD103(Gd158Di)",
+  "CD68(Tb159Di)",
+  "FoxP3(Dy162Di)",
+  "LAMP3(Dy163Di)",
+  "HLADRB(Yb171Di)",
+  "CD28(Yb174Di)",
+  "CD14(Lu175Di)",
+  "CD38(Pt198Di)",
+  "TTF1orCD16(Pt194Di)",
+  "CD163(Sm147Di)"
+)
+
+pixels_raw_focused <- pixels_raw %>% filter(marker %in% focused_markers)
+cat("Focused markers confirmed:", length(unique(pixels_raw_focused$marker)), "\n")
+
+```
+
+# Section 2: Raw Pixels, asinh Transformed
+
+I did this with all 41 markers previously in p12_imc_pixel_dist.Rmd, so I'm just going to plot 16 of them here.
+
+## Histograms (ROI 1)
+```{r fig.width=14, fig.height=12}
+roi1_raw_focused <- pixels_raw_focused %>% filter(ROI == "ROI_1")
+
+ggplot(roi1_raw_focused, aes(x = intensity_asinh)) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "white", size = 0.1, alpha = 0.8) +
+  facet_wrap(~ marker, scales = "free", ncol = 4) +
+  labs(
+    title    = "Pixel Intensity Landscape: Patient 12 (ROI 1)",
+    subtitle = "Raw values, asinh transformed",
+    x        = "asinh(Intensity)",
+    y        = "Pixel Count"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    strip.text       = element_text(face = "bold", size = 9),
+    panel.grid.minor = element_blank(),
+    axis.text.x      = element_text(size = 8),
+    axis.text.y      = element_text(size = 8)
+  )
+```
+
+
+## Density Ridge Plot (All ROIs)
+```{r fig.width=14, fig.height=16}
+ggplot(pixels_raw_focused, aes(x = intensity_asinh, y = ROI, fill = ROI)) +
+  geom_density_ridges(alpha = 0.8, scale = 0.9, rel_min_height = 0.01, show.legend = FALSE) +
+  facet_wrap(~ marker, scales = "free_x", ncol = 4) +
+  labs(
+    title    = "Patient 12 - Pixel Intensity Distributions per Marker",
+    subtitle = "Raw values, asinh transformed",
+    x        = "asinh(Intensity)",
+    y        = "Region of Interest (ROI)"
+  ) +
+  theme_ridges(font_size = 10) +
+  theme(
+    strip.text   = element_text(face = "bold", size = 9),
+    axis.text.y  = element_text(size = 8),
+    axis.title   = element_text(size = 11, face = "bold"),
+    axis.title.x = element_text(hjust = 0.5),
+    axis.title.y = element_text(hjust = 0.5, angle = 90)
+  )
+```
+
+# Section 3: Filtered Pixels, No Transformation
+
+## Histograms (ROI 1)
+```{r fig.width=14, fig.height=16}
+roi1_filtered <- pixels_filtered %>% filter(ROI == "ROI_1")
+
+ggplot(roi1_filtered, aes(x = intensity)) +
+  geom_histogram(bins = 50, fill = "darkorange", color = "white", size = 0.1, alpha = 0.8) +
+  facet_wrap(~ marker, scales = "free", ncol = 5) +
+  labs(
+    title    = "Pixel Intensity Landscape: Patient 12 (ROI 1)",
+    subtitle = "Filtered values, no transformation",
+    x        = "Raw Intensity",
+    y        = "Pixel Count"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    strip.text       = element_text(face = "bold", size = 9),
+    panel.grid.minor = element_blank(),
+    axis.text.x      = element_text(size = 8),
+    axis.text.y      = element_text(size = 8)
+  )
+```
+
+## Density Ridge Plot (All ROIs)
+```{r fig.width=14, fig.height=22}
+ggplot(pixels_filtered, aes(x = intensity, y = ROI, fill = ROI)) +
+  geom_density_ridges(alpha = 0.8, scale = 0.9, rel_min_height = 0.01, show.legend = FALSE) +
+  facet_wrap(~ marker, scales = "free_x", ncol = 5) +
+  labs(
+    title    = "Patient 12 - Pixel Intensity Distributions per Marker",
+    subtitle = "Filtered values, no transformation",
+    x        = "Raw Intensity",
+    y        = "Region of Interest (ROI)"
+  ) +
+  theme_ridges(font_size = 10) +
+  theme(
+    strip.text   = element_text(face = "bold", size = 9),
+    axis.text.y  = element_text(size = 8),
+    axis.title   = element_text(size = 11, face = "bold"),
+    axis.title.x = element_text(hjust = 0.5),
+    axis.title.y = element_text(hjust = 0.5, angle = 90)
+  )
+```
+After filtering, we still have the same number of pixels, but the hot pixels that were previously far out in the right tail have now been moved to zero. This is why the spike at zero gets bigger after filtering. However, the right tail became longer, which is unusual and unexpected. The tails should have gotten shorter because that means the outliers were removed, but now it's not certain whether that was done.
+
+
+# Compare max raw intensity before and after filtering
+```{r}
+pixels_raw %>%
+  group_by(marker) %>%
+  summarise(max_raw = max(intensity)) %>%
+  left_join(
+    pixels_filtered %>%
+      group_by(marker) %>%
+      summarise(max_filtered = max(intensity)),
+    by = "marker"
+  ) %>%
+  mutate(diff = max_filtered - max_raw) %>%
+  arrange(desc(diff))
+```
+
+# Section 4: Filtered Pixels, asinh Transformed
+
+## Histograms (ROI 1)
+```{r fig.width=14, fig.height=16}
+ggplot(roi1_filtered, aes(x = intensity_asinh)) +
+  geom_histogram(bins = 50, fill = "darkorange", color = "white", size = 0.1, alpha = 0.8) +
+  facet_wrap(~ marker, scales = "free", ncol = 5) +
+  labs(
+    title    = "Pixel Intensity Landscape: Patient 12 (ROI 1)",
+    subtitle = "Filtered values, asinh transformed",
+    x        = "asinh(Intensity)",
+    y        = "Pixel Count"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    strip.text       = element_text(face = "bold", size = 9),
+    panel.grid.minor = element_blank(),
+    axis.text.x      = element_text(size = 8),
+    axis.text.y      = element_text(size = 8)
+  )
+```
+
+
+## Density Ridge Plot (All ROIs)
+```{r fig.width=14, fig.height=22}
+ggplot(pixels_filtered, aes(x = intensity_asinh, y = ROI, fill = ROI)) +
+  geom_density_ridges(alpha = 0.8, scale = 0.9, rel_min_height = 0.01, show.legend = FALSE) +
+  facet_wrap(~ marker, scales = "free_x", ncol = 5) +
+  labs(
+    title    = "Patient 12 - Pixel Intensity Distributions per Marker",
+    subtitle = "Filtered values, asinh transformed",
+    x        = "asinh(Intensity)",
+    y        = "Region of Interest (ROI)"
+  ) +
+  theme_ridges(font_size = 10) +
+  theme(
+    strip.text   = element_text(face = "bold", size = 9),
+    axis.text.y  = element_text(size = 8),
+    axis.title   = element_text(size = 11, face = "bold"),
+    axis.title.x = element_text(hjust = 0.5),
+    axis.title.y = element_text(hjust = 0.5, angle = 90)
+  )
+```
+
+No point in doing the asinh transformation on the filtered data because of the 0-100 scaling step.
+
+
+# Spatial and Distribution Visualization of Filtered Data
+
+The spatial plots use raw intensity (not asinh) because the data is already 0-100 scaled.
+
+## Load ROI 1 Filtered Data (with X, Y coordinates)
+```{r load-filtered-roi1}
+roi1_filtered <- read.delim(
+  "/restricted/projectnb/camplab/home/vgupta7/tumor_imc/patient12_steinbock/raw_filtered/Patient_12T_ROI_001_1.txt",
+  check.names = FALSE
+)
+
+cat("Dimensions:", nrow(roi1_filtered), "pixels x", ncol(roi1_filtered), "columns\n")
+```
+
+
+## Subset Filtered Data to Focused Markers
+```{r filtered-focused-subset}
+pixels_filtered_focused <- pixels_filtered %>%
+  filter(marker %in% focused_markers)
+
+cat("Focused markers confirmed:", length(unique(pixels_filtered_focused$marker)), "\n")
+```
+
+
+## Spatial Visualization: Selected Immune Markers (ROI 1, Filtered)
+```{r filtered-spatial, fig.width=12, fig.height=14}
+# Downsample to every 3rd pixel
+set.seed(42)
+roi1_filtered_sub <- roi1_filtered %>%
+  filter(X %% 3 == 0, Y %% 3 == 0)
+
+cat("Downsampled pixels:", nrow(roi1_filtered_sub), "\n")
+
+# Same focused markers as before
+focused_markers_spatial <- c(
+  "EpCAM(Nd144Di)",
+  "SMA(Pr141Di)",
+  "FoxP3(Dy162Di)",
+  "CD68(Tb159Di)",
+  "CD163(Sm147Di)",
+  "CD1c(Sm154Di)",
+  "TIM3(Nd143Di)",
+  "PD1(Ho165Di)",
+  "TTF1orCD16(Pt194Di)"
+)
+
+roi1_filtered_long <- roi1_filtered_sub %>%
+  select(X, Y, all_of(focused_markers_spatial)) %>%
+  melt(id.vars = c("X", "Y"),
+       variable.name = "marker",
+       value.name    = "intensity")
+
+p_filtered_spatial <- ggplot(roi1_filtered_long, 
+                              aes(x = X, y = Y, fill = intensity)) +
+  geom_tile() +
+  scale_fill_viridis_c(option = "viridis") +
+  facet_wrap(~ marker, ncol = 3) +
+  labs(
+    title    = "Patient 12 ROI 1 - Selected Immune Markers (Filtered)",
+    subtitle = "Filtered values, 0-100 scaled, downsampled every 3rd pixel",
+    fill     = "Intensity\n(0-100)"
+  ) +
+  theme_void(base_size = 9) +
+  theme(
+    strip.text      = element_text(size = 8, face = "bold"),
+    legend.position = "bottom"
+  )
+
+ggsave("Patient12T_ROI1_filtered_spatial.pdf", p_filtered_spatial, width = 12, height = 14)
+print(p_filtered_spatial)
+```
+
+After filtering, there is a lot less background noise compared to the raw data spatial plots. Can now see discrete bright spots scattered across the tissue more clearly. 
+
+CD68 is a macrophage marker, so pixels with high CD68 expression are associated with macrophages.
+
+But it's important to remember that we're looking at pixels, not cells, which is what cell segmentation is for. 
+
+FoxP3 and PD1 are rare/sparse populations that need cell-level aggregation after segmentation to detect reliably. There are some tiny yellow specks present, which means those cell types are present but rare in this ROI.
+
+## Histograms: Focused Markers (ROI 1, Filtered)
+```{r filtered-focused-hist, fig.width=14, fig.height=12}
+roi1_filtered_focused <- pixels_filtered_focused %>%
+  filter(ROI == "ROI_1")
+
+ggplot(roi1_filtered_focused, aes(x = intensity)) +
+  geom_histogram(bins = 50, fill = "darkorange", color = "white", 
+                 size = 0.1, alpha = 0.8) +
+  facet_wrap(~ marker, scales = "free", ncol = 4) +
+  labs(
+    title    = "Pixel Intensity Landscape: Patient 12 (ROI 1, Filtered)",
+    subtitle = "Filtered values, 0-100 scaled, 16 selected markers",
+    x        = "Intensity (0-100 scaled)",
+    y        = "Pixel Count"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    strip.text       = element_text(face = "bold", size = 9),
+    panel.grid.minor = element_blank(),
+    axis.text.x      = element_text(size = 8),
+    axis.text.y      = element_text(size = 8)
+  )
+```
+
+## Density Ridge Plot: Focused Markers (All ROIs, Filtered)
+```{r filtered-focused-ridge, fig.width=14, fig.height=16}
+ggplot(pixels_filtered_focused, aes(x = intensity, y = ROI, fill = ROI)) +
+  geom_density_ridges(alpha = 0.8, scale = 0.9, rel_min_height = 0.01, 
+                      show.legend = FALSE) +
+  facet_wrap(~ marker, scales = "free_x", ncol = 4) +
+  labs(
+    title    = "Patient 12 - Pixel Intensity Distributions per Marker (Filtered)",
+    subtitle = "Filtered values, 0-100 scaled, 16 selected markers",
+    x        = "Intensity (0-100 scaled)",
+    y        = "Region of Interest (ROI)"
+  ) +
+  theme_ridges(font_size = 10) +
+  theme(
+    strip.text   = element_text(face = "bold", size = 9),
+    axis.text.y  = element_text(size = 8),
+    axis.title   = element_text(size = 11, face = "bold"),
+    axis.title.x = element_text(hjust = 0.5),
+    axis.title.y = element_text(hjust = 0.5, angle = 90)
+  )
+```
+
+
+
