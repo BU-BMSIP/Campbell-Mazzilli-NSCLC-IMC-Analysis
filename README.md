@@ -23,9 +23,10 @@ previously characterized lymph node findings.
     so we switched to ggplot in R because it's easier to use.
 
 **Week 3-5 — Preprocessing & QC**
-- Run steinbock pipeline on tumor samples (preprocessing → segmentation → feature extraction)
-- Quality control report (segmentation, image-level, cell-level)
-- Import data into R using imcRtools
+- Ran Steinbock pipeline on Patient 12 and 14 tumor samples (pixel filtration → preprocessing → DeepCell segmentation → feature extraction)
+- Explored pixel- and cell-level intensity distributions to evaluate marker quality and assess filtering effects
+- Performed segmentation and image-level QC (mask overlays, mean expression per ROI, cell area/density checks)
+- Visualized multiplexed images and segmentation masks in QuPath to assess marker-specific signal and cell boundary accuracy
 
 **Week 6-7 — Cell Phenotyping**
 - Batch correction if needed
