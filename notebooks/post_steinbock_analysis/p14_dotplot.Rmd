@@ -1,0 +1,293 @@
+---
+title: 'Patient 14 Dot Plot: Cluster Marker Expression'
+author: ''
+date: "06-18-2026"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 14, fig.height = 8)
+
+set.seed(42)
+```
+
+## Overview
+
+Dot plot showing mean marker expression per Louvain cluster, alongside
+UMAP colored by cluster. The goal is to characterize which markers
+define each cluster -- the grouping of the UMAP based off markers (groups
+of the cluster and their marker expression).
+
+Dot color = mean arcsinh-transformed expression per cluster
+Dot size = fraction of cells in the cluster expressing above the
+per-marker global median
+
+This is exploratory annotation prior to formal Celda-based cell
+phenotyping.
+
+------------------------------------------------------------------------
+
+## 1. Load Libraries
+
+```{r libraries}
+library(imcRtools)
+library(tidyverse)
+library(dittoSeq)
+library(viridis)
+library(scater)
+library(scran)
+library(bluster)
+library(patchwork)
+library(RColorBrewer)
+```
+
+------------------------------------------------------------------------
+
+## 2. Read in Steinbock Data
+
+```{r read-data}
+steinbock_path <- "/restricted/projectnb/camplab/home/tshah20/tumor_IMC/patient14_steinbock"
+
+spe <- read_steinbock(steinbock_path)
+spe
+```
+
+```{r process-spe}
+# set informative column names: image_cellID
+colnames(spe) <- paste0(spe$sample_id, "_", spe$ObjectNumber)
+
+# extract patient and ROI from sample_id
+spe$patient_id <- str_extract(spe$sample_id, "^[^_]+")
+spe$ROI        <- spe$sample_id
+
+# arcsinh transform (cofactor = 1, standard for IMC)
+assay(spe, "exprs") <- asinh(counts(spe) / 1)
+
+# flag biological channels (exclude DNA and membrane channels used for segmentation)
+rowData(spe)$use_channel <- !grepl("DNA191|DNA193|Membrane", rownames(spe))
+
+cat("Cells loaded:", ncol(spe), "\n")
+cat("ROIs:", n_distinct(spe$sample_id), "\n")
+cat("Channels:", nrow(spe), "\n")
+
+image_path <- "/restricted/projectnb/camplab/home/tshah20/tumor_IMC/images"
+```
+
+------------------------------------------------------------------------
+
+## 3. Subset and Run UMAP/tSNE
+
+UMAP/tSNE projects cells to 2D -- looking to see if the ROIs mix well.
+Marker expression is overlaid to verify that the embeddings separate
+biologically meaningful populations aka the differences between patient
+expressions.
+
+```{r dimred, fig.height=12, fig.width=14}
+set.seed(220225)
+cell_sub <- sample(seq_len(ncol(spe)), min(15000 * n_distinct(spe$sample_id), ncol(spe)))
+spe_sub  <- spe[, cell_sub]
+spe_sub <- runUMAP(spe_sub, subset_row = rowData(spe_sub)$use_channel, exprs_values = "exprs")
+spe_sub <- runTSNE(spe_sub, subset_row = rowData(spe_sub)$use_channel, exprs_values = "exprs")
+
+# define ROI colors
+roi_colors <- setNames(
+  colorRampPalette(brewer.pal(4, "Set1"))(n_distinct(spe$sample_id)),
+  unique(spe$sample_id)
+)
+
+p1 <- dittoDimPlot(spe_sub, var = "sample_id", reduction.use = "UMAP", size = 0.2) +
+  scale_color_manual(values = roi_colors) +
+  ggtitle("ROI on UMAP")
+
+p2 <- dittoDimPlot(spe_sub, var = "sample_id", reduction.use = "TSNE", size = 0.2) +
+  scale_color_manual(values = roi_colors) +
+  ggtitle("ROI on tSNE")
+
+(p1 + p2)
+
+ggsave("patient14_ROI_UMAP_tSNE.pdf",
+       plot   = (p1 + p2),
+       width  = 14,
+       height = 12,
+       path   = image_path)
+```
+
+```{r dimred-markers, fig.height=12, fig.width=14}
+p3 <- dittoDimPlot(spe_sub, var = "EpCAM", reduction.use = "UMAP",
+                   assay = "exprs", size = 0.2) +
+  scale_color_viridis(name = "EpCAM") +
+  ggtitle("EpCAM on UMAP")
+
+p4 <- dittoDimPlot(spe_sub, var = "SMA", reduction.use = "UMAP",
+                   assay = "exprs", size = 0.2) +
+  scale_color_viridis(name = "SMA") +
+  ggtitle("SMA on UMAP")
+
+p5 <- dittoDimPlot(spe_sub, var = "CD45RO", reduction.use = "UMAP",
+                   assay = "exprs", size = 0.2) +
+  scale_color_viridis(name = "CD45RO") +
+  ggtitle("CD45RO on UMAP")
+
+p6 <- dittoDimPlot(spe_sub, var = "CD68", reduction.use = "UMAP",
+                   assay = "exprs", size = 0.2) +
+  scale_color_viridis(name = "CD68") +
+  ggtitle("CD68 on UMAP")
+
+(p3 + p4) / (p5 + p6)
+
+ggsave("patient14_marker_UMAP.pdf",
+       plot   = (p3 + p4) / (p5 + p6),
+       width  = 14,
+       height = 12,
+       path   = image_path)
+```
+
+------------------------------------------------------------------------
+
+## 4. Louvain Clustering
+
+Graph-based Louvain clustering on the full spe (not the UMAP subset) at
+k = 20. Cluster labels are stored in spe$nn_clusters.
+
+```{r clustering}
+set.seed(220225)
+
+mat <- t(assay(spe, "exprs")[rowData(spe)$use_channel, ])
+
+g <- buildSNNGraph(t(mat), k = 20, type = "jaccard",
+                   BNPARAM = BiocNeighbors::KmknnParam())
+clusters <- igraph::cluster_louvain(g)$membership
+
+spe$nn_clusters <- factor(clusters)
+
+cat("Number of clusters:", nlevels(spe$nn_clusters), "\n")
+print(table(spe$nn_clusters))
+```
+
+------------------------------------------------------------------------
+
+## 5. UMAP Colored by Cluster
+
+Overlay cluster labels on the existing spe_sub UMAP. Cluster labels are
+propagated to the subset via cell name matching.
+
+```{r umap-clusters, fig.width=10, fig.height=7}
+# propagate cluster labels to spe_sub by matching cell names
+spe_sub$nn_clusters <- spe$nn_clusters[match(colnames(spe_sub), colnames(spe))]
+
+p_umap_clusters <- dittoDimPlot(spe_sub,
+             var = "nn_clusters",
+             reduction.use = "UMAP",
+             size = 0.3,
+             do.label = TRUE,
+             labels.size = 3) +
+  ggtitle("Patient 14: Louvain Clusters on UMAP") +
+  theme(legend.position = "right")
+
+print(p_umap_clusters)
+
+ggsave("patient14_cluster_UMAP.pdf",
+       plot   = p_umap_clusters,
+       width  = 10,
+       height = 7,
+       path   = image_path)
+```
+
+------------------------------------------------------------------------
+
+## 6. Dot Plot: Marker Expression per Cluster
+
+Each dot encodes mean arcsinh expression (color) and fraction of cells
+expressing above the per-marker global median (size).
+
+```{r dotplot, fig.width=16, fig.height=8}
+use_markers <- rownames(spe)[rowData(spe)$use_channel]
+expr_mat    <- assay(spe, "exprs")[use_markers, ]
+cluster_ids <- spe$nn_clusters
+
+# mean expression per cluster
+mean_expr <- sapply(levels(cluster_ids), function(cl) {
+  idx <- which(cluster_ids == cl)
+  rowMeans(expr_mat[, idx, drop = FALSE])
+})
+
+# fraction expressing above per-marker global median
+global_medians <- apply(expr_mat, 1, median)
+frac_expr <- sapply(levels(cluster_ids), function(cl) {
+  idx <- which(cluster_ids == cl)
+  rowMeans(expr_mat[, idx, drop = FALSE] > global_medians)
+})
+
+# reshape to long format
+mean_df <- as.data.frame(mean_expr) |>
+  rownames_to_column("marker") |>
+  pivot_longer(-marker, names_to = "cluster", values_to = "mean_exprs")
+
+frac_df <- as.data.frame(frac_expr) |>
+  rownames_to_column("marker") |>
+  pivot_longer(-marker, names_to = "cluster", values_to = "frac_expressing")
+
+plot_df <- left_join(mean_df, frac_df, by = c("marker", "cluster"))
+plot_df$cluster <- factor(plot_df$cluster, levels = levels(cluster_ids))
+
+# order markers by hierarchical clustering for readability
+marker_order <- rownames(mean_expr)[hclust(dist(mean_expr))$order]
+plot_df$marker <- factor(plot_df$marker, levels = marker_order)
+
+p_dot <- ggplot(plot_df, aes(x = cluster, y = marker)) +
+  geom_point(aes(size = frac_expressing, color = mean_exprs)) +
+  scale_color_viridis(option = "magma", name = "Mean\narcsinh expr") +
+  scale_size_continuous(range = c(0.5, 6), name = "Fraction\nexpressing") +
+  labs(
+    title = "Patient 14: Marker Expression per Louvain Cluster",
+    x = "Cluster",
+    y = "Marker"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    axis.text.x  = element_text(angle = 0, hjust = 0.5),
+    axis.text.y  = element_text(size = 9),
+    panel.grid.major = element_line(color = "grey90"),
+    legend.position  = "right"
+  )
+
+print(p_dot)
+```
+
+------------------------------------------------------------------------
+
+## 7. Save Dot Plot
+
+```{r save-dotplot}
+ggsave("patient14_dotplot_clusters.pdf",
+       plot   = p_dot,
+       width  = 16,
+       height = 8,
+       path   = image_path)
+
+cat("Saved to:", file.path(image_path, "patient14_dotplot_clusters.pdf"), "\n")
+```
+
+------------------------------------------------------------------------
+
+## Notes
+
+- Clustering is exploratory (graph-based Louvain). Formal cell
+  phenotyping will use Celda's celda_C two-pass approach per Xi et al.
+- GATA3 (Eu151) is absent from the SPE until steinbock measure
+  intensities is rerun; it is automatically excluded via the use_channel
+  flag.
+- TTF1orCD16 appears as TTForCD16 in the SPE due to a naming
+  inconsistency in the raw TXT files; both names refer to the same
+  channel.

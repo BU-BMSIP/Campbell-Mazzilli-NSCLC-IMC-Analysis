@@ -1,15 +1,15 @@
 ---
 title: 'Patient 14 Post-Steinbock Visualization -> Arcsinh'
-author: ''
+author: 'Tazein Shah'
 date: "06-10-2026"
 output:
-  pdf_document:
-    toc: true
   html_document:
     toc: true
     toc_float: true
     theme: flatly
     code_folding: show
+  pdf_document:
+    toc: true
 editor_options:
   markdown:
     wrap: 72
@@ -274,9 +274,10 @@ p_heatmap <- dittoHeatmap(
   spe[, cur_cells[cell_order]],
   genes          = rownames(spe)[rowData(spe)$use_channel],
   assay          = "exprs",
-  cluster_cols   = FALSE,
+  cluster_cols   = TRUE,
   scale          = "none",
   heatmap.colors = viridis(100),
+  breaks         = seq(0, 6, length.out = 101),
   annot.by       = "sample_id",
   annotation_colors = list(
     sample_id = setNames(

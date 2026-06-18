@@ -1,0 +1,379 @@
+---
+title: 'Patient 14 Cell Segmentation Mask Visualization'
+author: 'Tazein Shah'
+date: "06-10-2026"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 14, fig.height = 10)
+```
+
+## Overview
+
+This script visualizes cell segmentation mask overlays for Patient 14T across
+all ROIs. Each section uses a channel combination matched to one annotated cell
+type to assess segmentation quality per compartment. Cell type annotations
+follow Xi et al. (2026).
+
+1. Nuclear + structural anchors (DNA191 + DNA193 + Membrane)
+2. Tumor / Epithelial (EpCAM)
+3. Fibroblast (SMA)
+4. B Cell (CD19)
+5. CD4+ T Cell (CD4)
+6. CD8+ T Cell (CD8a)
+7. PMN-MDSC (CD15)
+8. Macrophage (CD14 + CD86)
+9. M-MDSC (CD14 + CD163)
+10. DC / mregDC (LAMP3 + CD1c + CD11c)
+
+---
+
+## 1. Load Libraries
+
+```{r libraries}
+library(imcRtools)
+library(cytomapper)
+library(tidyverse)
+```
+
+---
+
+## 2. Load Images, Masks, and Panel
+
+```{r load-data}
+steinbock_path <- "/restricted/projectnb/camplab/home/tshah20/tumor_IMC/patient14_steinbock"
+
+images <- loadImages(file.path(steinbock_path, "img/"))
+masks  <- loadImages(file.path(steinbock_path, "masks_deepcell/"), as.is = TRUE)
+
+panel         <- read.csv(file.path(steinbock_path, "panel_GATA3.csv"))
+kept_channels <- panel$name[panel$keep == 1]
+
+channelNames(images) <- kept_channels
+
+mcols(images)$sample_id <- names(images)
+mcols(masks)$sample_id  <- names(masks)
+
+cat("Images loaded:", length(images), "\n")
+cat("Masks loaded:", length(masks), "\n")
+cat("Channels:\n")
+print(channelNames(images))
+```
+
+---
+
+## 3. Normalize Images for Display
+
+Pixel intensities are normalized per image to [0, 1], then clipped at
+0.2 to bring out dim signals. Does not affect downstream analysis.
+
+```{r normalize}
+images_norm <- cytomapper::normalize(images, separateImages = TRUE)
+images_norm <- cytomapper::normalize(images_norm, inputRange = c(0, 0.2))
+
+img_ids <- seq_len(length(images_norm))
+```
+
+---
+
+## 4. Nuclear + Structural Anchors
+
+DNA191 and DNA193 mark nuclei, Membrane marks cell boundaries. This is the
+baseline check that individual nuclei are cleanly outlined by their masks
+without obvious clumping or splitting.
+
+```{r nuclear-structural, fig.height=12}
+plotPixels(
+  images_norm[img_ids],
+  mask           = masks[img_ids],
+  img_id         = "sample_id",
+  missing_colour = "white",
+  colour_by = c("DNA191", "DNA193", "Membrane"),
+  colour    = list(
+    DNA191   = c("black", "blue"),
+    DNA193   = c("black", "cyan"),
+    Membrane = c("black", "red")
+  ),
+  image_title = list(position = "topleft", cex = 1),
+  legend      = list(colour_by.title.cex = 0.8, colour_by.labels.cex = 0.8)
+)
+
+dev.copy(png, "images/mask_01_nuclear_structural.png", width = 2800, height = 2800, res = 200)
+dev.off()
+```
+
+---
+
+## 5. Tumor / Epithelial Cells
+
+EpCAM marks epithelial and tumor cells. Overlaid with DNA191 and Membrane to
+check that tumor cell nests are segmented as individual cells rather than merged
+into a single large mask.
+
+```{r tumor-epithelial, fig.height=12}
+plotPixels(
+  images_norm[img_ids],
+  mask           = masks[img_ids],
+  img_id         = "sample_id",
+  missing_colour = "white",
+  colour_by = c("EpCAM", "DNA191", "Membrane"),
+  colour    = list(
+    EpCAM    = c("black", "green"),
+    DNA191   = c("black", "blue"),
+    Membrane = c("black", "red")
+  ),
+  image_title = list(position = "topleft", cex = 1),
+  legend      = list(colour_by.title.cex = 0.8, colour_by.labels.cex = 0.8)
+)
+
+dev.copy(png, "images/mask_02_tumor_epithelial.png", width = 2800, height = 2800, res = 200)
+dev.off()
+```
+
+---
+
+## 6. Fibroblasts
+
+SMA (alpha-smooth muscle actin) marks fibroblasts and myofibroblasts in the
+tumor stroma. Fibroblasts tend to be elongated, so this panel checks whether
+the masks correctly capture their irregular shape rather than splitting them
+across multiple objects.
+
+```{r fibroblast, fig.height=12}
+plotPixels(
+  images_norm[img_ids],
+  mask           = masks[img_ids],
+  img_id         = "sample_id",
+  missing_colour = "white",
+  colour_by = c("SMA", "DNA191", "Membrane"),
+  colour    = list(
+    SMA      = c("black", "magenta"),
+    DNA191   = c("black", "blue"),
+    Membrane = c("black", "red")
+  ),
+  image_title = list(position = "topleft", cex = 1),
+  legend      = list(colour_by.title.cex = 0.8, colour_by.labels.cex = 0.8)
+)
+
+dev.copy(png, "images/mask_03_fibroblast.png", width = 2800, height = 2800, res = 200)
+dev.off()
+```
+
+---
+
+## 7. B Cells
+
+CD19 is the canonical B cell surface marker. B cells are small and round and
+tend to cluster in follicle-like structures in lymph node tissue; this panel
+checks for over-segmentation in densely packed B cell regions.
+
+```{r bcell, fig.height=12}
+plotPixels(
+  images_norm[img_ids],
+  mask           = masks[img_ids],
+  img_id         = "sample_id",
+  missing_colour = "white",
+  colour_by = c("CD19", "DNA191", "Membrane"),
+  colour    = list(
+    CD19     = c("black", "yellow"),
+    DNA191   = c("black", "blue"),
+    Membrane = c("black", "red")
+  ),
+  image_title = list(position = "topleft", cex = 1),
+  legend      = list(colour_by.title.cex = 0.8, colour_by.labels.cex = 0.8)
+)
+
+dev.copy(png, "images/mask_04_bcell.png", width = 2800, height = 2800, res = 200)
+dev.off()
+```
+
+---
+
+## 8. CD4+ T Cells
+
+CD4 marks helper T cells. CD4+ T cells are small and abundant in LN tissue;
+this panel assesses whether individual T cells are individually resolved or
+merged in dense infiltrates.
+
+```{r cd4-tcell, fig.height=12}
+plotPixels(
+  images_norm[img_ids],
+  mask           = masks[img_ids],
+  img_id         = "sample_id",
+  missing_colour = "white",
+  colour_by = c("CD4", "DNA191", "Membrane"),
+  colour    = list(
+    CD4      = c("black", "orange"),
+    DNA191   = c("black", "blue"),
+    Membrane = c("black", "red")
+  ),
+  image_title = list(position = "topleft", cex = 1),
+  legend      = list(colour_by.title.cex = 0.8, colour_by.labels.cex = 0.8)
+)
+
+dev.copy(png, "images/mask_05_cd4_tcell.png", width = 2800, height = 2800, res = 200)
+dev.off()
+```
+
+---
+
+## 9. CD8+ T Cells
+
+CD8a marks cytotoxic T cells. CD8+ T cells are the primary effector population
+in anti-tumor immunity; their segmentation quality is especially important for
+downstream proximity and neighborhood analyses.
+
+```{r cd8-tcell, fig.height=12}
+plotPixels(
+  images_norm[img_ids],
+  mask           = masks[img_ids],
+  img_id         = "sample_id",
+  missing_colour = "white",
+  colour_by = c("CD8a", "DNA191", "Membrane"),
+  colour    = list(
+    CD8a     = c("black", "orange"),
+    DNA191   = c("black", "blue"),
+    Membrane = c("black", "red")
+  ),
+  image_title = list(position = "topleft", cex = 1),
+  legend      = list(colour_by.title.cex = 0.8, colour_by.labels.cex = 0.8)
+)
+
+dev.copy(png, "images/mask_06_cd8_tcell.png", width = 2800, height = 2800, res = 200)
+dev.off()
+```
+
+---
+
+## 10. PMN-MDSCs
+
+CD15 marks polymorphonuclear myeloid-derived suppressor cells (PMN-MDSCs),
+a granulocytic immunosuppressive population. PMN-MDSCs are typically
+multi-lobed and larger than lymphocytes; this panel checks for mask merging
+in regions of granulocyte infiltration.
+
+```{r pmn-mdsc, fig.height=12}
+plotPixels(
+  images_norm[img_ids],
+  mask           = masks[img_ids],
+  img_id         = "sample_id",
+  missing_colour = "white",
+  colour_by = c("CD15", "DNA191", "Membrane"),
+  colour    = list(
+    CD15     = c("black", "yellow"),
+    DNA191   = c("black", "blue"),
+    Membrane = c("black", "red")
+  ),
+  image_title = list(position = "topleft", cex = 1),
+  legend      = list(colour_by.title.cex = 0.8, colour_by.labels.cex = 0.8)
+)
+
+dev.copy(png, "images/mask_07_pmn_mdsc.png", width = 2800, height = 2800, res = 200)
+dev.off()
+```
+
+---
+
+## 11. Macrophages
+
+CD14 marks monocytes and macrophages broadly; CD86 is a co-stimulatory marker
+expressed on activated macrophages and distinguishes them from M-MDSCs. Macrophages
+are large and irregularly shaped, making them prone to segmentation artifacts.
+
+```{r macrophage, fig.height=12}
+plotPixels(
+  images_norm[img_ids],
+  mask           = masks[img_ids],
+  img_id         = "sample_id",
+  missing_colour = "white",
+  colour_by = c("CD14", "CD86", "DNA191"),
+  colour    = list(
+    CD14   = c("black", "yellow"),
+    CD86   = c("black", "magenta"),
+    DNA191 = c("black", "blue")
+  ),
+  image_title = list(position = "topleft", cex = 1),
+  legend      = list(colour_by.title.cex = 0.8, colour_by.labels.cex = 0.8)
+)
+
+dev.copy(png, "images/mask_08_macrophage.png", width = 2800, height = 2800, res = 200)
+dev.off()
+```
+
+---
+
+## 12. M-MDSCs
+
+CD14 and CD163 together mark monocytic MDSCs (M-MDSCs), which are
+CD14+ but lack the CD86 co-stimulatory signal of activated macrophages.
+CD163 additionally marks M2-polarized immunosuppressive macrophages.
+
+```{r m-mdsc, fig.height=12}
+plotPixels(
+  images_norm[img_ids],
+  mask           = masks[img_ids],
+  img_id         = "sample_id",
+  missing_colour = "white",
+  colour_by = c("CD14", "CD163", "DNA191"),
+  colour    = list(
+    CD14   = c("black", "yellow"),
+    CD163  = c("black", "orange"),
+    DNA191 = c("black", "blue")
+  ),
+  image_title = list(position = "topleft", cex = 1),
+  legend      = list(colour_by.title.cex = 0.8, colour_by.labels.cex = 0.8)
+)
+
+dev.copy(png, "images/mask_09_m_mdsc.png", width = 2800, height = 2800, res = 200)
+dev.off()
+```
+
+---
+
+## 13. DC / mregDC
+
+LAMP3 is the canonical marker for mature regulatory dendritic cells (mregDCs),
+a tolerogenic DC subset. CD1c marks cDC2-like conventional DCs. CD11c is a
+broad DC and myeloid marker used to confirm the dendritic lineage. DCs are
+rare and morphologically variable; this panel checks that sparse LAMP3+
+cells are captured as distinct individual masks.
+
+```{r dc-mregdc, fig.height=12}
+plotPixels(
+  images_norm[img_ids],
+  mask           = masks[img_ids],
+  img_id         = "sample_id",
+  missing_colour = "white",
+  colour_by = c("LAMP3", "CD1c", "CD11c"),
+  colour    = list(
+    LAMP3 = c("black", "cyan"),
+    CD1c  = c("black", "green"),
+    CD11c = c("black", "yellow")
+  ),
+  image_title = list(position = "topleft", cex = 1),
+  legend      = list(colour_by.title.cex = 0.8, colour_by.labels.cex = 0.8)
+)
+
+dev.copy(png, "images/mask_10_dc_mregdc.png", width = 2800, height = 2800, res = 200)
+dev.off()
+```
+
+---
+
+## Session Info
+
+```{r session-info}
+sessionInfo()
+```
