@@ -1,0 +1,99 @@
+---
+title: 'Patient 14 Pre + Post Steinbock Read Distributions'
+author: 'Tazein Shah'
+date: "06-18-2026"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r}
+library(tidyverse)
+library(SummarizedExperiment)
+library(imcRtools)
+
+steinbock_dir <- "/restricted/projectnb/camplab/home/tshah20/tumor_IMC/patient14_steinbock/"
+
+# Patch panel file to match what steinbock wrote into intensities CSV
+panel <- read_csv(file.path(steinbock_dir, "panel_GATA3.csv"), show_col_types = FALSE)
+panel <- panel |>
+  mutate(name = if_else(name == "TTF1orCD16", "TTForCD16", name))
+
+patched_panel_path <- file.path(steinbock_dir, "panel_GATA3_patched.csv")
+write_csv(panel, patched_panel_path)
+
+spe <- read_steinbock(steinbock_dir, panel_file = "panel_GATA3_patched.csv")
+
+raw_dir <- "/restricted/projectnb/camplab/home/tshah20/tumor_IMC/patient14_steinbock/raw/"
+
+raw_files <- list.files(raw_dir, pattern = "\\.txt$", full.names = TRUE)
+
+coord_cols <- c("Start_push", "End_push", "Pushes_duration", "X", "Y", "Z")
+
+txt_cols <- names(read_tsv(raw_files[1], show_col_types = FALSE))
+marker_cols <- txt_cols[!txt_cols %in% coord_cols]
+
+txt_to_marker <- setNames(
+  str_extract(marker_cols, "^[^(]+"),
+  marker_cols
+)
+
+pre_seg <- map_dfr(raw_files, function(f) {
+  df <- read_tsv(f, show_col_types = FALSE)
+  roi <- tools::file_path_sans_ext(basename(f))
+  df |>
+    pivot_longer(cols = -any_of(coord_cols),
+                 names_to = "channel", values_to = "intensity") |>
+    mutate(
+      channel = recode(channel, !!!txt_to_marker),
+      channel = if_else(channel == "TTF1orCD16", "TTForCD16", channel),
+      roi = roi,
+      source = "pre_segmentation"
+    )
+}) |>
+  filter(channel %in% rownames(spe))
+
+post_seg <- assay(spe, "counts") |>
+  as.data.frame() |>
+  rownames_to_column("channel") |>
+  pivot_longer(-channel, names_to = "cell_id", values_to = "intensity") |>
+  mutate(
+    roi = str_remove(cell_id, "_\\d+$"),
+    source = "post_segmentation"
+  )
+
+combined <- bind_rows(pre_seg, post_seg) |>
+  filter(channel %in% rownames(spe))
+```
+
+
+```{r}
+# ---- pre_vs_post_seg_plot ----
+markers <- rownames(spe)
+
+for (m in markers) {
+  plot_df <- combined |> filter(channel == m)
+
+  p <- ggplot(plot_df, aes(x = intensity, fill = source, color = source)) +
+    geom_density(alpha = 0.35, linewidth = 0.6) +
+    scale_x_continuous(limits = c(0, quantile(plot_df$intensity, 0.99, na.rm = TRUE))) +
+    scale_fill_manual(values = c("pre_segmentation" = "#4E79A7", "post_segmentation" = "#F28E2B"),
+                      labels = c("pre_segmentation" = "Pre (pixel)", "post_segmentation" = "Post (cell mean)")) +
+    scale_color_manual(values = c("pre_segmentation" = "#4E79A7", "post_segmentation" = "#F28E2B"),
+                       labels = c("pre_segmentation" = "Pre (pixel)", "post_segmentation" = "Post (cell mean)")) +
+    labs(title = m, x = "Intensity", y = "Density", fill = NULL, color = NULL) +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "top")
+
+  print(p)
+}
+```
+
