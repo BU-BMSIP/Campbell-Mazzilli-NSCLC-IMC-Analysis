@@ -1,0 +1,134 @@
+---
+title: 'All Patient Raw Data Distributions + Median'
+author: 'Tazein Shah'
+date: "06-14-26"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup}
+library(tidyverse)
+
+patient_txt_dirs <- list(
+  "Patient_10" = "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/Data/Imaging/IMC/Tumor/PardeeTumorAblations/Patient_10T",
+  "Patient_11" = "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/Data/Imaging/IMC/Tumor/PardeeTumorAblations/Patient_11T",
+  "Patient_12" = "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/Data/Imaging/IMC/Tumor/PardeeTumorAblations/Patient_12T",
+  "Patient_13" = "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/Data/Imaging/IMC/Tumor/PardeeTumorAblations/Patient_13T",
+  "Patient_14" = "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/Data/Imaging/IMC/Tumor/PardeeTumorAblations/Patient_14T",
+  "Patient_15" = "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/Data/Imaging/IMC/Tumor/PardeeTumorAblations/Patient_15T",
+  "Patient_16" = "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/Data/Imaging/IMC/Tumor/PardeeTumorAblations/Patient_16T",
+  "Patient_17" = "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/Data/Imaging/IMC/Tumor/PardeeTumorAblations/Patient_17T",
+  "Patient_18" = "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/Data/Imaging/IMC/Tumor/PardeeTumorAblations/Patient_18T",
+  "Patient_19" = "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/Data/Imaging/IMC/Tumor/PardeeTumorAblations/Patient_19T",
+  "Patient_20" = "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/Data/Imaging/IMC/Tumor/PardeeTumorAblations/Patient_20T_5-19-2024"
+)
+
+exclude_cols <- c("Start_push", "End_push", "Pushes_duration", "X", "Y", "Z")
+```
+
+# Raw pixel distributions (subsampled)
+
+```{r read-raw-pixels}
+set.seed(42)
+n_pixels <- 10000  # reads to sample per ROI
+
+raw_pixels <- imap_dfr(patient_txt_dirs, function(dir, patient_id) {
+  txt_files <- list.files(dir, pattern = "\\.txt$", full.names = TRUE)
+
+  map_dfr(txt_files, function(f) {
+    dat <- read_tsv(f, show_col_types = FALSE)
+    dat <- dat[, !colnames(dat) %in% exclude_cols]
+    dat |>
+      slice_sample(n = min(n_pixels, nrow(dat))) |>
+      mutate(patient_id = patient_id, roi = basename(f))
+  })
+})
+```
+
+```{r plot-raw-pixels}
+long_raw <- raw_pixels |>
+  pivot_longer(cols = -c(patient_id, roi),
+               names_to = "marker", values_to = "value")
+
+dir.create("raw_pixel_plots", showWarnings = FALSE)
+
+markers  <- unique(long_raw$marker)
+patients <- unique(long_raw$patient_id)
+pal      <- setNames(scales::hue_pal()(length(patients)), patients)
+
+for (m in markers) {
+  dat <- filter(long_raw, marker == m)
+
+  p <- ggplot(dat, aes(x = value, fill = patient_id, colour = patient_id)) +
+    geom_density(alpha = 0.3, linewidth = 0.6) +
+    scale_fill_manual(values = pal) +
+    scale_colour_manual(values = pal) +
+    labs(title = m, x = "Raw intensity", y = "Density",
+         fill = "Patient", colour = "Patient") +
+    theme_bw(base_size = 12) +
+    theme(plot.title = element_text(face = "bold"),
+          legend.position = "bottom")
+
+  print(p)
+}
+
+message("Done: ", length(markers), " plots saved to raw_pixel_plots/")
+```
+
+# Per-ROI medians per patient
+
+```{r read-roi-medians}
+roi_medians <- imap_dfr(patient_txt_dirs, function(dir, patient_id) {
+  txt_files <- list.files(dir, pattern = "\\.txt$", full.names = TRUE)
+
+  map_dfr(txt_files, function(f) {
+    dat <- read_tsv(f, show_col_types = FALSE)
+    dat <- dat[, !colnames(dat) %in% exclude_cols]
+    dat |>
+      summarise(across(everything(), \(x) median(x, na.rm = TRUE))) |>
+      mutate(patient_id = patient_id, roi = basename(f))
+  })
+})
+```
+
+```{r plot-roi-medians}
+long_roi <- roi_medians |>
+  pivot_longer(cols = -c(patient_id, roi),
+               names_to = "marker", values_to = "value")
+
+dir.create("marker_plots", showWarnings = FALSE)
+
+markers  <- unique(long_roi$marker)
+patients <- unique(long_roi$patient_id)
+pal      <- setNames(scales::hue_pal()(length(patients)), patients)
+
+for (m in markers) {
+  dat <- filter(long_roi, marker == m)
+
+  p <- ggplot(dat, aes(x = value)) +
+    geom_histogram(aes(fill = patient_id), colour = "white",
+                   bins = 15, alpha = 0.7, position = "identity") +
+    geom_density(aes(y = after_stat(count)),
+                 colour = "grey30", linewidth = 0.8) +
+    scale_fill_manual(values = pal) +
+    labs(title = m, x = "Per-ROI median intensity",
+         y = "Count", fill = "Patient") +
+    theme_bw(base_size = 12) +
+    theme(plot.title = element_text(face = "bold"),
+          legend.position = "bottom")
+
+  print(p)
+
+}
+
+message("Done: ", length(markers), " plots saved to marker_plots/")
+```
