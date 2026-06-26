@@ -1,0 +1,292 @@
+---
+title: "Patients 14, 12, 17, 18, 19, 20 — Visualizing Distribution Differences"
+author: "Tazein Shah"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+library(imcRtools)
+library(dittoSeq)
+library(SummarizedExperiment)
+library(tidyverse)
+library(ggridges)
+library(RColorBrewer)
+
+dir.create("images", showWarnings = FALSE)
+```
+
+# Config
+
+```{r config}
+coord_cols <- c("Start_push", "End_push", "Pushes_duration", "X", "Y", "Z")
+
+markers_of_interest <- c(
+  "SMA", "CD4", "CD8a", "CD19", "CD15", "CD14", "CD86", "LAMP3",
+  "Ki67", "CD138", "PD1", "PDL1", "FoxP3", "CD68", "CD163", "TIM3",
+  "CD141", "CD11c", "CD56", "CD117", "EpCAM", "CD38", "CD45RO",
+  "MKI67", "LAG3", "CD1c"
+)
+
+patient_levels <- c("12", "14", "17", "18", "19", "20_4_25", "20_5_19")
+
+pt_colors <- setNames(
+  colorRampPalette(brewer.pal(7, "Set2"))(7),
+  rev(patient_levels)
+)
+
+base_dir     <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/steinbock/"
+raw_base_dir <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/Data/Imaging/IMC/Tumor/PardeeTumorAblations/"
+```
+
+# Load SPEs (post-seg)
+
+```{r load_spes}
+pt_dirs <- list(
+  "12"      = paste0(base_dir, "p12_results/"),
+  "14"      = paste0(base_dir, "p14_results/"),
+  "17"      = paste0(base_dir, "p17_results/"),
+  "18"      = paste0(base_dir, "p18_results/"),
+  "19"      = paste0(base_dir, "p19_results/"),
+  "20_4_25" = paste0(base_dir, "p20_4_25_results/"),
+  "20_5_19" = paste0(base_dir, "p20_5_19_results/")
+)
+
+spe_list <- imap(pt_dirs, function(dir, pt) {
+  spe <- read_steinbock(dir)
+  spe$patient_id <- pt
+  spe
+})
+```
+
+# Combine SPEs
+
+```{r combine_spes}
+common_markers  <- Reduce(intersect, lapply(spe_list, rownames))
+spe_list_trim   <- lapply(spe_list, function(s) s[common_markers, ])
+spe_combined    <- do.call(cbind, spe_list_trim)
+
+assay(spe_combined, "exprs") <- asinh(counts(spe_combined) / 1)
+
+rowData(spe_combined)$use_channel <- !grepl(
+  "DNA|Membrane", rownames(spe_combined), ignore.case = TRUE
+)
+
+metadata(spe_combined)$color_vectors <- list(patient_id = pt_colors)
+```
+
+# Build long data frames from SPE assays
+
+```{r spe_long}
+make_spe_long <- function(assay_name) {
+  as.data.frame(t(assay(spe_combined, assay_name))) |>
+    mutate(patient_id = factor(spe_combined$patient_id, levels = rev(patient_levels))) |>
+    pivot_longer(-patient_id, names_to = "marker", values_to = "intensity") |>
+    filter(marker %in% markers_of_interest)
+}
+
+counts_long <- make_spe_long("counts")
+exprs_long  <- make_spe_long("exprs")
+```
+
+# Load filtered pixels (0-100, pre-seg)
+
+```{r load_filtered_pixels}
+filtered_dirs <- list(
+  "12"      = paste0(base_dir, "p12_results/filtered/"),
+  "14"      = paste0(base_dir, "p14_results/filtered/"),
+  "17"      = paste0(base_dir, "p17_results/filtered/"),
+  "18"      = paste0(base_dir, "p18_results/filtered/"),
+  "19"      = paste0(base_dir, "p19_results/filtered/"),
+  "20_4_25" = paste0(base_dir, "p20_4_25_results/filtered/"),
+  "20_5_19" = paste0(base_dir, "p20_5_19_results/filtered/")
+)
+
+set.seed(42)
+pixels_filtered <- imap_dfr(filtered_dirs, function(dir, pt) {
+  txt_files <- list.files(dir, pattern = "\\.txt$", full.names = TRUE)
+  map_dfr(txt_files, function(f) {
+    df <- read_tsv(f, show_col_types = FALSE)
+    marker_cols <- setdiff(colnames(df), coord_cols)
+    df[sample(nrow(df), min(50000, nrow(df))), marker_cols]
+  }) |>
+    mutate(patient_id = pt)
+}) |>
+  rename_with(~ str_replace(.x, "\\(.*\\)$", "")) |>
+  pivot_longer(-patient_id, names_to = "marker", values_to = "intensity") |>
+  filter(marker %in% markers_of_interest) |>
+  mutate(patient_id = factor(patient_id, levels = rev(patient_levels)))
+```
+
+# Load raw unfiltered pixels
+
+```{r load_raw_pixels}
+raw_pt_dirs <- list(
+  "12"      = file.path(raw_base_dir, "Patient_12T"),
+  "14"      = file.path(raw_base_dir, "Patient_14T"),
+  "17"      = file.path(raw_base_dir, "Patient_17T"),
+  "18"      = file.path(raw_base_dir, "Patient_18T"),
+  "19"      = file.path(raw_base_dir, "Patient_19T"),
+  "20_4_25" = file.path(raw_base_dir, "4-25-2024_Patient 20-T"),
+  "20_5_19" = file.path(raw_base_dir, "Patient_20T_5-19-2024")
+)
+
+set.seed(42)
+pixels_raw <- imap_dfr(raw_pt_dirs, function(dir, pt) {
+  txt_files <- list.files(dir, pattern = "\\.txt$", full.names = TRUE)
+  map_dfr(txt_files, function(f) {
+    df <- read_tsv(f, show_col_types = FALSE)
+    marker_cols <- setdiff(colnames(df), coord_cols)
+    df[sample(nrow(df), min(50000, nrow(df))), marker_cols]
+  }) |>
+    mutate(patient_id = pt)
+}) |>
+  rename_with(~ str_replace(.x, "\\(.*\\)$", "")) |>
+  pivot_longer(-patient_id, names_to = "marker", values_to = "intensity") |>
+  filter(marker %in% markers_of_interest) |>
+  mutate(patient_id = factor(patient_id, levels = rev(patient_levels)))
+```
+
+# Marker split
+
+```{r marker_split}
+markers_use <- intersect(markers_of_interest, unique(pixels_filtered$marker))
+half        <- ceiling(length(markers_use) / 2)
+markers_1   <- markers_use[1:half]
+markers_2   <- markers_use[(half + 1):length(markers_use)]
+```
+
+# Plot functions
+
+```{r plot_functions}
+plot_ridges <- function(data, markers_subset, part, assay_label, xlab,
+                        subtitle = "50,000 pixels sampled per ROI") {
+  plot_df <- data |>
+    filter(marker %in% markers_subset) |>
+    mutate(marker = factor(marker, levels = markers_subset))
+
+  p <- ggplot(plot_df, aes(x = intensity, y = patient_id, fill = patient_id)) +
+    geom_density_ridges(alpha = 0.7, scale = 1.2, linewidth = 0.3,
+                        rel_min_height = 0.01) +
+    scale_fill_manual(values = pt_colors) +
+    facet_wrap(~ marker, scales = "free_x", ncol = 3,
+               labeller = label_value) +
+    labs(
+      title    = paste0("Staining distributions — ", assay_label, " (part ", part, ")"),
+      subtitle = subtitle,
+      x        = xlab,
+      y        = NULL
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+      legend.position  = "none",
+      strip.text       = element_text(face = "bold", size = 11),
+      strip.background = element_rect(fill = "grey90", color = "grey60"),
+      plot.title       = element_text(size = 14, face = "bold"),
+      plot.subtitle    = element_text(size = 10, color = "grey40")
+    )
+
+  fname <- file.path("images", paste0("ridgeplot_",
+                     gsub("[^a-z0-9]", "_", tolower(assay_label)),
+                     "_part", part, ".png"))
+  ggsave(fname, p, width = 14, height = 20, dpi = 150)
+  message("saved: ", fname)
+  print(p)
+}
+
+plot_ridges_raw <- function(data, markers_subset, part) {
+  plot_df <- data |>
+    filter(marker %in% markers_subset) |>
+    mutate(marker = factor(marker, levels = markers_subset))
+
+  x_limits <- plot_df |>
+    group_by(marker) |>
+    summarise(upper = quantile(intensity, 0.99), .groups = "drop")
+
+  plot_df <- plot_df |>
+    left_join(x_limits, by = "marker") |>
+    mutate(intensity = pmin(intensity, upper))
+
+  p <- ggplot(plot_df, aes(x = intensity, y = patient_id, fill = patient_id)) +
+    geom_density_ridges(alpha = 0.7, scale = 1.2, linewidth = 0.3,
+                        rel_min_height = 0.01) +
+    scale_fill_manual(values = pt_colors) +
+    facet_wrap(~ marker, scales = "free_x", ncol = 3,
+               labeller = label_value) +
+    labs(
+      title    = paste0("Staining distributions — Raw reads unfiltered (part ", part, ")"),
+      subtitle = "x axis clipped at 99th percentile per marker\n50,000 pixels sampled per ROI",
+      x        = "Intensity",
+      y        = NULL
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+      legend.position  = "none",
+      strip.text       = element_text(face = "bold", size = 11),
+      strip.background = element_rect(fill = "grey90", color = "grey60"),
+      plot.title       = element_text(size = 14, face = "bold"),
+      plot.subtitle    = element_text(size = 10, color = "grey40")
+    )
+
+  fname <- file.path("images", paste0("ridgeplot_raw_unfiltered_part", part, ".png"))
+  ggsave(fname, p, width = 14, height = 20, dpi = 150)
+  message("saved: ", fname)
+  print(p)
+}
+```
+
+# Ridgeplots
+
+## Raw reads (unfiltered)
+
+```{r plot_raw, fig.width=14, fig.height=20}
+for (part in 1:2) {
+  markers_i <- if (part == 1) markers_1 else markers_2
+  plot_ridges_raw(pixels_raw, markers_i, part)
+}
+```
+
+## Filtered pixels (0-100, pre-seg)
+
+```{r plot_filtered, fig.width=14, fig.height=20}
+for (part in 1:2) {
+  markers_i <- if (part == 1) markers_1 else markers_2
+  plot_ridges(pixels_filtered, markers_i, part,
+              assay_label = "Filtered pixel (0-100)",
+              xlab        = "Intensity")
+}
+```
+
+## Post-seg counts (0-100)
+
+```{r plot_counts, fig.width=14, fig.height=20}
+for (part in 1:2) {
+  markers_i <- if (part == 1) markers_1 else markers_2
+  plot_ridges(counts_long, markers_i, part,
+              assay_label = "Post-seg (0-100)",
+              xlab        = "Intensity",
+              subtitle    = NULL)
+}
+```
+
+## Post-seg asinh
+
+```{r plot_exprs, fig.width=14, fig.height=20}
+for (part in 1:2) {
+  markers_i <- if (part == 1) markers_1 else markers_2
+  plot_ridges(exprs_long, markers_i, part,
+              assay_label = "Post-seg asinh",
+              xlab        = "asinh(Intensity)",
+              subtitle    = NULL)
+}
+```
