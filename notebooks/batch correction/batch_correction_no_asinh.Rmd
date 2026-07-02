@@ -1,0 +1,314 @@
+---
+title: "Tumor IMC - Batch Correction and Dimensionality Reduction"
+author: "Vaidehi Gupta"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cerulean
+    code_folding: show
+  pdf_document:
+    toc: true
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+# Setup
+```{r setup, message=FALSE, warning=FALSE}
+.libPaths(c("/restricted/projectnb/camplab/home/vgupta7/R_libs", .libPaths()))
+
+library(imcRtools)
+library(SpatialExperiment)
+library(SingleCellExperiment)
+library(ggplot2)
+library(dplyr)
+library(stringr)
+library(harmony)
+library(scater)
+library(dittoSeq)
+library(viridis)
+library(cowplot)
+
+set.seed(42)
+```
+
+# Define Paths
+```{r paths}
+base_dir <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/steinbock/"
+
+figures_dir <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/figures/batch_correction_umaps/run3"
+dir.create(figures_dir, showWarnings = FALSE)
+
+steinbock_dirs <- list(
+  Patient10   = file.path(base_dir, "p10_results"),
+  Patient11   = file.path(base_dir, "p11_results"),
+  Patient12   = file.path(base_dir, "p12_results"),
+  Patient13   = file.path(base_dir, "p13_results"),
+  Patient14   = file.path(base_dir, "p14_results"),
+  Patient15   = file.path(base_dir, "p15_results"),
+  Patient16   = file.path(base_dir, "p16_results"),
+  Patient17   = file.path(base_dir, "p17_results"),
+  Patient18   = file.path(base_dir, "p18_results"),
+  Patient19   = file.path(base_dir, "p19_results"),
+  Patient20_425 = file.path(base_dir, "p20_4_25_results"),
+  Patient20_519 = file.path(base_dir, "p20_5_19_results")
+)
+```
+
+# Load All Patients
+```{r load-all}
+spe_list <- lapply(names(steinbock_dirs), function(patient) {
+  cat("Loading:", patient, "\n")
+  spe <- read_steinbock(steinbock_dirs[[patient]])
+  spe$patient_id  <- patient
+  spe
+})
+
+names(spe_list) <- names(steinbock_dirs)
+
+# Check cells loaded per patient
+for (p in names(spe_list)) {
+  cat(p, ":", ncol(spe_list[[p]]), "cells\n")
+}
+```
+
+# Add Metadata
+```{r metadata}
+# Add acquisition metadata for Patient 20
+spe_list$Patient20_425$acquisition <- "4-25"
+spe_list$Patient20_519$acquisition <- "5-19"
+
+# Add NA acquisition for all other patients
+for (p in names(spe_list)[!names(spe_list) %in% c("Patient20_425", "Patient20_519")]) {
+  spe_list[[p]]$acquisition <- NA
+}
+
+# Disease state metadata
+disease_state <- c(
+  Patient10    = "Benign",
+  Patient11    = "Lower",
+  Patient12    = "Higher",
+  Patient13    = "Higher",
+  Patient14    = "Lower",
+  Patient15    = "Higher",
+  Patient16    = "Lower",
+  Patient17    = "Lower",
+  Patient18    = "Lower",
+  Patient19    = "Higher",
+  Patient20_425 = "Lower",
+  Patient20_519 = "Lower"
+)
+```
+
+# Combine All Patients
+```{r combine}
+spe_combined <- do.call(cbind, spe_list)
+spe_combined$disease_state <- disease_state[spe_combined$patient_id]
+
+cat("Total cells before filtering:", ncol(spe_combined), "\n")
+cat("Total markers:", nrow(spe_combined), "\n")
+
+# Check cells per patient
+table(spe_combined$patient_id)
+```
+
+# Quality Control and Filtering
+```{r qc-filter}
+# Filter by cell area
+spe_combined <- spe_combined[, spe_combined$area >= 20 & spe_combined$area < 500]
+
+cat("Total cells after filtering:", ncol(spe_combined), "\n")
+```
+
+# Select Markers for Batch Correction
+```{r select-markers}
+# Exclude structural/QC markers
+markers_exclude <- c("DNA191", "DNA193", "Membrane")
+markers_use <- rownames(spe_combined)[!rownames(spe_combined) %in% markers_exclude]
+
+cat("Markers used for batch correction:", length(markers_use), "\n")
+print(markers_use)
+```
+
+# Dimensionality Reduction BEFORE Batch Correction
+```{r pca-before}
+# Run PCA on 0-100 scaled data (NOT asinh)
+spe_combined <- runPCA(spe_combined,
+                       assay.type = "counts",  # changed from asin to counts
+                       subset_row = markers_use,
+                       ncomponents = 50,
+                       name = "PCA_uncorrected")
+
+cat("PCA complete\n")
+```
+
+```{r umap-before}
+# Run UMAP on uncorrected PCA
+spe_combined <- runUMAP(spe_combined,
+                        dimred = "PCA_uncorrected",
+                        name = "UMAP_uncorrected")
+
+cat("UMAP complete\n")
+```
+
+## Visualize UMAP Before Batch Correction
+```{r plot-umap-before, fig.width=12, fig.height=5}
+# Color by patient
+p1 <- plotReducedDim(spe_combined,
+                     dimred = "UMAP_uncorrected",
+                     colour_by = "patient_id",
+                     point_size = 0.3,
+                     point_alpha = 0.3) +
+  labs(title = "UMAP Before Batch Correction",
+       subtitle = "Colored by patient") +
+  theme_bw() +
+  guides(color = guide_legend(override.aes = list(size = 4, alpha = 1)))
+
+# Color by sample_id
+p2 <- plotReducedDim(spe_combined,
+                     dimred = "UMAP_uncorrected",
+                     colour_by = "sample_id",
+                     point_size = 0.3,
+                     point_alpha = 0.3) +
+  labs(title = "UMAP Before Batch Correction",
+       subtitle = "Colored by sample_id (ROI)") +
+  theme_bw() +
+  theme(legend.position = "none")
+
+plot_grid(p1, p2, ncol = 2)
+ggsave(file.path(figures_dir, "umap_before_harmony.png"),
+       width = 12, height = 10, dpi = 300)
+```
+
+# Run Harmony Batch Correction
+```{r harmony}
+# Extract PCA embeddings
+pca_mat <- reducedDim(spe_combined, "PCA_uncorrected")
+
+# Run Harmony using sample_id as batch variable
+harmony_embeddings <- harmony::RunHarmony(
+  pca_mat,
+  meta_data = as.data.frame(colData(spe_combined)),
+  vars_use  = "sample_id",
+  verbose   = TRUE
+)
+
+# Store corrected embeddings
+reducedDim(spe_combined, "Harmony") <- harmony_embeddings
+
+cat("Harmony batch correction complete\n")
+```
+
+# Dimensionality Reduction AFTER Batch Correction
+```{r umap-after}
+# Run UMAP on Harmony-corrected embeddings
+spe_combined <- runUMAP(spe_combined,
+                        dimred = "Harmony",
+                        name = "UMAP_harmony")
+
+cat("UMAP on Harmony embeddings complete\n")
+```
+
+## Visualize UMAP After Batch Correction
+```{r plot-umap-after, fig.width=12, fig.height=5}
+# Color by patient
+p3 <- plotReducedDim(spe_combined,
+                     dimred = "UMAP_harmony",
+                     colour_by = "patient_id",
+                     point_size = 0.3,
+                     point_alpha = 0.3) +
+  labs(title = "UMAP After Harmony Batch Correction",
+       subtitle = "Colored by patient") +
+  theme_bw() +
+  guides(color = guide_legend(override.aes = list(size = 4, alpha = 1)))
+
+# Color by sample_id
+p4 <- plotReducedDim(spe_combined,
+                     dimred = "UMAP_harmony",
+                     colour_by = "sample_id",
+                     point_size = 0.3,
+                     point_alpha = 0.3) +
+  labs(title = "UMAP After Harmony Batch Correction",
+       subtitle = "Colored by sample_id (ROI)") +
+  theme_bw() +
+  theme(legend.position = "none")
+
+plot_grid(p3, p4, ncol = 2)
+ggsave(file.path(figures_dir, "umap_after_harmony.png"),
+       width = 14, height = 10, dpi = 300)
+```
+
+# UMAP Colored by Disease State
+```{r disease-state-umap, fig.width=12, fig.height=10}
+p5 <- plotReducedDim(spe_combined,
+                     dimred = "UMAP_harmony",
+                     colour_by = "disease_state",
+                     point_size = 0.3,
+                     point_alpha = 0.3) +
+  labs(title = "UMAP After Harmony Batch Correction",
+       subtitle = "Colored by disease state") +
+  theme_bw() +
+  guides(color = guide_legend(override.aes = list(size = 4, alpha = 1)))
+
+p5
+
+ggsave(file.path(figures_dir, "umap_harmony_disease_state.png"),
+       plot = p5,
+       width = 8, height = 6, dpi = 300)
+```
+
+# Before vs After Comparison
+```{r before-after, fig.width=12, fig.height=10}
+comparison_plot <- plot_grid(p1, p2, p3, p4, ncol = 2)
+comparison_plot
+ggsave(file.path(figures_dir, "umap_before_after_harmony.png"),
+       plot = comparison_plot,
+       width = 14, height = 10, dpi = 300)
+```
+
+# Assess Batch Correction Quality
+```{r assess}
+# Check if patients mix well after correction
+# Good batch correction = patients mix in UMAP
+# Bad batch correction = patients still cluster separately
+
+# Plot each patient separately to check mixing
+per_patient_plot <- plotReducedDim(spe_combined,
+               dimred = "UMAP_harmony",
+               colour_by = "patient_id",
+               point_size = 0.3,
+               point_alpha = 0.5) +
+  facet_wrap(~ spe_combined$patient_id) +
+  labs(title = "UMAP After Harmony - Per Patient") +
+  theme_bw() +
+  theme(legend.position = "none")
+
+per_patient_plot
+ggsave(file.path(figures_dir, "umap_harmony_per_patient.png"),
+       plot = per_patient_plot,
+       width = 14, height = 10, dpi = 300)
+```
+
+
+# Save Combined SPE Object
+```{r save}
+output_path <- file.path(base_dir, "../analysis/spe_combined_harmony_r3.rds")
+saveRDS(spe_combined, output_path)
+cat("Saved combined SPE object to:", output_path, "\n")
+```
+
+# Summary
+```{r summary}
+cat("=== Batch Correction Summary ===\n")
+cat("Total cells:", ncol(spe_combined), "\n")
+cat("Total markers:", nrow(spe_combined), "\n")
+cat("Markers used for correction:", length(markers_use), "\n")
+cat("Batch variable: sample_id\n")
+cat("Method: Harmony\n")
+cat("\nCells per patient:\n")
+print(table(spe_combined$patient_id))
+cat("\nCells per ROI (sample_id):\n")
+print(table(spe_combined$sample_id))
+```
