@@ -1,0 +1,246 @@
+---
+title: "Uncorrected Baseline Louvain Clustering"
+author: "Vaidehi Gupta"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cerulean
+    code_folding: show
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 12, fig.height = 8)
+set.seed(42)
+```
+
+# 1. Setup
+```{r}
+.libPaths(c("/restricted/projectnb/camplab/home/vgupta7/R_libs", .libPaths()))
+
+library(SpatialExperiment)
+library(SingleCellExperiment)
+library(scran)
+library(bluster)
+library(scater)
+library(dittoSeq)
+library(tidyverse)
+library(patchwork)
+```
+
+# 2. Load Single-cell Spatial Data Object
+```{r}
+# Establish analysis directory
+analysis_dir <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/"
+
+# Path to input file (the rds generated from Tazein's Louvain clustering)
+input_path <- file.path(analysis_dir, "harmony_0100_cluster.rds")
+
+if(!file.exists(input_path)) {
+  stop("Input file not found! Double check path: ", input_path)
+}
+
+# Read the object generated from the no-asinh pipeline
+spe <- readRDS(input_path)
+cat("Successfully loaded data object.\n")
+cat("Available reduced dimensions:", paste(reducedDimNames(spe), collapse = ", "), "\n")
+```
+
+# 3. Compute Louvain Clustering on Uncorrected Baseline PCA
+```{r}
+# 1. Build Shared Nearest Neighbor (SNN) Graph explicitly utilizing the pre-Harmony PCA slot
+g_uncorrected <- buildSNNGraph(spe, 
+                               use.dimred = "PCA_uncorrected", 
+                               type = "rank")
+
+# 2. Extract cluster membership assignments via Louvain algorithm
+uncorrected_louvain_clusters <- igraph::cluster_louvain(g_uncorrected)$membership
+
+# 3. Append results to object metadata column as a discrete factor
+spe$uncorrected_louvain <- as.factor(uncorrected_louvain_clusters)
+
+cat("Uncorrected baseline Louvain identified", length(levels(spe$uncorrected_louvain)), "clusters.\n")
+```
+
+These 34 clusters represent the raw, patient-specific batch artifact states (technical compartments)
+
+# 4. Cross-Reference Table: Raw PCA vs. Harmony Clusters
+```{r}
+# Check if the columns exist before generating the table
+if("broad_clusters" %in% colnames(colData(spe))) {
+  
+  cat("### Clean Contingency Matrix: Uncorrected vs Harmony Clusters\n")
+  
+  # 1. Generate the raw cross-tabulation
+  raw_table <- table(spe$uncorrected_louvain, spe$broad_clusters)
+  
+  # 2. Convert to a clean tibble format
+  clean_table <- as.data.frame.matrix(raw_table) %>% 
+    as_tibble(rownames = "Uncorrected_Cluster")
+  
+  # 3. Print the clean table
+  print(clean_table)
+  
+} else {
+  cat("Note: Target columns not found in this object metadata.\n")
+}
+```
+Row 6 has 16,301 cells
+Row 11 has 20,355 cells 
+
+These are the massive cell populations (likely EpCAM+ tumor sheets or dense structural stromal cells).
+
+Uncorrected cluster 11 has cells spread across Harmony clusters 7 (20,355), 8 (3,113), 9 (1,063) etc. This confirms that Harmony meaningfully reorganized the cell groupings rather than just relabeling them.
+
+# 5. Visualizing Uncorrected Clustering Shifts across Spaces
+```{r}
+# Plot uncorrected Louvain clusters on the uncorrected UMAP space to see original layout
+p1 <- plotReducedDim(spe, 
+                     dimred = "UMAP_uncorrected", 
+                     colour_by = "uncorrected_louvain", 
+                     point_size = 0.4) +
+  labs(title = "Uncorrected Clusters (Raw UMAP Space)", 
+       colour = "Raw Clusters") +
+  theme_minimal()
+
+# Plot those same uncorrected clusters on the Harmony UMAP space to visualize blending
+p2 <- plotReducedDim(spe, 
+                     dimred = "UMAP_harmony", 
+                     colour_by = "uncorrected_louvain", 
+                     point_size = 0.4) +
+  labs(title = "Uncorrected Clusters on Harmony UMAP", 
+       colour = "Raw Clusters") +
+  theme_minimal()
+
+# Display the two plots side-by-side
+p1 + p2 + plot_layout(guides = "collect") & 
+  guides(colour = guide_legend(override.aes = list(size = 5))) & 
+  theme(legend.position = "bottom")
+```
+
+Left UMAP: Uncorrected clusters shown on the uncorrected UMAP. There are 34 distinct clusters, many of which correspond to patient-specific islands. The separation is heavily influenced by technical batch effects. 
+
+Right UMAP: Those same 34 uncorrected clusters are projected onto the Harmony UMAP. The clusters are more scrambled and don't align cleanly. This confirms that Harmony reshuffled cells across the space, mixing what were previously patient-specific clusters.
+
+# 6. Export Updated SPE Object
+```{r}
+output_path <- file.path(base_dir, "../analysis/spe_combined_with_uncorrected_baseline.rds")
+saveRDS(spe, output_path)
+cat("Updated SPE object with baseline tracking data successfully saved to:", output_path, "\n")
+```
+
+# 7. Dot Plots for Uncorrected Clusters
+```{r}
+
+# Core markers (these come from the pre-print's cell type annotation scheme)
+core_markers <- c("SMA", "CD4", "CD8a", "CD19", "CD15",
+                  "CD14", "CD86", "LAMP3", "CD163", "EpCAM")
+core_markers <- core_markers[core_markers %in% rownames(spe)]
+
+# Full panel markers
+full_markers <- c(
+  "SMA", "CD4", "CD8a", "CD19", "CD15", "CD14", "CD86", "LAMP3",
+  "MKI67", "CD138", "PD1", "PDL1", "FoxP3", "CD68", "CD163",
+  "TIM3", "CD141", "CD11c", "CD56", "CD117", "EpCAM", "CD38",
+  "CD45RO", "LAG3", "CD1c", "GATA3", "TTF1orCD16"
+)
+full_markers <- full_markers[full_markers %in% rownames(spe)]
+
+## Preprocessing: 99th percentile cap + Z-score (same as Tazein's notebook)
+cap_99 <- function(mat) {
+  t(apply(mat, 1, function(x) {
+    q99 <- quantile(x, 0.99)
+    pmin(x, q99)
+  }))
+}
+
+zscore_rows <- function(mat) {
+  t(scale(t(mat)))
+}
+
+mat_0100 <- counts(spe) |> cap_99() |> zscore_rows()
+assay(spe, "scaled_0100") <- mat_0100
+
+# make_dotplot function (same as Tazein's)
+make_dotplot <- function(spe, assay_name, cluster_col, marker_set, title) {
+  expr_mat   <- assay(spe, assay_name)[marker_set, ]
+  cluster_id <- spe[[cluster_col]]
+
+  mean_expr <- sapply(levels(cluster_id), function(cl) {
+    idx <- which(cluster_id == cl)
+    rowMeans(expr_mat[, idx, drop = FALSE])
+  })
+
+  global_med <- apply(expr_mat, 1, median)
+  frac_expr  <- sapply(levels(cluster_id), function(cl) {
+    idx <- which(cluster_id == cl)
+    rowMeans(expr_mat[, idx, drop = FALSE] > global_med)
+  })
+
+  mean_df <- as.data.frame(mean_expr) |>
+    rownames_to_column("marker") |>
+    pivot_longer(-marker, names_to = "cluster", values_to = "mean_exprs")
+
+  frac_df <- as.data.frame(frac_expr) |>
+    rownames_to_column("marker") |>
+    pivot_longer(-marker, names_to = "cluster", values_to = "frac_expressing")
+
+  plot_df <- left_join(mean_df, frac_df, by = c("marker", "cluster"))
+  plot_df$cluster <- factor(plot_df$cluster, levels = levels(cluster_id))
+
+  marker_order <- rownames(mean_expr)[hclust(dist(mean_expr))$order]
+  plot_df$marker <- factor(plot_df$marker, levels = marker_order)
+
+  ggplot(plot_df, aes(x = cluster, y = marker)) +
+    geom_point(aes(size = frac_expressing, color = mean_exprs)) +
+    scale_color_viridis(option = "magma", name = "Mean\nZ-score expr") +
+    scale_size_continuous(range = c(0.5, 6), name = "Fraction\nexpressing") +
+    labs(title = title, x = "Cluster", y = "Marker") +
+    theme_bw(base_size = 12) +
+    theme(
+      axis.text.x      = element_text(angle = 0, hjust = 0.5),
+      axis.text.y      = element_text(size = 9),
+      panel.grid.major = element_line(color = "grey90"),
+      legend.position  = "right"
+    )
+}
+
+library(viridis)
+# Core marker dot plot
+p_dot_core <- make_dotplot(spe, "scaled_0100", "uncorrected_louvain",
+                           core_markers,
+                           "Uncorrected PCA: Core Marker Expression per Louvain Cluster")
+print(p_dot_core)
+
+# Full panel dot plot
+p_dot_full <- make_dotplot(spe, "scaled_0100", "uncorrected_louvain",
+                           full_markers,
+                           "Uncorrected PCA: Full Panel Marker Expression per Louvain Cluster")
+print(p_dot_full)
+```
+
+The diffuse signal across markers in many clusters suggests they're capturing a mix of cell types from the same patient, rather than true biological populations. This supports using the Harmony-corrected clustering for downstream analysis.
+
+# Plot uncorrected clusters on uncorrected UMAP
+```{r}
+p_uncorrected <- dittoDimPlot(spe,
+                               var = "uncorrected_louvain",
+                               reduction.use = "UMAP_uncorrected",
+                               size = 0.2,
+                               do.label = TRUE,
+                               labels.size = 3) +
+  labs(title = "Uncorrected PCA: Louvain Clustering (34 clusters)",
+       subtitle = "UMAP colored by cluster") +
+  theme(legend.position = "right")
+
+print(p_uncorrected)
+
+```
+

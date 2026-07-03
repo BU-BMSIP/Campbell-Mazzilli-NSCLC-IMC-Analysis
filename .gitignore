@@ -1,0 +1,10 @@
+*.pdf
+*.rds
+*.html
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+figures/
+images/
+*.csv
