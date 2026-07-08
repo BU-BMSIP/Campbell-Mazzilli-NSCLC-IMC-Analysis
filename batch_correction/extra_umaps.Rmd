@@ -2,7 +2,9 @@
 title: "Extra Batch Correction UMAPs"
 author: "Vaidehi Gupta"
 date: "`r Sys.Date()`"
-output: html_document
+output:
+  pdf_document: default
+  html_document: default
 ---
 
 ```{r setup, include=FALSE}
@@ -80,14 +82,91 @@ plotReducedDim(spe_sub,
 
 
 ```{r fig.width=12, fig.height=10}
-plotReducedDim(spe_sub,
-               dimred = "UMAP_harmony",
-               colour_by = "patient_id",
-               point_size = 0.3,
-               point_alpha = 0.5) +
-  facet_wrap(~ spe_sub$sample_id) +
-  labs(title = "UMAP After Harmony - ROI-level view",
-       subtitle = "Patients 12, 17, and 20") +
-  theme_bw() +
-  theme(legend.position = "none")
+patient_colors <- c(
+  "Patient12"     = "cornflowerblue",
+  "Patient17"     = "gold",
+  "Patient20_425" = "forestgreen",
+  "Patient20_519" = "coral"
+)
+
+
+for(patient in patients_of_interest) {
+  spe_patient <- spe_combined[, spe_combined$patient_id == patient]
+  
+  p <- plotReducedDim(spe_patient,
+                      dimred = "UMAP_harmony",
+                      colour_by = "patient_id",
+                      point_size = 0.5,
+                      point_alpha = 0.5) +
+    facet_wrap(~ spe_patient$sample_id) +
+    scale_colour_manual(values = patient_colors) +
+    labs(title = paste("UMAP After Harmony -", patient),
+         subtitle = "Faceted by ROI") +
+    theme_bw() +
+    theme(legend.position = "none")
+  
+  print(p)
+}
 ```
+# Check for Harmony overcorrection
+```{r}
+library(viridis)
+
+markers_to_check <- c("EpCAM", "SMA", "CD68", "CD8a", "CD19", "FoxP3", "LAMP3")
+
+for(marker in markers_to_check){
+  umap_coords <- reducedDim(spe_combined, "UMAP_harmony")
+  expr <- assay(spe_combined, "counts")[marker, ]
+  
+  df <- data.frame(
+    UMAP1 = umap_coords[, 1],
+    UMAP2 = umap_coords[, 2],
+    expr  = expr
+  )
+  
+  p <- ggplot(df, aes(x = UMAP1, y = UMAP2, color = expr)) +
+    geom_point(size = 0.3, alpha = 0.3) +
+    scale_color_viridis_c(option = "viridis") +
+    labs(title = paste("UMAP_harmony colored by", marker),
+         color = marker) +
+    theme_bw()
+  
+  print(p)
+}
+
+```
+Expression of markers is localized to specific regions of the UMAP. CD19 looks a bit more spread out than the other markers.
+
+# Check with more markers
+```{r fig.width=12, fig.height=6}
+library(patchwork)
+
+plot_marker <- function(spe, marker) {
+  umap_coords <- reducedDim(spe, "UMAP_harmony")
+  expr <- assay(spe, "counts")[marker, ]
+  
+  df <- data.frame(
+    UMAP1 = umap_coords[, 1],
+    UMAP2 = umap_coords[, 2],
+    expr  = expr
+  )
+  
+  ggplot(df, aes(x = UMAP1, y = UMAP2, color = expr)) +
+    geom_point(size = 0.3, alpha = 0.3) +
+    scale_color_viridis_c(option = "viridis") +
+    labs(title = marker, color = marker) +
+    theme_bw()
+}
+
+# Mutually exclusive pairs
+(plot_marker(spe_combined, "EpCAM") | plot_marker(spe_combined, "CD68")) /
+  (plot_marker(spe_combined, "SMA") | plot_marker(spe_combined, "CD19"))
+
+# Co-localizing markers
+(plot_marker(spe_combined, "PD1") | plot_marker(spe_combined, "TIM3") | plot_marker(spe_combined, "LAG3"))
+
+# Myeloid markers
+(plot_marker(spe_combined, "CD68") | plot_marker(spe_combined, "CD163") | plot_marker(spe_combined, "CD14"))
+```
+
+Mutually exclusive markers are in separate UMAP regions.

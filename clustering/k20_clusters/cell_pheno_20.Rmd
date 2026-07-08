@@ -55,7 +55,7 @@ library(RColorBrewer)
 ## 2. Load Harmonized Data
 
 ```{r load-data}
-spe_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/spe_combined_harmony_r3.rds"
+spe_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/batch_correction/spe_combined_harmony_r3.rds"
 
 spe <- readRDS(spe_path)
 
@@ -133,7 +133,7 @@ saved immediately after so clustering does not need to rerun on every
 render.
 
 ```{r cluster}
-intermediate_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/harmony_0100_clustered_intermediate.rds"
+intermediate_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/clustering/harmony_20_clustered_intermediate.rds"
 
 if (file.exists(intermediate_path)) {
   cat("Loading existing clustered SPE from intermediate file.\n")
@@ -369,11 +369,11 @@ all_markers <- lapply(levels(spe$broad_clusters), function(cl) {
 all_markers_df <- do.call(rbind, all_markers)
 
 write.csv(all_markers_df,
-          "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/findmarkers_broad_clusters.csv",
+          "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/clustering/harmony_20_cluster_findmarkers.csv",
           row.names = FALSE)
 
 # print top 5 positive markers per cluster
-df <- read.csv("/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/findmarkers_broad_clusters.csv")
+df <- read.csv("/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/clustering/harmony_20_cluster_findmarkers.csv")
 
 # summary table: top positive marker per cluster at a glance
 top1_summary <- do.call(rbind, lapply(levels(spe$broad_clusters), function(cl) {
@@ -560,7 +560,7 @@ if ("broad_celltype" %in% colnames(colData(spe))) {
 ## 17. Save Annotated SPE
 
 ```{r save}
-out_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/steinbock/harmony_0100_cluster.rds"
+out_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/clustering/k20_clusters/harmony_20_cluster_annot.rds"
 
 if ("broad_celltype" %in% colnames(colData(spe))) {
   saveRDS(spe, out_path)

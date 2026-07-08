@@ -1,0 +1,313 @@
+---
+title: 'All Patients: Violin Plots per Cluster — Harmony (no asinh)'
+author: "Vaidehi Gupta"
+date: "07-06-2026"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+subtitle: 20 Clusters — Full Panel Marker Distributions
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 14, fig.height = 6)
+set.seed(42)
+```
+
+## Overview
+
+The dot plot from `cell_pheno_20.Rmd` shows the *mean* Z-score
+expression per marker per cluster, which can hide whether a marker is
+uniformly expressed across a cluster or only in a subset of cells
+within it. That distinction matters because two markers can both show
+an elevated mean in the same cluster without ever being expressed in
+the same cell (e.g. the FoxP3 / LAMP3 concern raised at lab meeting).
+
+This notebook builds one violin plot per cluster: markers on the
+x-axis, and the full distribution of per-cell Z-score expression
+(all cells belonging to that cluster) on the y-axis. Reading the
+shape of each marker's violin (not just its mean) tells you:
+
+- **Tall, narrow, high violin** -> marker cleanly defines this
+  cluster's identity (most cells agree)
+- **Squashed, low violin near zero** -> marker is not really "on" in
+  this cluster; likely background/noise or an irrelevant marker
+- **Two-humped (bimodal) violin** -> the cluster is probably a mix of
+  two subpopulations, one positive and one negative for that marker,
+  rather than one cell type genuinely co-expressing both
+
+Three clusters are specifically flagged going in, based on the dot
+plot review:
+
+- **Cluster 4** ("DC / mregDC") -- LAMP3 is very high, but CD117,
+  MKI67, PD1, and EpCAM are also co-elevated in the same column. That
+  combination doesn't correspond to one coherent lineage, so this is
+  a candidate for a doublet/hybrid population.
+- **Cluster 9** ("Macrophage") -- broad, overlapping elevation across
+  many myeloid markers (CD11c, TIM3, CD163, CD14, CD68, CD86, LAG3,
+  PDL1, EpCAM, CD1c, TTF1orCD16, MKI67, LAMP3). Myeloid populations
+  often show this continuous pattern, so the violin shapes here help
+  tell "real transitional myeloid state" apart from "multiple merged
+  populations."
+- **Cluster 17** ("Unresolved Stromal / Other") -- flat in the dot
+  plot, no marker rises above baseline, and this matches the 10-cluster
+  `findMarkers()` result (no marker above logFC 0.5). Confirming the
+  violin shapes are flat here supports excluding this cluster before
+  subclustering.
+
+---
+
+## 1. Load Libraries
+
+```{r libraries}
+.libPaths(c("/restricted/projectnb/camplab/home/vgupta7/R_libs", .libPaths()))
+
+library(imcRtools)
+library(tidyverse)
+library(dittoSeq)
+library(viridis)
+library(scater)
+library(scran)
+library(patchwork)
+library(RColorBrewer)
+```
+
+---
+
+## 2. Load Annotated Clustered Data
+
+```{r load-data}
+# harmony_20_cluster.rds is the fully annotated output of cell_pheno_20.Rmd
+
+spe_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/clustering/k20_clusters/harmony_20_cluster.rds"
+
+spe <- readRDS(spe_path)
+
+cat("Cells:", ncol(spe), "\n")
+cat("Patients:", n_distinct(spe$patient_id), "\n")
+cat("Number of clusters:", nlevels(spe$broad_clusters), "\n")
+cat("Assays available:", paste(assayNames(spe), collapse = ", "), "\n")
+cat("Has broad_celltype annotation:", "broad_celltype" %in% colnames(colData(spe)), "\n")
+```
+
+---
+
+## 3. Marker Panel
+
+Using the full marker panel, same list used for the dot plot / findMarkers in cell_pheno_20.Rmd
+Keeping this identical means the violin marker order below is directly comparable to the dot plot.
+
+```{r markers}
+
+full_markers <- c(
+  "SMA", "CD4", "CD8a", "CD19", "CD15", "CD14", "CD86", "LAMP3",
+  "Ki67", "MKI67", "CD138", "PD1", "PDL1", "FoxP3", "CD68", "CD163",
+  "TIM3", "CD141", "CD11c", "CD56", "CD117", "EpCAM", "CD38",
+  "CD45RO", "LAG3", "CD1c", "GATA3", "TTF1orCD16"
+)
+full_markers <- full_markers[full_markers %in% rownames(spe)]
+
+cat("Full panel markers found:", length(full_markers), "\n")
+cat("Missing:", paste(setdiff(
+  c("SMA", "CD4", "CD8a", "CD19", "CD15", "CD14", "CD86", "LAMP3",
+    "Ki67", "MKI67", "CD138", "PD1", "PDL1", "FoxP3", "CD68", "CD163",
+    "TIM3", "CD141", "CD11c", "CD56", "CD117", "EpCAM", "CD38",
+    "CD45RO", "LAG3", "CD1c", "GATA3", "TTF1orCD16"),
+  rownames(spe)), collapse = ", "), "\n")
+```
+
+---
+
+## 4. Cluster -> Cell Type Lookup and Flagged Clusters
+
+Pull the cluster -> cell type label mapping straight out of the annotated SPE, so plot titles stay in sync with cell_pheno_20.Rmd without needing to retype the lookup table here.
+
+```{r lookup}
+
+cluster_levels <- levels(spe$broad_clusters)
+
+celltype_lookup <- setNames(
+  spe$broad_celltype[match(cluster_levels, as.character(spe$broad_clusters))],
+  cluster_levels
+)
+
+print(celltype_lookup)
+
+# Clusters flagged from the dot plot review, with a short reason each.
+# These get a highlighted subtitle on their violin plot so they're easy to spot when flipping through the PDF
+
+flagged_clusters <- list(
+  "4"  = "FLAGGED: LAMP3 co-elevated with CD117/MKI67/PD1/EpCAM -- check for doublet/hybrid",
+  "9"  = "FLAGGED: broad overlapping myeloid marker elevation -- check merged vs. transitional state",
+  "17" = "FLAGGED: no marker above baseline in dot plot -- candidate for exclusion"
+)
+```
+
+---
+
+## 5. Output Directory for Saved Plots
+
+Individual PNGs and one combined multi-page PDF get saved here.
+
+```{r out-dir}
+
+out_dir <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/clustering/k20_clusters/violin_plots"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+cat("Saving plots to:", out_dir, "\n")
+```
+
+---
+
+## 6. Violin Plot Function
+
+This builds one violin plot for a single cluster: x-axis = marker, y-axis = per-cell Z-score expression (scaled_0100 assay) for every cell in that cluster. 
+
+Markers are ordered by their mean expression within the cluster (highest first) so the "defining" markers for that cluster show up on the left.
+
+Each violin is filled by that marker's own mean expression (viridis scale) so it visually matches the color logic already used in the dot plot. Bright yellow means a marker is genuinely driving this cluster's identity, dark purple means it's near background.
+
+```{r violin-function}
+make_cluster_violin <- function(spe, assay_name, cluster_col, cluster_id,
+                                marker_set, celltype_label = NULL,
+                                note = NULL) {
+
+  idx      <- which(spe[[cluster_col]] == cluster_id)
+  expr_mat <- assay(spe, assay_name)[marker_set, idx, drop = FALSE]
+
+  # per-marker mean expression within this cluster -- drives both the
+  # x-axis ordering and the violin fill color
+  marker_means <- rowMeans(expr_mat)
+  marker_order <- names(sort(marker_means, decreasing = TRUE))
+
+  plot_df <- as.data.frame(t(expr_mat)) |>
+    pivot_longer(everything(), names_to = "marker", values_to = "zscore")
+  plot_df$marker <- factor(plot_df$marker, levels = marker_order)
+
+  # attach each cell's row to its marker's cluster-level mean, so the
+  # fill color is constant within a violin but varies across violins
+  plot_df$marker_mean <- marker_means[as.character(plot_df$marker)]
+
+  title_text <- paste0(
+    "Cluster ", cluster_id,
+    if (!is.null(celltype_label) && !is.na(celltype_label)) paste0(" \u2014 ", celltype_label) else ""
+  )
+  subtitle_text <- if (!is.null(note)) note else paste0("n = ", length(idx), " cells")
+  subtitle_color <- if (!is.null(note)) "firebrick" else "grey30"
+
+  ggplot(plot_df, aes(x = marker, y = zscore, fill = marker_mean)) +
+    geom_violin(color = "grey40", scale = "width", trim = TRUE) +
+    geom_boxplot(width = 0.12, outlier.size = 0.3, outlier.alpha = 0.3, fill = "white") +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+    scale_fill_viridis_c(option = "viridis", name = "Mean\nZ-score") +
+    labs(title = title_text, subtitle = subtitle_text,
+        x = "Marker", y = "Z-score expression (scaled_0100)") +
+    theme_bw(base_size = 11) +
+    theme(
+      axis.text.x    = element_text(angle = 45, hjust = 1),
+      plot.subtitle  = element_text(color = subtitle_color, face = "bold")
+    )
+}
+```
+
+---
+
+## 7. Generate and Save a Violin Plot for Every Cluster
+
+Loop over every cluster: print inline for this HTML/PDF render. Save an individual PNG per cluster, and collect all plots into a list for the combined multi-page PDF in the next chunk.
+
+```{r violin-loop, fig.width=14, fig.height=6}
+
+violin_plots <- list()
+
+for (cl in cluster_levels) {
+
+  celltype <- celltype_lookup[[cl]]
+  note     <- flagged_clusters[[cl]]  # NULL if this cluster isn't flagged
+
+  p <- make_cluster_violin(
+    spe             = spe,
+    assay_name      = "scaled_0100",
+    cluster_col     = "broad_clusters",
+    cluster_id      = cl,
+    marker_set      = full_markers,
+    celltype_label  = celltype,
+    note            = note
+  )
+
+  print(p)
+  violin_plots[[cl]] <- p
+
+  # individual PNG, one file per cluster
+  ggsave(
+    filename = file.path(out_dir, paste0("violin_cluster_", cl, ".png")),
+    plot     = p, width = 14, height = 6, dpi = 300
+  )
+}
+
+cat("Saved", length(violin_plots), "individual violin plots to:", out_dir, "\n")
+```
+
+---
+
+## 8. Combined Multi-Page PDF (All 20 Clusters)
+
+```{r combined-pdf}
+
+pdf_path <- file.path(out_dir, "violin_plots_all_clusters.pdf")
+
+pdf(pdf_path, width = 14, height = 6)
+for (cl in cluster_levels) {
+  print(violin_plots[[cl]])
+}
+dev.off()
+
+cat("Saved combined PDF to:", pdf_path, "\n")
+```
+
+---
+
+## 9. Quick Reference: Flagged Clusters Side-by-Side
+
+```{r flagged-side-by-side, fig.width=14, fig.height=16}
+
+flagged_ids <- names(flagged_clusters)
+flagged_ids <- flagged_ids[flagged_ids %in% cluster_levels]
+
+if (length(flagged_ids) > 0) {
+  wrap_plots(violin_plots[flagged_ids], ncol = 1)
+} else {
+  cat("No flagged clusters found in this cluster set.\n")
+}
+```
+
+---
+
+## Notes
+
+- Uses the `scaled_0100` assay (99th percentile cap + Z-score) that is
+  already attached to `harmony_20_cluster.rds` from `cell_pheno_20.Rmd`
+  -- no re-computation of this assay happens here, so the values match
+  the dot plot exactly.
+- Marker order is determined *per cluster* (highest mean first), not
+  the global hclust order used in the dot plot, so the left-most
+  markers in each panel are always that cluster's own top markers.
+- A bimodal violin for a marker that also had a high dot-plot mean is
+  the direct signature of a doublet/hybrid population -- that cell
+  type is not genuinely co-expressing both markers, it's two cell
+  types blended into one cluster.
+- If a flagged cluster's violins turn out clean (all unimodal, no
+  double humps), that argues the co-elevated markers are a real,
+  if unusual, biological signature and not a clustering artifact --
+  worth a second look with `findMarkers()` and spatial context (QuPath)
+  before relabeling.
+- Rerunning `cell_pheno_20.Rmd` may reshuffle cluster numbers; if that
+  happens, re-run this notebook against the newly saved
+  `harmony_20_cluster.rds` rather than reusing old cluster numbers.

@@ -1,0 +1,332 @@
+---
+title: 'Cluster Resolution Comparison: k=20 vs. k=150 and k=200'
+author: "Vaidehi Gupta"
+date: "07-07-2026"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+subtitle: Cross-tabulating fine (k=20) clusters against coarser (k=150, k=200) resolutions
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 8)
+set.seed(42)
+```
+
+## Overview
+
+The 20-cluster (k=20) run is the finest, fully annotated resolution.
+The k=150 (12 clusters) and k=200 (11 clusters) runs are much coarser
+partitions of the *same underlying cells*. Cross-tabulating which
+k=20 clusters collapse into which coarse cluster tells us:
+
+- **If two fine clusters merge into the same coarse cluster** -> they
+  likely represent real biology (e.g. activation
+  states of one lineage), not two separate cell types.
+- **If a fine cluster stays isolated as its own coarse cluster even at k=200** -> it's a genuinely distinct population; any co-expression weirdness inside it (e.g. Cluster 4's LAMP3/CD117 bimodality) is a *local* contamination problem, not a resolution problem, and needs targeted sub-clustering to resolve.
+- **If a small/weak fine cluster gets absorbed entirely into a bigger neighbor** at coarser resolution -> it's a borderline population worth extra scrutiny before treating its identity as settled.
+
+This is a per-cell comparison, not a per-cluster-label comparison, so
+cells are matched by their unique cell ID/barcode across the three
+`.rds` objects before any cross-tab is built.
+
+Rows: which of the 20 clusters a cell belongs to
+Columns: which of the 12 (or 11) coarse clusters that same cell belongs to
+Each cell: how many cells share that particular combination
+
+---
+
+## 1. Load Libraries
+
+```{r libraries}
+.libPaths(c("/restricted/projectnb/camplab/home/vgupta7/R_libs", .libPaths()))
+
+library(tidyverse)
+library(SingleCellExperiment)
+library(pheatmap)
+library(RColorBrewer)
+ library(ggplot2)
+library(dplyr)
+```
+
+---
+
+## 2. Load the Three Clustering Runs
+
+k=20: the fully annotated fine-resolution run (20 clusters)
+k=150 and k=200: the more broader resolution runs (12 and 11 clusters, respectively)
+
+```{r load-data}
+
+spe_k20_path  <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/clustering/k20_clusters/harmony_20_cluster_annot.rds"
+
+spe_k150_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/clustering/k150_clusters/harmony_150_cluster_annot.rds"
+
+spe_k200_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/clustering/k200_clusters/harmony_200_cluster_annot.rds"
+
+spe_k20  <- readRDS(spe_k20_path)
+spe_k150 <- readRDS(spe_k150_path)
+spe_k200 <- readRDS(spe_k200_path)
+
+cat("k=20  run: ", ncol(spe_k20),  "cells,", nlevels(factor(spe_k20$broad_clusters)),  "clusters\n")
+cat("k=150 run: ", ncol(spe_k150), "cells,", nlevels(factor(spe_k150$broad_clusters)), "clusters\n")
+cat("k=200 run: ", ncol(spe_k200), "cells,", nlevels(factor(spe_k200$broad_clusters)), "clusters\n")
+```
+
+---
+
+## 3. Cell-Barcode Alignment Function
+
+Cross-tabulating requires matching the SAME cell across two objects, not just assuming row order lines up. Different clustering runs may have dropped different QC-failed cells or been saved in a different cell order. This function finds the shared cells and returns aligned cluster-assignment vectors for both runs.
+
+```{r align-function}
+
+align_clusters <- function(spe_a, spe_b, label_a = "A", label_b = "B") {
+
+  common_cells <- intersect(colnames(spe_a), colnames(spe_b))
+
+  cat(sprintf(
+    "%s: %d cells | %s: %d cells | shared: %d cells (%.1f%% of %s, %.1f%% of %s)\n",
+    label_a, ncol(spe_a), label_b, ncol(spe_b), length(common_cells),
+    100 * length(common_cells) / ncol(spe_a), label_a,
+    100 * length(common_cells) / ncol(spe_b), label_b
+  ))
+
+  list(
+    cells      = common_cells,
+    clusters_a = factor(spe_a$broad_clusters[match(common_cells, colnames(spe_a))]),
+    clusters_b = factor(spe_b$broad_clusters[match(common_cells, colnames(spe_b))])
+  )
+}
+```
+
+---
+
+## 4. Cross-Tabulation Function (counts, proportions, purity, heatmap)
+
+Builds everything needed from one pair of aligned cluster vectors:
+- raw count cross-tab (fine clusters x coarse clusters)
+- row-normalized proportions (what % of each fine cluster's cells land in each coarse cluster)
+- a "purity" summary: for each fine cluster, which coarse cluster gets the most of its cells, 
+  and what fraction that is. 
+      - A fine cluster near 1.0 nests cleanly into one coarse cluster (stable). 
+      - A fine cluster split across several coarse clusters at a lower fraction is more ambiguous / composite.
+- a heatmap of the proportion table for quick visual scanning
+
+```{r crosstab-function}
+
+# plot_heatmap: adaptive text color heatmap, defined once and reused below
+plot_heatmap <- function(mat, title = "", legend_title = "value",
+                         digits = 2, text_threshold = 0.5) {
+  row_levels <- rownames(mat)
+  col_levels <- colnames(mat)
+
+  df <- as.data.frame(as.table(mat))
+  colnames(df) <- c("row", "col", "value")
+  df$row <- factor(df$row, levels = rev(row_levels))
+  df$col <- factor(df$col, levels = col_levels)
+
+  val_range <- range(df$value, na.rm = TRUE)
+  df$norm_value <- (df$value - val_range[1]) / diff(val_range)
+  df$text_color <- ifelse(df$norm_value > text_threshold, "white", "black")
+
+  ggplot(df, aes(x = col, y = row, fill = value)) +
+    geom_tile(color = "white", linewidth = 0.5) +
+    geom_text(aes(label = sprintf(paste0("%.", digits, "f"), value), color = text_color),
+              size = 3) +
+    scale_fill_gradientn(colors = brewer.pal(9, "YlGnBu"), name = legend_title) +
+    scale_color_identity() +
+    labs(title = title, x = NULL, y = NULL) +
+    theme_minimal(base_size = 11) +
+    theme(
+      panel.grid  = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+      axis.text.y = element_text(size = 10),
+      plot.title  = element_text(face = "bold")
+    )
+}
+
+run_crosstab <- function(fine_clusters, coarse_clusters,
+                         fine_label = "k=20", coarse_label = "coarse",
+                         fine_names = NULL, coarse_names = NULL) {
+  count_tab <- table(fine = fine_clusters, coarse = coarse_clusters)
+  if (!is.null(fine_names)) {
+    rownames(count_tab) <- paste0(rownames(count_tab), " - ", fine_names[rownames(count_tab)])
+  }
+  if (!is.null(coarse_names)) {
+    colnames(count_tab) <- paste0(colnames(count_tab), " - ", coarse_names[colnames(count_tab)])
+  }
+  prop_tab <- prop.table(count_tab, margin = 1)
+
+  purity_df <- data.frame(
+    fine_cluster            = rownames(prop_tab),
+    dominant_coarse_cluster = colnames(prop_tab)[apply(prop_tab, 1, which.max)],
+    fraction_in_dominant    = round(apply(prop_tab, 1, max), 3)
+  ) |>
+    arrange(fraction_in_dominant)
+
+  list(counts = count_tab, proportions = prop_tab, purity = purity_df)
+}
+```
+
+---
+
+## 5. Comparison A: k=20 vs. k=150 (12 clusters)
+
+Pull the cell-type name lookup from the k=20 annotated object so the heatmap rows are readable (e.g. "4 - DC / mregDC") instead of just bare cluster numbers.
+
+```{r compare-k20-k150, fig.width=11, fig.height=8}
+
+celltype_lookup_k20 <- setNames(
+  spe_k20$broad_celltype[match(levels(factor(spe_k20$broad_clusters)), as.character(spe_k20$broad_clusters))],
+  levels(factor(spe_k20$broad_clusters))
+)
+
+celltype_lookup_k150 <- setNames(
+  spe_k150$broad_celltype[match(levels(factor(spe_k150$broad_clusters)), as.character(spe_k150$broad_clusters))],
+  levels(factor(spe_k150$broad_clusters))
+)
+
+aligned_150 <- align_clusters(spe_k20, spe_k150, label_a = "k=20", label_b = "k=150")
+
+result_150 <- run_crosstab(
+  fine_clusters   = aligned_150$clusters_a,
+  coarse_clusters = aligned_150$clusters_b,
+  fine_label      = "k=20",
+  coarse_label    = "k=150",
+  fine_names      = celltype_lookup_k20,
+  coarse_names    = celltype_lookup_k150
+)
+
+plot_heatmap(result_150$proportions,
+            title = "k=20 clusters vs. k=150 clusters (row-normalized)",
+            legend_title = "proportion")
+
+cat("\n--- k=20 clusters sorted by how 'split' they are across k=150 clusters ---\n")
+cat("(low fraction_in_dominant = split across multiple coarse clusters = more ambiguous)\n\n")
+print(result_150$purity)
+```
+
+---
+
+## 6. Comparison B: k=20 vs. k=200 (11 clusters)
+
+```{r compare-k20-k200, fig.width=11, fig.height=8}
+
+celltype_lookup_k200 <- setNames(
+  spe_k200$broad_celltype[match(levels(factor(spe_k200$broad_clusters)), as.character(spe_k200$broad_clusters))],
+  levels(factor(spe_k200$broad_clusters))
+)
+
+aligned_200 <- align_clusters(spe_k20, spe_k200, label_a = "k=20", label_b = "k=200")
+
+result_200 <- run_crosstab(
+  fine_clusters   = aligned_200$clusters_a,
+  coarse_clusters = aligned_200$clusters_b,
+  fine_label      = "k=20",
+  coarse_label    = "k=200",
+  fine_names      = celltype_lookup_k20,
+  coarse_names    = celltype_lookup_k200
+)
+
+plot_heatmap(result_200$proportions,
+            title = "k=20 clusters vs. k=200 clusters (row-normalized)",
+            legend_title = "proportion")
+
+
+cat("\n--- k=20 clusters sorted by how 'split' they are across k=200 clusters ---\n")
+cat("(low fraction_in_dominant = split across multiple coarse clusters = more ambiguous)\n\n")
+print(result_200$purity)
+```
+
+---
+
+## 7. Bonus: k=150 vs. k=200 Stability Check
+
+k=150 (12 clusters) and k=200 (11 clusters) are very close in cluster count. 
+Worth checking directly whether they're actually the same.
+Partition with one cluster merged, or genuinely different groupings.
+High agreement here would support treating ~11-12 as a stable "natural" number of broad cell types in this tissue.
+
+```{r compare-k150-k200, fig.width=9, fig.height=6}
+
+aligned_150_200 <- align_clusters(spe_k150, spe_k200, label_a = "k=150", label_b = "k=200")
+
+result_150_200 <- run_crosstab(
+  fine_clusters   = aligned_150_200$clusters_a,
+  coarse_clusters = aligned_150_200$clusters_b,
+  fine_label      = "k=150",
+  coarse_label    = "k=200",
+  fine_names      = celltype_lookup_k150,
+  coarse_names    = celltype_lookup_k200
+)
+
+plot_heatmap(result_150_200$proportions,
+            title = "k=150 clusters vs. k=200 clusters (row-normalized)",
+            legend_title = "proportion")
+
+cat("\n--- k=150 clusters sorted by how 'split' they are across k=200 clusters ---\n\n")
+print(result_150_200$purity)
+```
+
+---
+
+## 8. Flagged-Cluster Lookup (quick reference)
+
+Quick pull-out of where our specifically flagged clusters from the violin plot review land at each coarser resolution.
+
+```{r flagged-lookup}
+library(kableExtra)
+
+flagged_ids <- c("4", "9", "10", "11", "17", "18", "20")
+
+flagged_summary <- purrr::map_dfr(flagged_ids, function(id) {
+  row_150 <- result_150$purity |> filter(str_starts(fine_cluster, paste0(id, " -")))
+  row_200 <- result_200$purity |> filter(str_starts(fine_cluster, paste0(id, " -")))
+
+  tibble(
+    fine_cluster           = paste0(id, " - ", celltype_lookup_k20[[id]]),
+    dominant_k150_cluster  = ifelse(nrow(row_150) > 0, row_150$dominant_coarse_cluster, NA),
+    frac_in_k150           = ifelse(nrow(row_150) > 0, row_150$fraction_in_dominant, NA),
+    dominant_k200_cluster  = ifelse(nrow(row_200) > 0, row_200$dominant_coarse_cluster, NA),
+    frac_in_k200           = ifelse(nrow(row_200) > 0, row_200$fraction_in_dominant, NA)
+  )
+})
+
+flagged_summary |>
+  kbl(caption = "Where the flagged k=20 clusters land at coarser resolution",
+      col.names = c("Fine Cluster (k=20)", "Dominant k=150 Cluster", "Frac. in k=150",
+                    "Dominant k=200 Cluster", "Frac. in k=200")) |>
+  kable_styling(latex_options = c("striped", "hold_position"),
+                full_width = FALSE) |>
+  row_spec(0, bold = TRUE)
+```
+
+---
+
+## Notes
+
+- **Alignment matters:** the `align_clusters()` function intersects
+  cell barcodes rather than assuming the same cell order across
+  objects. If the shared-cell percentage printed in Section 3/5/6 is
+  much less than ~95-100%, that's worth investigating on its own --
+  it would mean the two clustering runs were built from meaningfully
+  different QC-filtered cell sets, not just different `k` values.
+- **Reading the purity table:** `fraction_in_dominant` close to 1.0
+  means that fine cluster nests cleanly into one coarse cluster
+  (stable, trustworthy). Lower values (e.g. < 0.6) mean that fine
+  cluster's cells are genuinely split across multiple coarse groups --
+  either a real transitional population, or a cluster whose fine-level
+  identity is shakier than it looked in the dot plot / violin plots
+  alone.
+- **This does not replace the violin plots.** This tells you *which*
+  clusters merge or split under different resolutions; it doesn't
+  tell you *why* (e.g. doublet vs. real continuum). Use it to decide
+  which clusters are worth a targeted subclustering pass, then use
+  violin plots on that subclustering result to confirm the biological
+  story.

@@ -1,0 +1,359 @@
+---
+title: "Unknown Cluster Diagnostics (k20 / k150 / k200 Overlap)"
+author: "Tazein Shah"
+date: "07-07-2026"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(SpatialExperiment)
+library(imcRtools)
+library(scran)
+library(scater)
+library(bluster)
+library(dittoSeq)
+library(dplyr)
+library(tidyverse)
+library(viridis)
+library(patchwork)
+```
+
+## Purpose
+
+Cluster 2 from the k150 broad clustering run was labeled Unknown. This notebook checks whether that cluster represents a real intermediate population or a resolution dependent artifact, by comparing cell level cluster assignments across k20, k150, and k200 Louvain runs and isolating the subset of cells that agree across all three.
+
+## Load the SPE object and cluster assignments
+
+```{r load-data}
+spe <- readRDS("/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/batch_correction/spe_combined_harmony_r3.rds")
+
+# Update these paths to point at your saved k sweep results
+k20_spe  <- readRDS("/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/clustering/k20_clusters/harmony_20_cluster_annot.rds")
+k150_spe <- readRDS("/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/clustering/k150_clusters/harmony_150_cluster_annot.rds")
+k200_spe <- readRDS("/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/clustering/k200_clusters/harmony_200_cluster_annot.rds")
+
+# Pull cluster labels into named vectors keyed by cell ID, rather than
+# assuming column order matches across the three saved objects
+k20_vec  <- setNames(colData(k20_spe)$broad_clusters,  colnames(k20_spe))
+k150_vec <- setNames(colData(k150_spe)$broad_clusters, colnames(k150_spe))
+k200_vec <- setNames(colData(k200_spe)$broad_clusters, colnames(k200_spe))
+
+# Confirm cell IDs actually align across all four objects before proceeding.
+# If any of these are FALSE, the saved k sweep objects contain a different
+# cell subset than spe_combined_harmony_r3.rds and need to be reconciled
+# before the overlap comparison means anything
+setequal(names(k20_vec), colnames(spe))
+setequal(names(k150_vec), colnames(spe))
+setequal(names(k200_vec), colnames(spe))
+
+# Reindex to spe's cell order rather than relying on load order
+k20_clusters  <- k20_vec[colnames(spe)]
+k150_clusters <- k150_vec[colnames(spe)]
+k200_clusters <- k200_vec[colnames(spe)]
+
+stopifnot(all(names(k20_clusters) == colnames(spe)))
+stopifnot(all(names(k150_clusters) == colnames(spe)))
+stopifnot(all(names(k200_clusters) == colnames(spe)))
+
+# spe only has a counts assay, so generate the asinh transformed assay used
+# for findMarkers and visualization. Cofactor = 1 per project convention.
+assay(spe, "exprs") <- asinh(assay(spe, "counts") / 1)
+```
+
+## Build a cross tabulation across the three k values
+
+```{r build-comparison-table}
+cluster_compare <- data.frame(
+  cell_id = colnames(spe),
+  k20  = as.character(k20_clusters),
+  k150 = as.character(k150_clusters),
+  k200 = as.character(k200_clusters),
+  patient_id = spe$patient_id,
+  area = spe$area,
+  stringsAsFactors = FALSE
+)
+
+# Cluster 2 is the Unknown cluster from the k150 annotation
+unknown_cells <- cluster_compare %>% filter(k150 == "2") %>% pull(cell_id)
+
+length(unknown_cells)
+```
+
+## Where do the Unknown cells land at k20 and k200
+
+```{r crosstab-k20-k200}
+table(cluster_compare$k20[cluster_compare$k150 == "2"])
+table(cluster_compare$k200[cluster_compare$k150 == "2"])
+```
+
+A dominant single cluster at both k20 and k200 supports a real population that k150 split out or merged oddly. A scattered distribution across many clusters at both resolutions points toward a boundary population sitting between several already annotated cell types.
+
+## Define the stable core from k150 and k200 agreement
+
+k150 and k200 turned out to agree almost completely on these cells, with k20 splintering them across many smaller clusters instead. Rather than intersecting all three, the core is defined from the k150/k200 agreement, and k20 is used afterward as a secondary check rather than a strict filter.
+
+```{r stable-core}
+core_unknown <- cluster_compare %>%
+  filter(k150 == "2", k200 == "2")
+
+cat("Cells in k150/k200 agreement core:", nrow(core_unknown), "\n")
+cat("Percent of full Unknown cluster:", round(nrow(core_unknown) / length(unknown_cells) * 100, 1), "\n")
+
+stable_cells <- core_unknown$cell_id
+```
+
+### k20 breakdown within the stable core
+
+```{r k20-breakdown}
+table(cluster_compare$k20[cluster_compare$cell_id %in% stable_cells])
+```
+
+This shows which k20 clusters the core cells were splintered into. The next chunk checks whether cells landing in different k20 destinations look marker-wise similar (supporting k20 simply being too coarse to resolve this population) or meaningfully different (suggesting more than one population is bundled inside what k150 called Unknown).
+
+```{r k20-subgroup-markers}
+spe$k20_subgroup <- cluster_compare$k20[match(colnames(spe), cluster_compare$cell_id)]
+spe$k20_subgroup[!colnames(spe) %in% stable_cells] <- NA
+
+markers_k20_subgroup <- findMarkers(
+  spe[, colnames(spe) %in% stable_cells],
+  groups = spe$k20_subgroup[colnames(spe) %in% stable_cells],
+  assay.type = "exprs"
+)
+
+# Review each entry in markers_k20_subgroup for the largest k20 destinations
+# (17, 16, 2, 1, 14 based on your table) to see whether their marker
+# profiles differ meaningfully within the stable core
+```
+
+## Marker analysis on the stable core
+
+```{r marker-analysis}
+spe$group_label <- ifelse(colnames(spe) %in% stable_cells, "unknown_core", "rest")
+
+markers_unknown <- findMarkers(spe, groups = spe$group_label, assay.type = "exprs")
+
+positive_markers <- markers_unknown$unknown_core %>%
+  as.data.frame() %>%
+  filter(logFC.rest > 0) %>%
+  arrange(desc(logFC.rest))
+
+head(positive_markers, 20)
+
+# If positive_markers comes back empty, check summary(as.data.frame(markers_unknown$unknown_core)$logFC.rest)
+# below before assuming something broke. If every logFC is negative, that means
+# unknown_core has no marker elevated above the rest of the dataset anywhere in
+# the panel, which is itself a meaningful result, not a coding error.
+
+# Cluster 2: reasoning notes go here once markers are reviewed against
+# CellMarker 2.0 and the Xi et al annotation scheme
+```
+
+### Signal quality check
+
+If `positive_markers` came back empty, check whether this reflects low overall signal rather than a distinct marker profile. A cluster that is uniformly lower across the whole panel, rather than elevated on a specific set of markers, usually points to weak staining, low counts, or segmentation artifacts rather than a real, definable cell type.
+
+```{r signal-quality-check}
+df_unknown_markers <- as.data.frame(markers_unknown$unknown_core)
+summary(df_unknown_markers$logFC.rest)
+
+total_counts <- colSums(assay(spe, "counts"))
+tapply(total_counts, spe$group_label, summary)
+```
+
+A much lower total count distribution for `unknown_core` compared to `rest`, combined with uniformly negative logFC across the panel, supports treating this as a low signal or segmentation artifact population to exclude before subclustering, rather than a cell type to name.
+
+## Marker expression distributions for the stable core
+
+```{r ridge-core}
+if (nrow(positive_markers) >= 10) {
+  core_markers <- rownames(positive_markers)[1:10]
+} else {
+  # No markers elevated in unknown_core, so fall back to the least
+  # negative (closest to zero) markers just to visualize what little
+  # separation exists
+  core_markers <- df_unknown_markers %>%
+    arrange(desc(logFC.rest)) %>%
+    slice_head(n = 10) %>%
+    rownames()
+}
+
+library(ggridges)
+
+expr_long <- as.data.frame(t(as.matrix(assay(spe, "exprs")[core_markers, ]))) %>%
+  mutate(group_label = spe$group_label) %>%
+  pivot_longer(cols = all_of(core_markers), names_to = "marker", values_to = "expression")
+
+ggplot(expr_long, aes(x = expression, y = marker, fill = group_label)) +
+  geom_density_ridges(alpha = 0.6, scale = 1.2) +
+  scale_fill_manual(values = c("rest" = "grey70", "unknown_core" = "steelblue")) +
+  theme_ridges(font_size = 12) +
+  labs(title = "Marker expression distributions: unknown_core vs rest",
+       x = "asinh expression", y = "Marker")
+```
+
+## UMAP visualization
+
+```{r umap-check}
+dittoDimPlot(
+  spe,
+  var = "group_label",
+  reduction.use = "UMAP_harmony",
+  size = 0.2,
+  do.label = TRUE
+) + ggtitle("Stable Unknown core vs rest")
+```
+
+## Composition diagnostics
+
+### Patient composition
+
+```{r patient-composition}
+cluster_compare %>%
+  filter(cell_id %in% stable_cells) %>%
+  count(patient_id) %>%
+  arrange(desc(n)) %>%
+  as_tibble() %>%
+  print(n = Inf)
+```
+
+A stable core dominated by one or two patients suggests patient specific signal rather than a distinct, broadly present cell type.
+
+### Proportion of Unknown cells per ROI
+
+```{r roi-proportions}
+# Patient20_425 corresponds to the p20_4_25_results acquisition, and
+# Patient20_519 corresponds to the p20_5_19_results acquisition, both
+# from the same patient rather than two different patients.
+
+roi_summary <- data.frame(
+  cell_id     = colnames(spe),
+  patient_id  = spe$patient_id,
+  sample_id   = spe$sample_id,
+  is_unknown  = colnames(spe) %in% stable_cells
+) %>%
+  group_by(patient_id, sample_id) %>%
+  summarise(
+    total_cells        = n(),
+    unknown_cells      = sum(is_unknown),
+    proportion_unknown = round(unknown_cells / total_cells, 3),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(proportion_unknown))
+
+roi_summary %>% print(n = Inf)
+
+# Wide format: one row per patient, one column per ROI, values are the
+# proportion of Unknown cells in that ROI
+roi_summary_wide <- roi_summary %>%
+  select(patient_id, sample_id, proportion_unknown) %>%
+  pivot_wider(names_from = sample_id, values_from = proportion_unknown)
+
+roi_summary_wide
+```
+
+A roughly even proportion across most ROIs within a patient argues against a single bad ROI driving the signal. If specific ROIs show a much higher proportion than others for the same patient, that points toward a local staining or tissue quality issue in those particular ROIs rather than something patient wide or dataset wide.
+
+### ROI / acquisition composition
+
+```{r roi-composition}
+sort(table(spe$sample_id[colnames(spe) %in% stable_cells]), decreasing = TRUE)
+```
+
+If the stable core is concentrated in a handful of ROIs or acquisitions rather than spread proportionally across the cohort, that points toward a staining or imaging batch issue tied to specific slides. A broad, roughly proportional spread across most ROIs argues against a simple batch explanation.
+
+### Ki67 proliferation check
+
+```{r ki67-check}
+ki67_vals <- assay(spe, "exprs")["MKI67", ]
+tapply(ki67_vals, spe$group_label, summary)
+
+# Normalized by total counts per cell, to check whether the raw Ki67 gap
+# is a genuine proliferation difference or just tracking the overall
+# signal drop seen across the whole panel
+ki67_normalized <- ki67_vals / total_counts
+tapply(ki67_normalized, spe$group_label, summary)
+```
+
+Low Ki67 in `unknown_core` relative to `rest`, combined with normal cell area and roughly proportional spread across patients and ROIs, would support a quiescent or low activity cell explanation rather than a technical artifact. If the gap mostly disappears after normalizing by total counts, it likely just reflects the same global signal reduction seen across the whole panel rather than a proliferation specific difference.
+
+### Cell area distribution
+
+```{r area-diagnostics}
+area_summary <- cluster_compare %>%
+  mutate(group = ifelse(cell_id %in% stable_cells, "unknown_core", "rest")) %>%
+  group_by(group) %>%
+  summarise(
+    mean_area = mean(area, na.rm = TRUE),
+    median_area = median(area, na.rm = TRUE),
+    sd_area = sd(area, na.rm = TRUE)
+  )
+
+area_summary
+
+ggplot(cluster_compare %>% mutate(group = ifelse(cell_id %in% stable_cells, "unknown_core", "rest")),
+       aes(x = group, y = area)) +
+  geom_violin() +
+  theme_classic(base_size = 14)
+```
+
+Unusually small or large area relative to the rest of the dataset can indicate segmentation artifacts, which produce marker dropout patterns that look like an Unknown signature without reflecting a real cell type.
+
+## Spatial neighbor contamination check
+
+Based on the diagnostics above (normal cell area, uniformly reduced signal across the whole panel, proportional spread across patients and ROIs), a global signal intensity issue looks more likely than local spatial contamination. This check is left in as a secondary confirmation rather than a required step, and only runs if a spatial graph already exists on `spe`.
+
+```{r neighbor-check}
+if ("knn_interaction_graph" %in% colPairNames(spe)) {
+  spe_sub <- spe[, colnames(spe) %in% stable_cells]
+
+  neighbor_summary <- aggregateNeighbors(
+    spe,
+    colPairName = "knn_interaction_graph",
+    aggregate_by = "expression",
+    assay_type = "exprs",
+    subset_row = setdiff(rownames(spe), c("DNA191", "DNA193"))
+  )
+
+  # Compare mean neighbor expression profile for the stable core
+  # against known cell type signatures to check for spillover from
+  # adjacent tumor or stromal regions, consistent with the
+  # contamination pattern already flagged for clusters 3, 10, and 11
+} else {
+  cat("No spatial graph found on spe (expected colPairName 'knn_interaction_graph').\n")
+  cat("Skipping neighbor contamination check. Run imcRtools::buildSpatialGraph first if this becomes relevant.\n")
+}
+```
+
+## Final summary heatmap
+
+Full marker panel across the stable core versus the rest of the dataset, annotated by patient and ROI, to visually cross check the findings above in one place.
+
+```{r final-heatmap}
+# rowData(spe) has no use_channel column on this object, so build the
+# channel list directly, excluding the DNA channels used for segmentation
+# rather than biological signal
+all_channels <- setdiff(rownames(spe), c("DNA191", "DNA193"))
+
+set.seed(220619)
+cur_cells <- sample(seq_len(ncol(spe)), min(2000, ncol(spe)))
+
+dittoHeatmap(
+  spe[, cur_cells],
+  genes = all_channels,
+  assay = "exprs",
+  scale = "none",
+  heatmap.colors = viridis(100),
+  annot.by = c("group_label", "patient_id", "sample_id")
+)
+```
+
+## Summary and next steps
+
+* If the stable core shows a clear, consistent marker signature distinct from neighboring populations, and patient and area distributions look normal, proceed to name the cluster and add it to the annotation vector.
+* If the stable core shows elevated or mixed markers from adjacent cell types with no clean signature, this points toward neighbor contamination or a doublet population rather than a true cell type, and should be flagged accordingly in the annotation notes.
+* If the core is small relative to the full k150 Unknown cluster and patient or area distributions look abnormal, this likely reflects segmentation or resolution artifacts rather than biology.
+* If cell area and DNA channels look normal, but every protein marker is uniformly reduced and the core spans most patients and ROIs proportionally, this points toward a real population of low protein expressing cells (for example quiescent or low metabolic activity cells) rather than a segmentation or batch artifact. Check the Ki67 result above to help distinguish this from an artifact explanation.

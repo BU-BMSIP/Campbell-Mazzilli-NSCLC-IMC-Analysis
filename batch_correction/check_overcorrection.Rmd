@@ -1,0 +1,356 @@
+---
+title: "Checking for Harmony Overcorrection"
+author: "Vaidehi Gupta"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cerulean
+    code_folding: show
+  pdf_document:
+    toc: true
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 12, fig.height = 6)
+set.seed(42)
+```
+
+## Overview
+
+The disease-state UMAP alone can't tell us whether Harmony
+overcorrected, since `disease_state` was never the batch variable
+Harmony was told to fix (`sample_id` was). Similar UMAP *shape* across
+disease states is expected if the same broad cell types are present
+in all three, just at different proportions -- that's a density
+question, not a shape question.
+
+This notebook runs four more targeted checks instead:
+
+1. **CD19 (and other flagged markers) pre- vs. post-Harmony** -- is
+   diffuse expression a pre-existing background problem, or did
+   Harmony smear out a signal that used to be crisp?
+2. **Per-cluster patient composition / enrichment** -- is any cluster
+   driven almost entirely by one patient's cells (undercorrection),
+   after accounting for how many cells that patient contributes
+   overall?
+3. **LISI (Local Inverse Simpson's Index)** -- a quantitative,
+   per-cell metric. We want *high* batch-LISI (patients well-mixed
+   locally) and *low* cluster-LISI (distinct cell types still
+   staying separate locally) on the Harmony embedding.
+4. **Cell-type composition (%) across disease state** -- the
+   proportion-based version of the check the UMAP shape couldn't
+   answer.
+
+---
+
+## 1. Load Libraries
+
+```{r libraries}
+
+.libPaths(c("/restricted/projectnb/camplab/home/vgupta7/R_libs", .libPaths()))
+library(imcRtools)
+library(SpatialExperiment)
+library(SingleCellExperiment)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(scater)
+library(viridis)
+library(patchwork)
+library(cowplot)
+library(pheatmap)
+library(RColorBrewer)
+
+# lisi is not on CRAN -- install once from GitHub if not already available:
+#remotes::install_github("immunogenomics/LISI")
+library(lisi)
+```
+
+---
+
+## 2. Load Data
+
+spe_combined: has BOTH UMAP_uncorrected/PCA_uncorrected and UMAP_harmony/Harmony reduced dims, needed for the pre/post comparisons in checks 1 and 3
+
+```{r load-data}
+
+spe_combined_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/batch_correction/spe_combined_harmony_r3.rds"
+spe_combined <- readRDS(spe_combined_path)
+
+spe_clustered_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/clustering/k20_clusters/harmony_20_cluster_annot.rds"
+spe_clustered <- readRDS(spe_clustered_path)
+
+cat("spe_combined:", ncol(spe_combined), "cells |", "reducedDims:", paste(reducedDimNames(spe_combined), collapse = ", "), "\n")
+cat("spe_clustered:", ncol(spe_clustered), "cells |", nlevels(factor(spe_clustered$broad_clusters)), "clusters\n")
+```
+
+
+Clustering may have dropped a few more QC-failed cells than the batch-correction object, so match by cell barcode rather than assuming identical row order/length between the two objects.
+
+```{r align-cells}
+
+common_cells <- intersect(colnames(spe_combined), colnames(spe_clustered))
+
+cat(sprintf("Shared cells: %d (%.1f%% of spe_combined, %.1f%% of spe_clustered)\n",
+           length(common_cells),
+           100 * length(common_cells) / ncol(spe_combined),
+           100 * length(common_cells) / ncol(spe_clustered)))
+
+# aligned metadata used throughout this notebook
+meta_common <- data.frame(
+  cell_id        = common_cells,
+  patient_id     = spe_combined$patient_id[match(common_cells, colnames(spe_combined))],
+  sample_id      = spe_combined$sample_id[match(common_cells, colnames(spe_combined))],
+  disease_state  = spe_combined$disease_state[match(common_cells, colnames(spe_combined))],
+  broad_clusters = spe_clustered$broad_clusters[match(common_cells, colnames(spe_clustered))],
+  row.names      = common_cells
+)
+
+# cluster -> cell type name lookup for readable labels later
+celltype_lookup <- setNames(
+  spe_clustered$broad_celltype[match(levels(factor(spe_clustered$broad_clusters)), as.character(spe_clustered$broad_clusters))],
+  levels(factor(spe_clustered$broad_clusters))
+)
+```
+
+---
+
+## 3. Check 1 — Marker Expression: Before vs. After Harmony
+
+This plots one marker's expression on BOTH the uncorrected and Harmony-corrected UMAP side by side. If a marker looks equally diffuse on both, that's a pre-existing background/noise problem (not Harmony's doing). If it's crisp before and blurs out after, that's a real overcorrection candidate for that specific channel.
+
+```{r marker-pre-post-function}
+
+plot_marker_pre_post <- function(spe, marker) {
+
+  umap_before <- reducedDim(spe, "UMAP_uncorrected")
+  umap_after  <- reducedDim(spe, "UMAP_harmony")
+  expr        <- assay(spe, "counts")[marker, ]
+
+  df_before <- data.frame(UMAP1 = umap_before[, 1], UMAP2 = umap_before[, 2], expr = expr)
+  df_after  <- data.frame(UMAP1 = umap_after[, 1],  UMAP2 = umap_after[, 2],  expr = expr)
+
+  p_before <- ggplot(df_before, aes(UMAP1, UMAP2, color = expr)) +
+    geom_point(size = 0.3, alpha = 0.3) +
+    scale_color_viridis_c(option = "viridis") +
+    labs(title = paste(marker, "- BEFORE Harmony"), color = marker) +
+    theme_bw()
+
+  p_after <- ggplot(df_after, aes(UMAP1, UMAP2, color = expr)) +
+    geom_point(size = 0.3, alpha = 0.3) +
+    scale_color_viridis_c(option = "viridis") +
+    labs(title = paste(marker, "- AFTER Harmony"), color = marker) +
+    theme_bw()
+
+  p_before | p_after
+}
+```
+
+
+These are markers flagged in earlier review: CD19 (diffuse on the Harmony UMAP, unclear if pre-existing), FoxP3 (unexpectedly elevated in the PMN-MDSC cluster's violin plot). EpCAM and CD68 included as a "should stay clean" contrast since they're mutually exclusive lineage markers with no prior noise concerns.
+
+```{r marker-pre-post-run, fig.width=12, fig.height=5}
+
+markers_to_check <- c("CD19", "FoxP3", "EpCAM", "CD68")
+
+for (marker in markers_to_check) {
+  print(plot_marker_pre_post(spe_combined, marker))
+}
+```
+
+---
+
+## 4. Check 2 — Per-Cluster Patient Composition and Enrichment
+
+```{r patient-composition}
+# raw counts and proportions: how many/what % of each cluster's cells come from each patient
+
+comp_counts <- table(cluster = meta_common$broad_clusters, patient = meta_common$patient_id)
+comp_props  <- prop.table(comp_counts, margin = 1)  # row-normalized by cluster
+
+# relabel rows with cell type names for readability
+rownames(comp_counts) <- paste0(rownames(comp_counts), " - ", celltype_lookup[rownames(comp_counts)])
+rownames(comp_props)  <- rownames(comp_counts)
+
+pheatmap(
+  comp_props,
+  cluster_rows    = FALSE,
+  cluster_cols    = FALSE,
+  display_numbers = TRUE,
+  number_format   = "%.2f",
+  color           = colorRampPalette(brewer.pal(9, "YlOrRd"))(100),
+  main            = "Cluster composition by patient (row-normalized %)",
+  fontsize_number = 7,
+  angle_col       = 45
+)
+```
+
+Raw composition alone is misleading. A patient who simply contributes more cells overall will naturally show up more in every cluster. Instead compute an ENRICHMENT score: each patient's share
+of a cluster, divided by that patient's share of the whole dataset.
+
+Enrichment near 1 = patient is represented in this cluster about as much as expected. 
+Enrichment >> 1 for ONE patient, with no obvious biological reason, is the signature of under-correction (that patient's batch effect is still driving its own sub-cluster).
+
+```{r patient-enrichment}
+
+overall_patient_frac <- prop.table(table(meta_common$patient_id))
+
+enrichment <- sweep(comp_props, 2, overall_patient_frac[colnames(comp_props)], "/")
+
+pheatmap(
+  enrichment,
+  cluster_rows    = FALSE,
+  cluster_cols    = FALSE,
+  display_numbers = TRUE,
+  number_format   = "%.1f",
+  color           = colorRampPalette(rev(brewer.pal(9, "RdBu")))(100),
+  breaks          = seq(0, 4, length.out = 101),  # centered visually around 1 = expected
+  main            = "Patient enrichment per cluster (1 = expected, >2 = flagged)",
+  fontsize_number = 7,
+  angle_col       = 45
+)
+
+# flat table of any (cluster, patient) combination with enrichment > 2
+# AND a non-trivial number of cells (avoids flagging noise in tiny clusters)
+enrichment_flags <- as.data.frame(as.table(enrichment)) |>
+  rename(cluster = cluster, patient = patient, enrichment = Freq) |>
+  left_join(
+    as.data.frame(as.table(comp_counts)) |> rename(cluster = cluster, patient = patient, n_cells = Freq),
+    by = c("cluster", "patient")
+  ) |>
+  filter(enrichment > 2, n_cells > 50) |>
+  arrange(desc(enrichment))
+
+cat("Flagged (cluster, patient) pairs with enrichment > 2x expected and > 50 cells:\n")
+print(enrichment_flags)
+```
+
+---
+
+## 5. Check 3 — LISI (Local Inverse Simpson's Index)
+
+LISI is computed per cell on an embedding, using a metadata label. It estimates the "effective number" of distinct label values found in that cell's local neighborhood. For a batch label, higher LISI is better (patients well-mixed locally). For a cell-type/cluster label, LOWER LISI is better (biology staying separate locally). We compute both labels on BOTH embeddings so we can see the
+before/after change directly.
+
+```{r lisi-compute}
+
+pca_before_mat <- reducedDim(spe_combined, "PCA_uncorrected")[common_cells, ]
+harmony_after_mat <- reducedDim(spe_combined, "Harmony")[common_cells, ]
+
+lisi_meta <- meta_common[common_cells, c("sample_id", "broad_clusters")]
+
+lisi_before <- compute_lisi(pca_before_mat, lisi_meta, c("sample_id", "broad_clusters"))
+lisi_after  <- compute_lisi(harmony_after_mat, lisi_meta, c("sample_id", "broad_clusters"))
+
+lisi_summary <- data.frame(
+  metric   = c("Batch LISI (sample_id) -- want HIGH", "Cluster LISI (broad_clusters) -- want LOW"),
+  before   = c(median(lisi_before$sample_id), median(lisi_before$broad_clusters)),
+  after    = c(median(lisi_after$sample_id),  median(lisi_after$broad_clusters))
+)
+
+knitr::kable(lisi_summary, digits = 2,
+            caption = "Median LISI before (PCA_uncorrected) vs. after (Harmony)")
+```
+
+```{r lisi-plot, fig.width=10, fig.height=5}
+lisi_long <- bind_rows(
+  lisi_before |> mutate(stage = "Before Harmony"),
+  lisi_after  |> mutate(stage = "After Harmony")
+) |>
+  pivot_longer(cols = c(sample_id, broad_clusters), names_to = "label_type", values_to = "lisi") |>
+  mutate(
+    label_type = recode(label_type,
+                        sample_id = "Batch LISI (sample_id) -- want HIGH",
+                        broad_clusters = "Cluster LISI (broad_clusters) -- want LOW"),
+    stage = factor(stage, levels = c("Before Harmony", "After Harmony"))
+  )
+
+ggplot(lisi_long, aes(x = stage, y = lisi, fill = stage)) +
+  geom_violin(trim = TRUE) +
+  geom_boxplot(width = 0.15, outlier.size = 0.3, fill = "white") +
+  facet_wrap(~ label_type, scales = "free_y") +
+  theme_bw() +
+  labs(title = "LISI distributions before vs. after Harmony", y = "LISI", x = NULL) +
+  theme(legend.position = "none")
+```
+
+---
+
+## 6. Check 4 — Cell-Type Composition (%) Across Disease State
+
+This is the proportion-based version of the question the UMAP shape couldn't answer: even if all three disease states occupy the same overall UMAP footprint, do their cell-type PROPORTIONS differ the way we'd biologically expect (e.g. more Tumor Epithelial / Treg / M2 Macrophage in Higher-stage tissue)?
+
+```{r celltype-by-disease-state, fig.width=10, fig.height=6}
+
+meta_common$broad_celltype <- celltype_lookup[as.character(meta_common$broad_clusters)]
+
+composition_by_state <- meta_common |>
+  count(disease_state, broad_celltype) |>
+  group_by(disease_state) |>
+  mutate(pct = 100 * n / sum(n)) |>
+  ungroup()
+
+ggplot(composition_by_state, aes(x = disease_state, y = pct, fill = broad_celltype)) +
+  geom_col(position = "stack") +
+  labs(title = "Cell type composition (%) by disease state",
+      x = "Disease State", y = "% of cells", fill = "Cell Type") +
+  theme_bw() +
+  theme(legend.position = "right")
+```
+
+Same breakdown per patient, to spot-check whether any individual patient's composition looks like an outlier within their disease state group (useful alongside the enrichment check in Section 4).
+
+```{r celltype-by-patient, fig.width=12, fig.height=6}
+
+composition_by_patient <- meta_common |>
+  count(patient_id, disease_state, broad_celltype) |>
+  group_by(patient_id) |>
+  mutate(pct = 100 * n / sum(n)) |>
+  ungroup()
+
+ggplot(composition_by_patient, aes(x = patient_id, y = pct, fill = broad_celltype)) +
+  geom_col(position = "stack") +
+  facet_wrap(~ disease_state, scales = "free_x", nrow = 1) +
+  labs(title = "Cell type composition (%) by patient, grouped by disease state",
+      x = "Patient", y = "% of cells", fill = "Cell Type") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "right")
+```
+
+---
+
+## Notes
+
+- **Check 1 (marker pre/post):** if a marker looks equally diffuse
+  before and after Harmony, that's evidence of antibody
+  background/spillover, not overcorrection -- goes back to the
+  channel-level fixes discussed earlier (compensation, thresholding,
+  or exclusion), not a batch-correction fix.
+- **Check 2 (enrichment):** enrichment > 2x with a real cell count is
+  the flag to act on. A small cluster showing high enrichment for a
+  patient with very few total cells is less concerning than a large
+  cluster dominated by one high-cell-count patient with no known
+  biological reason (unlike the original Patient 12 case, which
+  turned out to be a data-loading issue, not biology or an
+  undercorrection).
+- **Check 3 (LISI):** if the "after" batch-LISI barely improves over
+  "before," Harmony isn't doing much (undercorrection). If cluster-LISI
+  goes up substantially after Harmony (cell types becoming *less*
+  locally distinct), that's the direct quantitative signature of
+  overcorrection -- distinct biology is being blended along with the
+  batch effect.
+- **Check 4 (composition by disease state):** don't expect dramatic
+  differences in overall UMAP shape -- look here instead for whether
+  proportions shift the way tumor biology would predict. If Higher
+  and Lower and Benign show nearly identical composition percentages
+  across every cell type with no expected biological gradient, that's
+  worth discussing with Dr. Campbell as a possible overcorrection
+  signal at the composition level, separate from anything visible on
+  the UMAP itself.

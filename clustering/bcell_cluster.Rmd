@@ -1,0 +1,271 @@
+---
+title: "B Cell Cluster Comparison Across Resolutions (k20 / k150 / k200)"
+author: "Tazein Shah"
+date: "07 07 2026"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(SpatialExperiment)
+library(imcRtools)
+library(scran)
+library(scater)
+library(bluster)
+library(dittoSeq)
+library(dplyr)
+library(tidyverse)
+library(viridis)
+library(patchwork)
+library(ggridges)
+```
+
+## Purpose
+
+B cell and plasma cell related clusters have been annotated at all three resolutions: clusters 9 and 11 at k150, clusters 3 and 15 at k20, and cluster 5 at k200. This notebook compares what is being expressed across these clusters, and any subtypes, to see whether the same broad population splits, merges, or stays consistent across resolutions and whether the marker profile supports the subtype calls already made at each one.
+
+This follows the same cell level, ID matched comparison approach as `06_unknown_cluster_diagnostics.Rmd`, but the focus here is on expression content within B cell clusters rather than on resolving a single Unknown cluster.
+
+## Load the SPE object and cluster assignments
+
+```{r load-data}
+spe <- readRDS("/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/batch_correction/spe_combined_harmony_r3.rds")
+
+k20_spe  <- readRDS("/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/clustering/k20_clusters/harmony_20_cluster_annot.rds")
+k150_spe <- readRDS("/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/clustering/k150_clusters/harmony_150_cluster_annot.rds")
+k200_spe <- readRDS("/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/clustering/k200_clusters/harmony_200_cluster_annot.rds")
+
+k20_vec  <- setNames(colData(k20_spe)$broad_clusters,  colnames(k20_spe))
+k150_vec <- setNames(colData(k150_spe)$broad_clusters, colnames(k150_spe))
+k200_vec <- setNames(colData(k200_spe)$broad_clusters, colnames(k200_spe))
+
+setequal(names(k20_vec), colnames(spe))
+setequal(names(k150_vec), colnames(spe))
+setequal(names(k200_vec), colnames(spe))
+
+k20_clusters  <- k20_vec[colnames(spe)]
+k150_clusters <- k150_vec[colnames(spe)]
+k200_clusters <- k200_vec[colnames(spe)]
+
+stopifnot(all(names(k20_clusters) == colnames(spe)))
+stopifnot(all(names(k150_clusters) == colnames(spe)))
+stopifnot(all(names(k200_clusters) == colnames(spe)))
+
+assay(spe, "exprs") <- asinh(assay(spe, "counts") / 1)
+
+cluster_compare <- data.frame(
+  cell_id = colnames(spe),
+  k20  = as.character(k20_clusters),
+  k150 = as.character(k150_clusters),
+  k200 = as.character(k200_clusters),
+  patient_id = spe$patient_id,
+  sample_id  = spe$sample_id,
+  area = spe$area,
+  stringsAsFactors = FALSE
+)
+```
+
+## Step 1: Confirm B cell / plasma cell clusters at k20 and k200 with CD19
+
+Cluster IDs for all three resolutions are fixed below from the broad annotation vectors: k150 clusters 9 and 11, k20 clusters 3 and 15, and k200 cluster 5. CD19 is the anchor marker for B cells on this panel (CD20 is absent), so before trusting those labels, check that CD19 is actually elevated in those specific clusters and not somewhere else at each resolution.
+
+```{r cd19-dotplot-all-resolutions, fig.width=10, fig.height=4}
+spe$k20  <- as.character(k20_clusters)
+spe$k150 <- as.character(k150_clusters)
+spe$k200 <- as.character(k200_clusters)
+
+p_k20 <- dittoDotPlot(spe, vars = "CD19", group.by = "k20") + ggtitle("CD19, k20 clusters")
+p_k150 <- dittoDotPlot(spe, vars = "CD19", group.by = "k150") + ggtitle("CD19, k150 clusters")
+p_k200 <- dittoDotPlot(spe, vars = "CD19", group.by = "k200") + ggtitle("CD19, k200 clusters")
+
+p_k20 / p_k150 / p_k200
+```
+
+Check the dot plots above against the cluster IDs defined below. If CD19 is not clearly elevated in clusters 3 or 15 at k20, or in cluster 5 at k200, that is worth flagging before moving on to the expression comparison steps.
+
+```{r define-bcell-clusters}
+# k150 is fixed from the finalized broad annotation
+# 9 = Plasma Cell / Activated B Cell, 11 = Plasma Cell / B Cell
+k150_bcell_clusters <- c("9", "11")
+
+# k20 broad annotation
+# 3 = Plasmablast / Activated B Cell, 15 = Plasma Cell
+k20_bcell_clusters <- c("3", "15")
+
+# k200 broad annotation
+# 5 = Plasma Cell / B Cell
+k200_bcell_clusters <- c("5")
+
+cluster_compare <- cluster_compare %>%
+  mutate(
+    is_bcell_k20  = k20  %in% k20_bcell_clusters,
+    is_bcell_k150 = k150 %in% k150_bcell_clusters,
+    is_bcell_k200 = k200 %in% k200_bcell_clusters
+  )
+```
+
+## Step 2: How consistently do the same cells fall into B cell clusters across resolutions
+
+```{r bcell-overlap-counts}
+cat("k20 B cell candidate cells: ", sum(cluster_compare$is_bcell_k20), "\n")
+cat("k150 B cell cells: ", sum(cluster_compare$is_bcell_k150), "\n")
+cat("k200 B cell candidate cells: ", sum(cluster_compare$is_bcell_k200), "\n")
+
+cluster_compare %>%
+  count(is_bcell_k20, is_bcell_k150, is_bcell_k200) %>%
+  arrange(desc(n))
+```
+
+This shows how much the three resolutions agree on which cells are B cell versus plasma cell versus something else entirely. A large agreement block across all three supports a stable population. A large block that is B cell only at one resolution suggests that resolution is splitting or merging the population differently rather than resolving real subtypes.
+
+## Step 3: Where do k150 B cell cells land at k20 and k200
+
+```{r crosstab-bcell}
+cluster_compare %>% filter(is_bcell_k150) %>% count(k20) %>% arrange(desc(n))
+cluster_compare %>% filter(is_bcell_k150) %>% count(k200) %>% arrange(desc(n))
+```
+
+## Step 4: Marker expression across B cell clusters at each resolution
+
+Rather than one heatmap, use dot plots per resolution so subtype level marker patterns are easy to compare directly. Update `bcell_markers` to whatever panel of B cell and plasma cell related markers is relevant once the panel file is checked; CD19 is the confirmed anchor and is included by default.
+
+```{r bcell-marker-list}
+# Update this list against panel.csv for any plasma cell specific markers
+# beyond CD19 that are relevant here
+bcell_markers <- c("CD19")
+```
+
+```{r bcell-dotplot-k150, fig.width=8, fig.height=4}
+spe_k150_bcell <- spe[, spe$k150 %in% k150_bcell_clusters]
+
+dittoDotPlot(spe_k150_bcell, vars = bcell_markers, group.by = "k150") +
+  ggtitle("Marker expression across k150 B cell clusters")
+```
+
+```{r bcell-dotplot-k20, fig.width=8, fig.height=4}
+spe_k20_bcell <- spe[, spe$k20 %in% k20_bcell_clusters]
+
+dittoDotPlot(spe_k20_bcell, vars = bcell_markers, group.by = "k20") +
+  ggtitle("Marker expression across k20 B cell clusters")
+```
+
+```{r bcell-dotplot-k200, fig.width=8, fig.height=4}
+spe_k200_bcell <- spe[, spe$k200 %in% k200_bcell_clusters]
+
+dittoDotPlot(spe_k200_bcell, vars = bcell_markers, group.by = "k200") +
+  ggtitle("Marker expression across k200 B cell clusters")
+```
+
+## Step 5: Full panel markers defining each B cell cluster, per resolution
+
+`findMarkers` run separately within each resolution's B cell subset, restricted to positive logFC, to see what each subtype is actually defined by rather than only checking CD19.
+
+```{r findmarkers-per-resolution}
+run_bcell_markers <- function(spe_subset, group_col) {
+  markers <- findMarkers(spe_subset, groups = colData(spe_subset)[[group_col]], assay.type = "exprs")
+  purrr::map(markers, function(x) {
+    as.data.frame(x) %>%
+      filter(if_any(starts_with("logFC"), ~ . > 0)) %>%
+      arrange(desc(across(starts_with("logFC"), ~ .))) %>%
+      head(10)
+  })
+}
+
+markers_k150_bcell <- run_bcell_markers(spe_k150_bcell, "k150")
+markers_k20_bcell  <- run_bcell_markers(spe_k20_bcell,  "k20")
+markers_k200_bcell <- run_bcell_markers(spe_k200_bcell, "k200")
+
+markers_k150_bcell
+markers_k20_bcell
+markers_k200_bcell
+```
+
+## Step 6: Ridge plots of marker distributions by resolution
+
+Ridge plots preferred over heatmaps for distribution level comparisons. This shows the shape of CD19 (and any other markers added to `bcell_markers`) within each cluster at each resolution, not just the mean captured by the dot plots above.
+
+```{r ridge-k150, fig.width=7, fig.height=5}
+expr_long_k150 <- as.data.frame(t(as.matrix(assay(spe_k150_bcell, "exprs")[bcell_markers, , drop = FALSE]))) %>%
+  mutate(cluster = spe_k150_bcell$k150) %>%
+  pivot_longer(cols = all_of(bcell_markers), names_to = "marker", values_to = "expression")
+
+ggplot(expr_long_k150, aes(x = expression, y = cluster, fill = cluster)) +
+  geom_density_ridges(alpha = 0.7, scale = 1.2) +
+  theme_ridges(font_size = 12) +
+  labs(title = "k150 B cell clusters, marker distribution", x = "asinh expression", y = "Cluster") +
+  theme(legend.position = "none")
+```
+
+```{r ridge-k20, fig.width=7, fig.height=5}
+expr_long_k20 <- as.data.frame(t(as.matrix(assay(spe_k20_bcell, "exprs")[bcell_markers, , drop = FALSE]))) %>%
+  mutate(cluster = spe_k20_bcell$k20) %>%
+  pivot_longer(cols = all_of(bcell_markers), names_to = "marker", values_to = "expression")
+
+ggplot(expr_long_k20, aes(x = expression, y = cluster, fill = cluster)) +
+  geom_density_ridges(alpha = 0.7, scale = 1.2) +
+  theme_ridges(font_size = 12) +
+  labs(title = "k20 B cell clusters, marker distribution", x = "asinh expression", y = "Cluster") +
+  theme(legend.position = "none")
+```
+
+```{r ridge-k200, fig.width=7, fig.height=5}
+expr_long_k200 <- as.data.frame(t(as.matrix(assay(spe_k200_bcell, "exprs")[bcell_markers, , drop = FALSE]))) %>%
+  mutate(cluster = spe_k200_bcell$k200) %>%
+  pivot_longer(cols = all_of(bcell_markers), names_to = "marker", values_to = "expression")
+
+ggplot(expr_long_k200, aes(x = expression, y = cluster, fill = cluster)) +
+  geom_density_ridges(alpha = 0.7, scale = 1.2) +
+  theme_ridges(font_size = 12) +
+  labs(title = "k200 B cell clusters, marker distribution", x = "asinh expression", y = "Cluster") +
+  theme(legend.position = "none")
+```
+
+## Step 7: UMAP check across resolutions
+
+```{r umap-bcell-check, fig.width=10, fig.height=4}
+spe$bcell_any <- cluster_compare$is_bcell_k20 | cluster_compare$is_bcell_k150 | cluster_compare$is_bcell_k200
+
+p1 <- dittoDimPlot(spe, var = "k20", reduction.use = "UMAP_harmony", cells.use = spe$bcell_any, size = 0.3, do.label = TRUE) + ggtitle("k20 B cell region")
+p2 <- dittoDimPlot(spe, var = "k150", reduction.use = "UMAP_harmony", cells.use = spe$bcell_any, size = 0.3, do.label = TRUE) + ggtitle("k150 B cell region")
+p3 <- dittoDimPlot(spe, var = "k200", reduction.use = "UMAP_harmony", cells.use = spe$bcell_any, size = 0.3, do.label = TRUE) + ggtitle("k200 B cell region")
+
+p1 + p2 + p3
+```
+
+## Step 8: Patient and ROI composition per B cell cluster, per resolution
+
+```{r patient-composition-bcell}
+cluster_compare %>%
+  filter(is_bcell_k150) %>%
+  count(patient_id, k150) %>%
+  arrange(k150, desc(n)) %>%
+  as_tibble() %>%
+  print(n = Inf)
+
+cluster_compare %>%
+  filter(is_bcell_k20) %>%
+  count(patient_id, k20) %>%
+  arrange(k20, desc(n)) %>%
+  as_tibble() %>%
+  print(n = Inf)
+
+cluster_compare %>%
+  filter(is_bcell_k200) %>%
+  count(patient_id, k200) %>%
+  arrange(k200, desc(n)) %>%
+  as_tibble() %>%
+  print(n = Inf)
+```
+
+A subtype that is concentrated in one or two patients rather than spread across the cohort is worth flagging the same way as the neutrophil neighbor contamination already noted for clusters 10 and 11 at k150.
+
+## Summary and next steps
+
+* Compare the `findMarkers` output across k20, k150, and k200 for each B cell cluster. If the same marker set defines a given subtype regardless of resolution, that subtype is likely real rather than a resolution artifact.
+* If k20 collapses the plasma cell and activated B cell subtypes seen at k150 into a single cluster, that supports k20 simply being too coarse rather than the k150 split being wrong.
+* If k200 splits a k150 B cell cluster into two or more clusters with clearly different marker profiles, consider whether that split should be carried into the final annotation as a subtype rather than treated as noise.
+* Cross reference any B cell subtype with unusual patient or ROI concentration against the neighbor contamination pattern already flagged for clusters 10 and 11, since plasma cell and B cell clusters were noted as having neutrophil neighbor contamination at k150.
+* Once `bcell_markers` is confirmed against panel.csv, rerun Steps 4 through 6 with the full marker list rather than CD19 alone.
