@@ -166,7 +166,8 @@ run_crosstab <- function(fine_clusters, coarse_clusters,
   purity_df <- data.frame(
     fine_cluster            = rownames(prop_tab),
     dominant_coarse_cluster = colnames(prop_tab)[apply(prop_tab, 1, which.max)],
-    fraction_in_dominant    = round(apply(prop_tab, 1, max), 3)
+    fraction_in_dominant    = round(apply(prop_tab, 1, max), 3),
+    row.names               = NULL 
   ) |>
     arrange(fraction_in_dominant)
 
@@ -209,7 +210,7 @@ plot_heatmap(result_150$proportions,
 
 cat("\n--- k=20 clusters sorted by how 'split' they are across k=150 clusters ---\n")
 cat("(low fraction_in_dominant = split across multiple coarse clusters = more ambiguous)\n\n")
-print(result_150$purity)
+knitr::kable(result_150$purity, digits = 3, caption = "k=20 sorted by purity vs. k=150")
 ```
 
 ---
@@ -241,7 +242,7 @@ plot_heatmap(result_200$proportions,
 
 cat("\n--- k=20 clusters sorted by how 'split' they are across k=200 clusters ---\n")
 cat("(low fraction_in_dominant = split across multiple coarse clusters = more ambiguous)\n\n")
-print(result_200$purity)
+knitr::kable(result_200$purity, digits = 3, caption = "k=20 clusters sorted by purity vs. k=200")
 ```
 
 ---
@@ -271,7 +272,7 @@ plot_heatmap(result_150_200$proportions,
             legend_title = "proportion")
 
 cat("\n--- k=150 clusters sorted by how 'split' they are across k=200 clusters ---\n\n")
-print(result_150_200$purity)
+knitr::kable(result_150_200$purity, digits = 3, caption = "k=150 clusters sorted by purity vs. k=200")
 ```
 
 ---
@@ -301,8 +302,9 @@ flagged_summary <- purrr::map_dfr(flagged_ids, function(id) {
 flagged_summary |>
   kbl(caption = "Where the flagged k=20 clusters land at coarser resolution",
       col.names = c("Fine Cluster (k=20)", "Dominant k=150 Cluster", "Frac. in k=150",
-                    "Dominant k=200 Cluster", "Frac. in k=200")) |>
-  kable_styling(latex_options = c("striped", "hold_position"),
+                    "Dominant k=200 Cluster", "Frac. in k=200"),
+      booktabs = FALSE) |>
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"),
                 full_width = FALSE) |>
   row_spec(0, bold = TRUE)
 ```

@@ -1,0 +1,471 @@
+---
+title: "Epithelial Cluster Diagnostics (k20 / k150 / k200 Overlap)"
+author: "Vaidehi Gupta"
+date: "07-08-2026"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+.libPaths(c("/restricted/projectnb/camplab/home/vgupta7/R_libs", .libPaths()))
+
+library(SpatialExperiment)
+library(imcRtools)
+library(scran)
+library(scater)
+library(bluster)
+library(dittoSeq)
+library(dplyr)
+library(tidyverse)
+library(viridis)
+library(patchwork)
+library(ggridges)
+```
+
+## Purpose
+
+Same framework as the T cell diagnostics notebook, applied to the
+epithelial compartment. Four clusters are in scope here, for different
+reasons:
+
+- **Cluster 10 (Transitional Myeloid/Unresolved)** -- this is the most
+  important one to resolve. Its violin plot showed TTF1orCD16 and
+  EpCAM co-elevated, and the k150/k200 crosstab showed 94%/93% of its
+  cells landing in the partner-annotated "Tumor Epithelial (TTF1+)"
+  coarse cluster -- not a myeloid group. Two independent resolutions
+  both call this population epithelial. This notebook checks whether
+  the stable core actually looks epithelial on its own markers, which
+  would support relabeling cluster 10 entirely rather than treating it
+  as a myeloid cluster with epithelial contamination.
+- **Cluster 18 (Tumor Epithelial)** -- only ~60-63% agreement with
+  itself across coarser resolutions, small (836 cells), and showed a
+  patient enrichment spike (Patient20_425, ~3.2x).
+- **Clusters 13 and 16 (both labeled "Epithelial")** -- 13 splits
+  roughly evenly between two coarse clusters; 16 showed much weaker
+  overall signal than 13 despite being the larger of the two. Included
+  here as a lighter screening check on whether they represent two real
+  subtypes or one is a lower-quality duplicate of the other.
+
+## Load the SPE object and cluster assignments
+
+```{r load-data}
+clustering_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/clustering"
+
+spe <- readRDS("/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/batch_correction/spe_combined_harmony_r3.rds")
+
+k20_spe  <- readRDS(file.path(clustering_path, "k20_clusters",  "harmony_20_cluster_annot.rds"))
+k150_spe <- readRDS(file.path(clustering_path, "k150_clusters", "harmony_150_cluster_annot.rds"))
+k200_spe <- readRDS(file.path(clustering_path, "k200_clusters", "harmony_200_cluster_annot.rds"))
+
+k20_vec  <- setNames(colData(k20_spe)$broad_clusters,  colnames(k20_spe))
+k150_vec <- setNames(colData(k150_spe)$broad_clusters, colnames(k150_spe))
+k200_vec <- setNames(colData(k200_spe)$broad_clusters, colnames(k200_spe))
+
+setequal(names(k20_vec), colnames(spe))
+setequal(names(k150_vec), colnames(spe))
+setequal(names(k200_vec), colnames(spe))
+
+k20_clusters  <- k20_vec[colnames(spe)]
+k150_clusters <- k150_vec[colnames(spe)]
+k200_clusters <- k200_vec[colnames(spe)]
+
+stopifnot(all(names(k20_clusters) == colnames(spe)))
+stopifnot(all(names(k150_clusters) == colnames(spe)))
+stopifnot(all(names(k200_clusters) == colnames(spe)))
+
+assay(spe, "exprs") <- asinh(assay(spe, "counts") / 1)
+
+get_celltype_lookup <- function(spe_obj) {
+  if ("broad_celltype" %in% colnames(colData(spe_obj))) {
+    lv <- levels(factor(colData(spe_obj)$broad_clusters))
+    setNames(
+      colData(spe_obj)$broad_celltype[match(lv, as.character(colData(spe_obj)$broad_clusters))],
+      lv
+    )
+  } else {
+    lv <- levels(factor(colData(spe_obj)$broad_clusters))
+    setNames(lv, lv)
+  }
+}
+
+celltype_k20  <- get_celltype_lookup(k20_spe)
+celltype_k150 <- get_celltype_lookup(k150_spe)
+celltype_k200 <- get_celltype_lookup(k200_spe)
+```
+
+## Build the cross-tabulation table
+
+```{r build-comparison-table}
+cluster_compare <- data.frame(
+  cell_id = colnames(spe),
+  k20  = as.character(k20_clusters),
+  k150 = as.character(k150_clusters),
+  k200 = as.character(k200_clusters),
+  patient_id = spe$patient_id,
+  sample_id  = spe$sample_id,
+  area = spe$area,
+  stringsAsFactors = FALSE
+)
+```
+
+## Identify epithelial clusters at k20
+
+```{r identify-epithelial-clusters}
+# Cluster 10 is NOT labeled "Epithelial" at k20 -- it's included
+# explicitly below rather than picked up by the label match, since the
+# whole point is testing whether that label is wrong.
+epithelial_clusters_k20 <- names(celltype_k20)[grepl("Epithelial", celltype_k20, ignore.case = TRUE)]
+epithelial_clusters_k20 <- union(epithelial_clusters_k20, "10")
+
+data.frame(k20_cluster = epithelial_clusters_k20, label = celltype_k20[epithelial_clusters_k20])
+```
+
+## Screening pass: where does each cluster land at k150/k200
+
+```{r screening-crosstab}
+screen_cluster <- function(k20_id) {
+  k150_tab <- table(cluster_compare$k150[cluster_compare$k20 == k20_id])
+  k200_tab <- table(cluster_compare$k200[cluster_compare$k20 == k20_id])
+
+  dom_150 <- names(which.max(k150_tab))
+  dom_200 <- names(which.max(k200_tab))
+
+  data.frame(
+    k20_cluster       = k20_id,
+    label             = celltype_k20[[k20_id]],
+    n_cells           = sum(cluster_compare$k20 == k20_id),
+    dominant_k150     = paste0(dom_150, " - ", celltype_k150[[dom_150]]),
+    frac_k150         = round(max(k150_tab) / sum(k150_tab), 3),
+    dominant_k200     = paste0(dom_200, " - ", celltype_k200[[dom_200]]),
+    frac_k200         = round(max(k200_tab) / sum(k200_tab), 3)
+  )
+}
+
+screening_results <- bind_rows(lapply(epithelial_clusters_k20, screen_cluster)) |>
+  arrange(pmin(frac_k150, frac_k200))
+
+print(screening_results)
+```
+
+## Stable-core and marker/composition diagnostic functions
+
+```{r shared-functions}
+# identical logic to the T cell notebook -- kept here rather than
+# sourced from a shared file so this notebook can run standalone
+run_stable_core_diagnostic <- function(k20_id, spe, cluster_compare) {
+
+  cat("\n==============================\n")
+  cat("Cluster", k20_id, "-", celltype_k20[[k20_id]], "\n")
+  cat("==============================\n")
+
+  cluster_cells <- cluster_compare$cell_id[cluster_compare$k20 == k20_id]
+
+  k150_tab <- table(cluster_compare$k150[cluster_compare$k20 == k20_id])
+  k200_tab <- table(cluster_compare$k200[cluster_compare$k20 == k20_id])
+  dom_150 <- names(which.max(k150_tab))
+  dom_200 <- names(which.max(k200_tab))
+
+  cat("Dominant k150:", dom_150, "-", celltype_k150[[dom_150]],
+      sprintf("(%.1f%%)\n", 100 * max(k150_tab) / sum(k150_tab)))
+  cat("Dominant k200:", dom_200, "-", celltype_k200[[dom_200]],
+      sprintf("(%.1f%%)\n", 100 * max(k200_tab) / sum(k200_tab)))
+
+  stable_core <- cluster_compare |>
+    filter(k20 == k20_id, k150 == dom_150, k200 == dom_200) |>
+    pull(cell_id)
+
+  disagreement_cells <- setdiff(cluster_cells, stable_core)
+
+  cat("Stable core:", length(stable_core), "/", length(cluster_cells),
+      sprintf("(%.1f%%)\n", 100 * length(stable_core) / length(cluster_cells)))
+
+  list(
+    k20_id              = k20_id,
+    cluster_cells       = cluster_cells,
+    stable_core         = stable_core,
+    disagreement_cells  = disagreement_cells,
+    dominant_k150       = dom_150,
+    dominant_k200       = dom_200
+  )
+}
+
+run_marker_diagnostics <- function(diag_result, spe, top_n = 10) {
+
+  spe$group_label <- case_when(
+    colnames(spe) %in% diag_result$stable_core        ~ "stable_core",
+    colnames(spe) %in% diag_result$disagreement_cells  ~ "disagreement",
+    TRUE                                                ~ "rest"
+  )
+
+  markers_vs_rest <- findMarkers(spe, groups = spe$group_label, assay.type = "exprs")
+  positive_vs_rest <- as.data.frame(markers_vs_rest$stable_core) |>
+    filter(logFC.rest > 0) |>
+    arrange(desc(logFC.rest))
+
+  cat("Top markers, stable_core vs rest of dataset:\n")
+  print(head(positive_vs_rest, top_n))
+
+  markers_vs_disagreement <- NULL
+  if (length(diag_result$disagreement_cells) >= 20) {
+    spe_pair <- spe[, spe$group_label %in% c("stable_core", "disagreement")]
+    markers_vs_disagreement <- findMarkers(spe_pair, groups = droplevels(factor(spe_pair$group_label)),
+                                           assay.type = "exprs")
+
+    cat("\nTop markers, stable_core vs disagreement cells (same original cluster):\n")
+    print(head(as.data.frame(markers_vs_disagreement$stable_core) |> arrange(desc(logFC.disagreement)), top_n))
+  } else {
+    cat("\nToo few disagreement cells (<20) for a meaningful stable_core vs disagreement comparison.\n")
+  }
+
+  list(
+    positive_vs_rest         = positive_vs_rest,
+    markers_vs_disagreement  = markers_vs_disagreement,
+    group_label              = spe$group_label
+  )
+}
+
+run_composition_diagnostics <- function(diag_result, cluster_compare) {
+
+  cat("\nPatient composition of stable core:\n")
+  patient_comp <- cluster_compare |>
+    filter(cell_id %in% diag_result$stable_core) |>
+    count(patient_id) |>
+    arrange(desc(n)) |>
+    as.data.frame()
+
+  print(patient_comp)
+
+  cat("\nROI (sample_id) composition of stable core:\n")
+  print(sort(table(cluster_compare$sample_id[cluster_compare$cell_id %in% diag_result$stable_core]),
+             decreasing = TRUE))
+
+  area_df <- cluster_compare |>
+    mutate(group = case_when(
+      cell_id %in% diag_result$stable_core        ~ "stable_core",
+      cell_id %in% diag_result$disagreement_cells  ~ "disagreement",
+      TRUE                                          ~ "rest"
+    )) |>
+    filter(group != "rest")
+
+  cat("\nCell area summary, stable core vs disagreement cells:\n")
+  area_summary <- area_df |>
+    group_by(group) |>
+    summarise(
+      mean_area = mean(area, na.rm = TRUE),
+      median_area = median(area, na.rm = TRUE),
+      sd_area = sd(area, na.rm = TRUE)
+    ) |>
+    as.data.frame()
+
+  print(area_summary)
+
+  ggplot(area_df, aes(x = group, y = area, fill = group)) +
+    geom_violin() +
+    theme_classic(base_size = 14) +
+    labs(title = paste("Cell area: stable core vs. disagreement cells, cluster", diag_result$k20_id))
+}
+```
+
+## Ki67 / proliferation check function
+
+```{r ki67-function}
+# specific to the epithelial notebook -- tumor epithelial cells are
+# where proliferation status is most biologically relevant, per the
+# meeting notes ("see if the proliferating cells are high in EpCAM")
+run_ki67_check <- function(diag_result, spe, cluster_compare) {
+
+  ki67_vals <- assay(spe, "exprs")["MKI67", ]
+  total_counts <- colSums(assay(spe, "counts"))
+
+  group <- case_when(
+    colnames(spe) %in% diag_result$stable_core        ~ "stable_core",
+    colnames(spe) %in% diag_result$disagreement_cells  ~ "disagreement",
+    TRUE                                                ~ "rest"
+  )
+
+  cat("Raw Ki67 (MKI67), by group:\n")
+  print(tapply(ki67_vals[group != "rest"], group[group != "rest"], summary))
+
+  ki67_normalized <- ki67_vals / total_counts
+  cat("\nKi67 normalized by total counts, by group:\n")
+  print(tapply(ki67_normalized[group != "rest"], group[group != "rest"], summary))
+}
+```
+
+---
+
+## Deep dive: Cluster 10 (Transitional Myeloid/Unresolved -> possibly mislabeled)
+
+```{r deep-dive-10}
+diag_10 <- run_stable_core_diagnostic("10", spe, cluster_compare)
+```
+
+```{r deep-dive-10-markers}
+markers_10 <- run_marker_diagnostics(diag_10, spe)
+```
+
+```{r deep-dive-10-composition, fig.width=8, fig.height=5}
+run_composition_diagnostics(diag_10, cluster_compare)
+```
+
+```{r deep-dive-10-ki67}
+run_ki67_check(diag_10, spe, cluster_compare)
+```
+
+```{r deep-dive-10-ridge, fig.width=10, fig.height=6}
+top_markers_10 <- rownames(markers_10$positive_vs_rest)[1:min(10, nrow(markers_10$positive_vs_rest))]
+
+expr_long_10 <- as.data.frame(t(as.matrix(assay(spe, "exprs")[top_markers_10, ]))) |>
+  mutate(group_label = markers_10$group_label) |>
+  filter(group_label != "rest") |>
+  pivot_longer(cols = all_of(top_markers_10), names_to = "marker", values_to = "expression")
+
+ggplot(expr_long_10, aes(x = expression, y = marker, fill = group_label)) +
+  geom_density_ridges(alpha = 0.6, scale = 1.2) +
+  scale_fill_manual(values = c("stable_core" = "steelblue", "disagreement" = "firebrick")) +
+  theme_ridges(font_size = 12) +
+  labs(title = "Cluster 10: stable core vs. disagreement cells", x = "asinh expression", y = "Marker")
+```
+
+**Observations:**
+- TTF1 clearly separates stable core from disagreement cells
+- No myeloid marker has their disagreement group popping out. CD14, CD1c, CD117, etc all have largely overlapping distributions between the two groups.
+
+
+If the stable core's top markers here come back EpCAM/TTF1orCD16-led
+with CD68/CD11c/CD14 notably absent or low, that supports relabeling
+cluster 10 as epithelial outright (consistent with the k150/k200
+crosstab). If myeloid markers are still elevated even within the
+stable core, that argues for a genuine hybrid/spillover population
+rather than a simple mislabel -- worth a QuPath spatial check either way,
+per the earlier discussion, to see whether these cells sit inside tumor
+nests or scattered through stroma/macrophage-rich regions.
+
+---
+
+## Deep dive: Cluster 18 (Tumor Epithelial)
+
+```{r deep-dive-18}
+diag_18 <- run_stable_core_diagnostic("18", spe, cluster_compare)
+```
+
+```{r deep-dive-18-markers}
+markers_18 <- run_marker_diagnostics(diag_18, spe)
+```
+
+```{r deep-dive-18-composition, fig.width=8, fig.height=5}
+run_composition_diagnostics(diag_18, cluster_compare)
+```
+
+```{r deep-dive-18-ki67}
+run_ki67_check(diag_18, spe, cluster_compare)
+```
+
+```{r deep-dive-18-ridge, fig.width=10, fig.height=6}
+top_markers_18 <- rownames(markers_18$positive_vs_rest)[1:min(10, nrow(markers_18$positive_vs_rest))]
+
+expr_long_18 <- as.data.frame(t(as.matrix(assay(spe, "exprs")[top_markers_18, ]))) |>
+  mutate(group_label = markers_18$group_label) |>
+  filter(group_label != "rest") |>
+  pivot_longer(cols = all_of(top_markers_18), names_to = "marker", values_to = "expression")
+
+ggplot(expr_long_18, aes(x = expression, y = marker, fill = group_label)) +
+  geom_density_ridges(alpha = 0.6, scale = 1.2) +
+  scale_fill_manual(values = c("stable_core" = "steelblue", "disagreement" = "firebrick")) +
+  theme_ridges(font_size = 12) +
+  labs(title = "Cluster 18: stable core vs. disagreement cells", x = "asinh expression", y = "Marker")
+```
+
+Given cluster 18 is only 836 cells to begin with, check the stable
+core size before over-interpreting -- a stable core under ~50 cells
+should be treated as low-confidence, same caveat as cluster 20 in the
+T cell notebook.
+
+---
+
+## UMAP check, all four clusters
+
+```{r umap-check}
+spe$flagged_group <- case_when(
+  colnames(spe) %in% diag_10$stable_core ~ "Cluster 10 - stable core",
+  colnames(spe) %in% diag_10$disagreement_cells ~ "Cluster 10 - disagreement",
+  colnames(spe) %in% diag_18$stable_core ~ "Cluster 18 - stable core",
+  colnames(spe) %in% diag_18$disagreement_cells ~ "Cluster 18 - disagreement",
+  TRUE ~ "other"
+)
+
+dittoDimPlot(
+  spe,
+  var = "flagged_group",
+  reduction.use = "UMAP_harmony",
+  size = 0.2,
+  do.label = FALSE
+) + ggtitle("Clusters 10 and 18: stable core vs. disagreement cells")
+```
+
+```{r umap-check-v2, fig.width=9, fig.height=7}
+umap_df <- as.data.frame(reducedDim(spe, "UMAP_harmony"))
+colnames(umap_df) <- c("UMAP1", "UMAP2")
+umap_df$flagged_group <- spe$flagged_group
+
+group_colors <- c(
+  "other" = "grey85",
+  "Cluster 10 - stable core"    = "#4C9BE8",
+  "Cluster 10 - disagreement"   = "#E8A13B",
+  "Cluster 18 - stable core"    = "#F5E642",
+  "Cluster 18 - disagreement"   = "#2CA37F"
+)
+
+# draw order: background first, then progressively rarer/smaller groups on top
+draw_order <- c("other",
+                "Cluster 10 - stable core", "Cluster 10 - disagreement",
+                "Cluster 18 - stable core", "Cluster 18 - disagreement")
+
+umap_df$flagged_group <- factor(umap_df$flagged_group, levels = draw_order)
+umap_df <- umap_df[order(umap_df$flagged_group), ]
+
+point_sizes <- c(
+  "other" = 0.15,
+  "Cluster 10 - stable core"  = 0.3,
+  "Cluster 10 - disagreement" = 0.5,
+  "Cluster 18 - stable core"  = 1.2,
+  "Cluster 18 - disagreement" = 1.2
+)
+umap_df$pt_size <- point_sizes[as.character(umap_df$flagged_group)]
+
+ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = flagged_group)) +
+  geom_point(aes(size = flagged_group), alpha = 0.8) +
+  scale_color_manual(values = group_colors) +
+  scale_size_manual(values = point_sizes, guide = "none") +
+  theme_bw(base_size = 13) +
+  guides(color = guide_legend(override.aes = list(size = 4, alpha = 1))) +
+  labs(title = "Clusters 10 and 18: stable core vs. disagreement cells",
+       color = "Group")
+```
+
+## Summary and next steps
+
+* **Cluster 10:** this is the highest-value result in this notebook --
+  if the stable core's markers confirm epithelial identity, this
+  should be relabeled and merged conceptually with the other
+  epithelial clusters rather than kept as "Transitional
+  Myeloid/Unresolved." Follow up with the QuPath spatial check
+  discussed earlier before finalizing, since marker evidence alone
+  can't distinguish "these are epithelial cells near macrophages" from
+  "these are macrophages that ate epithelial debris."
+* **Cluster 18:** check stable core size first given the small starting
+  n. If markers still look cleanly epithelial/tumor-associated (EpCAM,
+  GATA3, and ideally MKI67/PDL1 per the meeting notes' recommended
+  tumor markers) in the stable core, that's reassuring despite the
+  patient enrichment flag. If Patient20_425 dominates the stable core
+  specifically, treat this cluster's tumor-epithelial identity as
+  patient-specific rather than general until confirmed elsewhere.
+* **Clusters 13 and 16:** use the screening table to see whether they
+  land in the same or different coarse clusters at both k150 and
+  k200. Landing consistently in different coarse groups across both
+  supports two real subtypes; landing in the same one, especially with
+  16 unable to beat baseline convincingly, supports treating 16 as a
+  lower-confidence duplicate of 13.

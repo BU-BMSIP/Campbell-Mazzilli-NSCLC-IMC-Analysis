@@ -1,0 +1,527 @@
+---
+title: "T Cell Cluster Diagnostics (k20 / k150 / k200 Overlap)"
+author: "Vaidehi Gupta"
+date: "07-08-2026"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+.libPaths(c("/restricted/projectnb/camplab/home/vgupta7/R_libs", .libPaths()))
+
+library(SpatialExperiment)
+library(imcRtools)
+library(scran)
+library(scater)
+library(bluster)
+library(dittoSeq)
+library(dplyr)
+library(tidyverse)
+library(viridis)
+library(patchwork)
+library(ggridges)
+```
+
+## Purpose
+
+Adapted from Tazein's Unknown-cluster diagnostic template, applied to the
+T cell compartment. Two clusters already have real cause for suspicion
+from prior work:
+
+- **Cluster 11 (Treg)** -- FoxP3 wasn't even the top marker in its violin
+  plot (CD138 was), it split across multiple coarse clusters in the
+  k150/k200 crosstab (max ~0.83, into a Plasma Cell/B Cell group, not a
+  T cell group), and it showed extreme single-patient enrichment
+  (Patient19, ~3.9x expected).
+- **Cluster 20 (Exhausted T Cell)** -- very weak violin signature (max
+  mean barely above 0), only 225 cells, split across five different
+  coarse clusters (best match ~0.39/~0.34), and driven largely by one
+  patient (Patient16).
+
+Clusters 6 (CD8+ T), 7 (CD4+ T), and 8 (Memory T) looked clean in the
+violin review, so they get a lighter screening pass rather than the
+full stable-core workup -- this notebook exists to check whether that
+holds up, not to assume it.
+
+## Load the SPE object and cluster assignments
+
+```{r load-data}
+
+clustering_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/clustering"
+
+spe <- readRDS("/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/batch_correction/spe_combined_harmony_r3.rds")
+
+k20_spe  <- readRDS(file.path(clustering_path, "k20_clusters",  "harmony_20_cluster_annot.rds"))
+k150_spe <- readRDS(file.path(clustering_path, "k150_clusters", "harmony_150_cluster_annot.rds"))
+k200_spe <- readRDS(file.path(clustering_path, "k200_clusters", "harmony_200_cluster_annot.rds"))
+
+k20_vec  <- setNames(colData(k20_spe)$broad_clusters,  colnames(k20_spe))
+k150_vec <- setNames(colData(k150_spe)$broad_clusters, colnames(k150_spe))
+k200_vec <- setNames(colData(k200_spe)$broad_clusters, colnames(k200_spe))
+
+setequal(names(k20_vec), colnames(spe))
+setequal(names(k150_vec), colnames(spe))
+setequal(names(k200_vec), colnames(spe))
+
+k20_clusters  <- k20_vec[colnames(spe)]
+k150_clusters <- k150_vec[colnames(spe)]
+k200_clusters <- k200_vec[colnames(spe)]
+
+stopifnot(all(names(k20_clusters) == colnames(spe)))
+stopifnot(all(names(k150_clusters) == colnames(spe)))
+stopifnot(all(names(k200_clusters) == colnames(spe)))
+
+assay(spe, "exprs") <- asinh(assay(spe, "counts") / 1)
+
+# cell type name lookups for readable labels -- falls back to bare
+# cluster numbers if broad_celltype isn't present on a given object
+get_celltype_lookup <- function(spe_obj) {
+  if ("broad_celltype" %in% colnames(colData(spe_obj))) {
+    lv <- levels(factor(colData(spe_obj)$broad_clusters))
+    setNames(
+      colData(spe_obj)$broad_celltype[match(lv, as.character(colData(spe_obj)$broad_clusters))],
+      lv
+    )
+  } else {
+    lv <- levels(factor(colData(spe_obj)$broad_clusters))
+    setNames(lv, lv)
+  }
+}
+
+celltype_k20  <- get_celltype_lookup(k20_spe)
+celltype_k150 <- get_celltype_lookup(k150_spe)
+celltype_k200 <- get_celltype_lookup(k200_spe)
+```
+
+## Build the cross-tabulation table
+
+```{r build-comparison-table}
+cluster_compare <- data.frame(
+  cell_id = colnames(spe),
+  k20  = as.character(k20_clusters),
+  k150 = as.character(k150_clusters),
+  k200 = as.character(k200_clusters),
+  patient_id = spe$patient_id,
+  sample_id  = spe$sample_id,
+  area = spe$area,
+  stringsAsFactors = FALSE
+)
+```
+
+## Identify T cell clusters at k20
+
+```{r identify-tcell-clusters}
+
+tcell_clusters_k20 <- names(celltype_k20)[grepl("T Cell|Treg", celltype_k20, ignore.case = TRUE)]
+
+data.frame(k20_cluster = tcell_clusters_k20, label = celltype_k20[tcell_clusters_k20])
+```
+
+## Screening pass: where does each T cell cluster land at k150/k200
+
+```{r screening-crosstab}
+screen_cluster <- function(k20_id) {
+  k150_tab <- table(cluster_compare$k150[cluster_compare$k20 == k20_id])
+  k200_tab <- table(cluster_compare$k200[cluster_compare$k20 == k20_id])
+
+  dom_150 <- names(which.max(k150_tab))
+  dom_200 <- names(which.max(k200_tab))
+
+  data.frame(
+    k20_cluster       = k20_id,
+    label             = celltype_k20[[k20_id]],
+    n_cells           = sum(cluster_compare$k20 == k20_id),
+    dominant_k150     = paste0(dom_150, " - ", celltype_k150[[dom_150]]),
+    frac_k150         = round(max(k150_tab) / sum(k150_tab), 3),
+    dominant_k200     = paste0(dom_200, " - ", celltype_k200[[dom_200]]),
+    frac_k200         = round(max(k200_tab) / sum(k200_tab), 3)
+  )
+}
+
+screening_results <- bind_rows(lapply(tcell_clusters_k20, screen_cluster)) |>
+  arrange(pmin(frac_k150, frac_k200))
+
+print(screening_results)
+```
+
+Clusters near the top of this table (lowest `frac_k150`/`frac_k200`)
+are the ones worth the full stable-core workup below. Confirm 11 and
+20 still look like the worst offenders before proceeding. If
+screening reveals a different cluster is now also splitting badly,
+add it to the deep-dive list.
+
+Seems like I will have to do a deep dive into cluster 8 and 12 as well
+
+## Stable-core diagnostic function
+
+This starts from a fine k20 cluster and checks whether it holds together at coarser resolution. 
+
+The **"stable core"** here is the subset of a k20 cluster's cells that land in that cluster's own dominant k150 AND dominant k20 groups (i.e. the cells all three resolutions agree on). 
+
+Cells left over (in the k20 cluster but not in that majority pattern) are the **"disagreement"** cells likely responsible for the splitting.
+
+```{r stable-core-function}
+
+run_stable_core_diagnostic <- function(k20_id, spe, cluster_compare) {
+
+  cat("\n==============================\n")
+  cat("Cluster", k20_id, "-", celltype_k20[[k20_id]], "\n")
+  cat("==============================\n")
+
+  cluster_cells <- cluster_compare$cell_id[cluster_compare$k20 == k20_id]
+
+  k150_tab <- table(cluster_compare$k150[cluster_compare$k20 == k20_id])
+  k200_tab <- table(cluster_compare$k200[cluster_compare$k20 == k20_id])
+  dom_150 <- names(which.max(k150_tab))
+  dom_200 <- names(which.max(k200_tab))
+
+  cat("Dominant k150:", dom_150, "-", celltype_k150[[dom_150]],
+      sprintf("(%.1f%%)\n", 100 * max(k150_tab) / sum(k150_tab)))
+  cat("Dominant k200:", dom_200, "-", celltype_k200[[dom_200]],
+      sprintf("(%.1f%%)\n", 100 * max(k200_tab) / sum(k200_tab)))
+
+  stable_core <- cluster_compare |>
+    filter(k20 == k20_id, k150 == dom_150, k200 == dom_200) |>
+    pull(cell_id)
+
+  disagreement_cells <- setdiff(cluster_cells, stable_core)
+
+  cat("Stable core:", length(stable_core), "/", length(cluster_cells),
+      sprintf("(%.1f%%)\n", 100 * length(stable_core) / length(cluster_cells)))
+
+  list(
+    k20_id              = k20_id,
+    cluster_cells       = cluster_cells,
+    stable_core         = stable_core,
+    disagreement_cells  = disagreement_cells,
+    dominant_k150       = dom_150,
+    dominant_k200       = dom_200
+  )
+}
+```
+
+## Marker + composition diagnostic function
+
+Runs findMarkers twice: stable_core vs. the rest of the dataset (same comparison as Tazein's script), AND stable_core vs. its own disagreement_cells.
+(new part, directly tests whether the "core"and the "split off" cells within the SAME k20 cluster look like genuinely different cell types, which is the direct test of whether this cluster is internally a mixture).
+
+```{r marker-diagnostic-function}
+
+run_marker_diagnostics <- function(diag_result, spe, top_n = 10) {
+
+  spe$group_label <- case_when(
+    colnames(spe) %in% diag_result$stable_core        ~ "stable_core",
+    colnames(spe) %in% diag_result$disagreement_cells  ~ "disagreement",
+    TRUE                                                ~ "rest"
+  )
+
+  # stable core vs rest of dataset
+  markers_vs_rest <- findMarkers(spe, groups = spe$group_label, assay.type = "exprs")
+  positive_vs_rest <- as.data.frame(markers_vs_rest$stable_core) |>
+    filter(logFC.rest > 0) |>
+    arrange(desc(logFC.rest))
+
+  cat("Top markers, stable_core vs rest of dataset:\n")
+  print(head(positive_vs_rest, top_n))
+
+  # stable core vs disagreement cells, only if there are enough
+  # disagreement cells to make the comparison meaningful
+  markers_vs_disagreement <- NULL
+  if (length(diag_result$disagreement_cells) >= 20) {
+    spe_pair <- spe[, spe$group_label %in% c("stable_core", "disagreement")]
+    markers_vs_disagreement <- findMarkers(spe_pair, groups = droplevels(factor(spe_pair$group_label)),
+                                           assay.type = "exprs")
+
+    cat("\nTop markers, stable_core vs disagreement cells (same original cluster):\n")
+    print(head(as.data.frame(markers_vs_disagreement$stable_core) |> arrange(desc(logFC.disagreement)), top_n))
+  } else {
+    cat("\nToo few disagreement cells (<20) for a meaningful stable_core vs disagreement comparison.\n")
+  }
+
+  list(
+    positive_vs_rest         = positive_vs_rest,
+    markers_vs_disagreement  = markers_vs_disagreement,
+    group_label              = spe$group_label
+  )
+}
+```
+
+## Composition diagnostic function
+
+```{r composition-function}
+# same checks as Tazein's script: patient composition, ROI proportion,
+# area distribution -- applied to whichever stable_core is passed in
+run_composition_diagnostics <- function(diag_result, cluster_compare) {
+
+  cat("\nPatient composition of stable core:\n")
+  patient_comp <- cluster_compare |>
+    filter(cell_id %in% diag_result$stable_core) |>
+    count(patient_id) |>
+    arrange(desc(n)) |>
+    as.data.frame()
+  
+  print(patient_comp)
+
+  cat("\nROI (sample_id) composition of stable core:\n")
+  print(sort(table(cluster_compare$sample_id[cluster_compare$cell_id %in% diag_result$stable_core]),
+             decreasing = TRUE))
+
+  area_df <- cluster_compare |>
+    mutate(group = case_when(
+      cell_id %in% diag_result$stable_core        ~ "stable_core",
+      cell_id %in% diag_result$disagreement_cells  ~ "disagreement",
+      TRUE                                          ~ "rest"
+    )) |>
+    filter(group != "rest")
+
+  cat("\nCell area summary, stable core vs disagreement cells:\n")
+  area_summary <- area_df |> 
+    group_by(group) |> 
+    summarise(
+      mean_area = mean(area, na.rm = TRUE),
+      median_area = median(area, na.rm = TRUE),
+      sd_area = sd(area, na.rm = TRUE)
+    ) |>
+    as.data.frame()
+
+  print(area_summary)
+
+  ggplot(area_df, aes(x = group, y = area, fill = group)) +
+    geom_violin() +
+    theme_classic(base_size = 14) +
+    labs(title = paste("Cell area: stable core vs. disagreement cells, cluster", diag_result$k20_id))
+}
+```
+
+---
+
+## Deep dive: Cluster 11 (Treg)
+
+```{r deep-dive-11}
+diag_11 <- run_stable_core_diagnostic("11", spe, cluster_compare)
+```
+79.1% of cluster 11's cells agree with each other on landing in a Plasma Cell/B Cell course group at both k150 and k200. This is likely not a T cell group at all. 
+
+```{r deep-dive-11-markers}
+markers_11 <- run_marker_diagnostics(diag_11, spe)
+```
+
+```{r deep-dive-11-composition, fig.width=8, fig.height=5}
+run_composition_diagnostics(diag_11, cluster_compare)
+```
+
+```{r deep-dive-11-ridge, fig.width=10, fig.height=6}
+top_markers_11 <- rownames(markers_11$positive_vs_rest)[1:min(10, nrow(markers_11$positive_vs_rest))]
+
+expr_long_11 <- as.data.frame(t(as.matrix(assay(spe, "exprs")[top_markers_11, ]))) |>
+  mutate(group_label = markers_11$group_label) |>
+  filter(group_label != "rest") |>
+  pivot_longer(cols = all_of(top_markers_11), names_to = "marker", values_to = "expression")
+
+ggplot(expr_long_11, aes(x = expression, y = marker, fill = group_label)) +
+  geom_density_ridges(alpha = 0.6, scale = 1.2) +
+  scale_fill_manual(values = c("stable_core" = "steelblue", "disagreement" = "firebrick")) +
+  theme_ridges(font_size = 12) +
+  labs(title = "Cluster 11: stable core vs. disagreement cells", x = "asinh expression", y = "Marker")
+```
+
+This supports the idea that cluster 11 is a mix of more than one type of cell, not just a single population.
+
+# Deep dive into Patient 19 
+```{r deep-dive-patient-19}
+core_patient_counts <- cluster_compare |>
+  filter(cell_id %in% diag_11$stable_core) |>
+  count(patient_id) |>
+  mutate(pct_of_core = round(100 * n / sum(n), 1)) |>
+  arrange(desc(n))
+
+print(core_patient_counts)
+
+patient19_pct <- core_patient_counts |>
+  filter(patient_id == "Patient19") |>
+  pull(pct_of_core)
+
+cat("\nPatient19 makes up", ifelse(length(patient19_pct) > 0, paste0(patient19_pct, "%"), "0%"),
+   "of the stable core (n =", length(diag_11$stable_core), "cells)\n")
+
+disagreement_patient_counts <- cluster_compare |>
+  filter(cell_id %in% diag_11$disagreement_cells) |>
+  count(patient_id) |>
+  mutate(pct_of_disagreement = round(100 * n / sum(n), 1)) |>
+  arrange(desc(n))
+
+print(disagreement_patient_counts)
+```
+stable_core: Patient19 = 19.8% (237 of 1195 cells)
+disagreement: Patient19 = 32.6% (103 of 320 cells)
+
+So patient 19 isn't wildly over-represented in Cluster 11 and not really driving the noise.
+
+**In summary:** Cluster 11's core, consistent identity (79% of the cluster) looks B/plasma-lineage-associated across two independent coarse resolutions. It isn't primarily explained by one patient and isn't distinguished by FoxP3 the way a real Treg population should be. Patient19's enrichment is real, but it's a separate, smaller issue sitting mostly in the noisier, already-questionable 21% of the cluster.
+
+---
+
+## Deep dive: Cluster 20 (Exhausted T Cell)
+
+```{r deep-dive-20}
+diag_20 <- run_stable_core_diagnostic("20", spe, cluster_compare)
+```
+Only 33.8% of the cells agree with each other, and the dominant destination only capture 39.1% of the cluster to begin with. 
+
+```{r deep-dive-20-markers}
+markers_20 <- run_marker_diagnostics(diag_20, spe)
+```
+
+```{r deep-dive-20-composition, fig.width=8, fig.height=5}
+run_composition_diagnostics(diag_20, cluster_compare)
+```
+
+```{r deep-dive-20-ridge, fig.width=10, fig.height=6}
+top_markers_20 <- rownames(markers_20$positive_vs_rest)[1:min(10, nrow(markers_20$positive_vs_rest))]
+
+expr_long_20 <- as.data.frame(t(as.matrix(assay(spe, "exprs")[top_markers_20, ]))) |>
+  mutate(group_label = markers_20$group_label) |>
+  filter(group_label != "rest") |>
+  pivot_longer(cols = all_of(top_markers_20), names_to = "marker", values_to = "expression")
+
+ggplot(expr_long_20, aes(x = expression, y = marker, fill = group_label)) +
+  geom_density_ridges(alpha = 0.6, scale = 1.2) +
+  scale_fill_manual(values = c("stable_core" = "steelblue", "disagreement" = "firebrick")) +
+  theme_ridges(font_size = 12) +
+  labs(title = "Cluster 20: stable core vs. disagreement cells", x = "asinh expression", y = "Marker")
+```
+
+Only one marker (TIGIT) shows any real separation, but the rest of the markers have almost near-total overlap.
+
+**In summary:** Cluster 20 is simply too small and too weak to support a specific identity claim at all. There's only 76 cells in the stable core with only one weakly-separating marker. Not enough to make a confident call.
+
+---
+
+## Deep dive: Cluster 8 (Memory T Cell)
+
+```{r deep-dive-8}
+diag_8 <- run_stable_core_diagnostic("8", spe, cluster_compare)
+```
+
+
+```{r deep-dive-8-markers}
+markers_8 <- run_marker_diagnostics(diag_8, spe)
+```
+
+
+```{r deep-dive-8-composition, fig.width=8, fig.height=5}
+run_composition_diagnostics(diag_8, cluster_compare)
+```
+
+
+```{r deep-dive-8-ridge, fig.width=10, fig.height=6}
+top_markers_8 <- rownames(markers_8$positive_vs_rest)[1:min(10, nrow(markers_8$positive_vs_rest))]
+
+expr_long_8 <- as.data.frame(t(as.matrix(assay(spe, "exprs")[top_markers_8, ]))) |>
+  mutate(group_label = markers_8$group_label) |>
+  filter(group_label != "rest") |>
+  pivot_longer(cols = all_of(top_markers_8), names_to = "marker", values_to = "expression")
+
+ggplot(expr_long_8, aes(x = expression, y = marker, fill = group_label)) +
+  geom_density_ridges(alpha = 0.6, scale = 1.2) +
+  scale_fill_manual(values = c("stable_core" = "steelblue", "disagreement" = "firebrick")) +
+  theme_ridges(font_size = 12) +
+  labs(title = "Cluster 8: stable core vs. disagreement cells", x = "asinh expression", y = "Marker")
+```
+
+---
+
+## Deep dive: Cluster 12 (Mast Cell)
+
+```{r deep-dive-12}
+diag_12 <- run_stable_core_diagnostic("12", spe, cluster_compare)
+```
+
+```{r deep-dive-12-markers}
+markers_12 <- run_marker_diagnostics(diag_12, spe)
+```
+
+```{r deep-dive-12-composition, fig.width=8, fig.height=5}
+run_composition_diagnostics(diag_12, cluster_compare)
+```
+
+```{r deep-dive-12-ridge, fig.width=10, fig.height=6}
+top_markers_12 <- rownames(markers_12$positive_vs_rest)[1:min(10, nrow(markers_12$positive_vs_rest))]
+
+expr_long_12 <- as.data.frame(t(as.matrix(assay(spe, "exprs")[top_markers_12, ]))) |>
+  mutate(group_label = markers_12$group_label) |>
+  filter(group_label != "rest") |>
+  pivot_longer(cols = all_of(top_markers_12), names_to = "marker", values_to = "expression")
+
+ggplot(expr_long_12, aes(x = expression, y = marker, fill = group_label)) +
+  geom_density_ridges(alpha = 0.6, scale = 1.2) +
+  scale_fill_manual(values = c("stable_core" = "steelblue", "disagreement" = "firebrick")) +
+  theme_ridges(font_size = 12) +
+  labs(title = "Cluster 12: stable core vs. disagreement cells", x = "asinh expression", y = "Marker")
+```
+
+## UMAP check, all flagged clusters
+
+```{r umap-check}
+umap_coords <- reducedDim(spe, "UMAP_harmony")
+
+base_df <- data.frame(
+  cell_id = colnames(spe),
+  UMAP1   = umap_coords[, 1],
+  UMAP2   = umap_coords[, 2]
+)
+
+# build one facet's worth of data per cluster: every cell gets a
+# "status" (stable_core / disagreement / other) relative to THAT
+# cluster specifically, plus a "facet" label naming which cluster
+# panel this copy belongs to
+build_facet_df <- function(diag_result, cluster_label) {
+  base_df |>
+    mutate(
+      status = case_when(
+        cell_id %in% diag_result$stable_core       ~ "stable core",
+        cell_id %in% diag_result$disagreement_cells ~ "disagreement",
+        TRUE                                         ~ "other"
+      ),
+      facet = cluster_label
+    )
+}
+
+facet_data <- bind_rows(
+  build_facet_df(diag_8,  "Cluster 8 (Memory T Cell)"),
+  build_facet_df(diag_11, "Cluster 11 (Treg)"),
+  build_facet_df(diag_12, "Cluster 12 (Mast Cell)"),
+  build_facet_df(diag_20, "Cluster 20 (Exhausted T Cell)")
+)
+
+# plot "other" first (background, grey) then the flagged points on
+# top, same layering fix as before, just repeated per facet
+facet_other   <- facet_data |> filter(status == "other")
+facet_flagged <- facet_data |> filter(status != "other")
+
+ggplot() +
+  geom_point(data = facet_other, aes(x = UMAP1, y = UMAP2), color = "grey85", size = 0.15) +
+  geom_point(data = facet_flagged, aes(x = UMAP1, y = UMAP2, color = status), size = 1, alpha = 1) +
+  scale_color_manual(values = c("stable core" = "#1f78b4", "disagreement" = "#e31a1c")) +
+  facet_wrap(~ facet, ncol = 2) +
+  labs(title = "Clusters 8, 11, 12, and 20: stable core vs. disagreement cells", color = "Status") +
+  theme_bw() +
+  theme(strip.text = element_text(face = "bold"))
+```
+
+Cluster 8 has a large, coherent population, with disagreement and stable core occupying the same space instead of splitting into different areas. 
+
+Meanwhile, clusters 11, 12, and 20 are sparse and scattered. The blue points tend to cluster into small pockets, while the red points are more spread out around them. This means that the stable core and disagreement cells likely have somewhat different marker profiles. Supports the idea of treating these clusters as lower-confidence annotations.
+
+## Summary and next steps
+
+* **Cluster 11:** if the stable core's top markers come back plasma/B-cell-associated (CD138, CD38, CD19) rather than FoxP3/T-cell markers, that confirms the violin-plot and k150/k200-crosstab suspicion -- this cluster should be relabeled, not kept as Treg. Check whether Patient19 dominates the stable core specifically (not just the full cluster), since that's the enrichment signal already flagged.
+
+* **Cluster 20:** given its already-tiny size (225 cells), expect a very small stable core. If the stable core is under ~50 cells, marker and ridge results here should be treated as low-confidence regardless of what they show -- the honest conclusion may be "too few cells to annotate reliably" rather than a specific relabeling.
+
+* **Screening pass:** if clusters 6, 7, or 8 showed a `frac_k150`/`frac_k200` below ~0.85 in the screening table, they deserve the same deep-dive treatment as 11 and 20 before assuming they're settled.
+
+* Bring both deep-dive results to Dr. Campbell alongside the existing violin plot and enrichment findings for these two clusters -- this notebook adds a third, independent confirmation method on top of what's already been shown for both.

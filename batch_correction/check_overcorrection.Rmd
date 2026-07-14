@@ -3,13 +3,13 @@ title: "Checking for Harmony Overcorrection"
 author: "Vaidehi Gupta"
 date: "`r Sys.Date()`"
 output:
+  pdf_document:
+    toc: true
   html_document:
     toc: true
     toc_float: true
     theme: cerulean
     code_folding: show
-  pdf_document:
-    toc: true
 editor_options:
   markdown:
     wrap: 72
@@ -165,6 +165,7 @@ for (marker in markers_to_check) {
 }
 ```
 
+There seems to be potential spillover for CD19, as it appears to be diffuse even before Harmony batch correction.
 ---
 
 ## 4. Check 2 — Per-Cluster Patient Composition and Enrichment
@@ -241,10 +242,24 @@ before/after change directly.
 
 ```{r lisi-compute}
 
-pca_before_mat <- reducedDim(spe_combined, "PCA_uncorrected")[common_cells, ]
-harmony_after_mat <- reducedDim(spe_combined, "Harmony")[common_cells, ]
+# Subsampled to keep this from thrashing memory on a shared node.
+# 20% of cells, stratified by patient so no patient gets left out or
+# over/under-represented relative to their share of the full dataset.
 
-lisi_meta <- meta_common[common_cells, c("sample_id", "broad_clusters")]
+set.seed(42)
+
+subsample_cells <- meta_common |>
+  group_by(patient_id) |>
+  slice_sample(prop = 0.20) |>
+  pull(cell_id)
+
+cat("Subsampled cells:", length(subsample_cells), "out of", nrow(meta_common),
+   sprintf("(%.1f%%)\n", 100 * length(subsample_cells) / nrow(meta_common)))
+
+pca_before_mat    <- reducedDim(spe_combined, "PCA_uncorrected")[subsample_cells, ]
+harmony_after_mat <- reducedDim(spe_combined, "Harmony")[subsample_cells, ]
+
+lisi_meta <- meta_common[subsample_cells, c("sample_id", "broad_clusters")]
 
 lisi_before <- compute_lisi(pca_before_mat, lisi_meta, c("sample_id", "broad_clusters"))
 lisi_after  <- compute_lisi(harmony_after_mat, lisi_meta, c("sample_id", "broad_clusters"))
@@ -256,8 +271,14 @@ lisi_summary <- data.frame(
 )
 
 knitr::kable(lisi_summary, digits = 2,
-            caption = "Median LISI before (PCA_uncorrected) vs. after (Harmony)")
+            caption = "Median LISI before (PCA_uncorrected) vs. after (Harmony), 20% stratified subsample")
 ```
+
+Batch-LISI roughly doubled (patients mix well locally), which means Harmony was able to achieve strong batch correction without any evidence of overcorrection (cluster separation held steady or improved).
+
+Cluster-LISI slightly decreased, which means cell types are separating more cleanly after Harmony. This is strong evidence that Harmony did not overcorrect. 
+
+Note: A Cluster-LISI value approaching 1.0 means that a cell's neighborhood is (on average) almost entirely made up of its own cluster.
 
 ```{r lisi-plot, fig.width=10, fig.height=5}
 lisi_long <- bind_rows(
@@ -295,15 +316,24 @@ composition_by_state <- meta_common |>
   count(disease_state, broad_celltype) |>
   group_by(disease_state) |>
   mutate(pct = 100 * n / sum(n)) |>
-  ungroup()
+  ungroup() |>
+  mutate(broad_lineage = case_when(
+    str_detect(broad_celltype, "T Cell|Treg") ~ "T Cell",
+    str_detect(broad_celltype, "Macrophage|MDSC|DC|Mast") ~ "Myeloid",
+    str_detect(broad_celltype, "Epithelial") ~ "Epithelial",
+    str_detect(broad_celltype, "Plasma|Plasmablast") ~ "B/Plasma",
+    str_detect(broad_celltype, "Fibroblast") ~ "Stromal",
+    TRUE ~ "Other/Unresolved"
+  ))
 
-ggplot(composition_by_state, aes(x = disease_state, y = pct, fill = broad_celltype)) +
+ggplot(composition_by_state, aes(x = disease_state, y = pct, fill = broad_lineage)) +
   geom_col(position = "stack") +
-  labs(title = "Cell type composition (%) by disease state",
-      x = "Disease State", y = "% of cells", fill = "Cell Type") +
+  labs(title = "Cell lineage composition (%) by disease state",
+      x = "Disease State", y = "% of cells", fill = "Lineage") +
   theme_bw() +
   theme(legend.position = "right")
 ```
+
 
 Same breakdown per patient, to spot-check whether any individual patient's composition looks like an outlier within their disease state group (useful alongside the enrichment check in Section 4).
 
@@ -313,17 +343,29 @@ composition_by_patient <- meta_common |>
   count(patient_id, disease_state, broad_celltype) |>
   group_by(patient_id) |>
   mutate(pct = 100 * n / sum(n)) |>
-  ungroup()
+  ungroup() |>
+  mutate(broad_lineage = case_when(
+    str_detect(broad_celltype, "T Cell|Treg") ~ "T Cell",
+    str_detect(broad_celltype, "Macrophage|MDSC|DC|Mast") ~ "Myeloid",
+    str_detect(broad_celltype, "Epithelial") ~ "Epithelial",
+    str_detect(broad_celltype, "Plasma|Plasmablast") ~ "B/Plasma",
+    str_detect(broad_celltype, "Fibroblast") ~ "Stromal",
+    TRUE ~ "Other/Unresolved"
+  ))
 
-ggplot(composition_by_patient, aes(x = patient_id, y = pct, fill = broad_celltype)) +
+ggplot(composition_by_patient, aes(x = patient_id, y = pct, fill = broad_lineage)) +
   geom_col(position = "stack") +
   facet_wrap(~ disease_state, scales = "free_x", nrow = 1) +
-  labs(title = "Cell type composition (%) by patient, grouped by disease state",
-      x = "Patient", y = "% of cells", fill = "Cell Type") +
+  labs(title = "Cell lineage composition (%) by patient, grouped by disease state",
+      x = "Patient", y = "% of cells", fill = "Lineage") +
   theme_bw() +
   theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "right")
 ```
+There's substantial patient-to-patient heterogeneity even after batch correction and clustering.
 
+Patient 17 has a significant amount of Other/Unresolved cells, which makes sense given its faulty ROIs. 
+
+Patient 10 (Benign) has way more Myeloid cells and way less T-cell/B plasma. 
 ---
 
 ## Notes

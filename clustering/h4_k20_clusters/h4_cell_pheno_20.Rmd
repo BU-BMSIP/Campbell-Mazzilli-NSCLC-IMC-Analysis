@@ -1,0 +1,578 @@
+---
+title: 'All Patients: Broad Cell Type Clustering — Harmony V4'
+author: "Tazein Shah"
+date: "07-13-2026"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+subtitle: 20 Clusters
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 12, fig.height = 8)
+set.seed(42)
+```
+
+## Overview
+
+Broad cell type clustering on the harmonized combined SPE
+(`spe_combined_harmony_r3.rds`). This Harmony run was computed on raw
+counts directly (PCA on `counts`, no asinh, no cap/Z-score) before
+Harmony. Clustering runs on the Harmony corrected embeddings
+(analogous to Xi et al.'s PCA on top 2,000 variable features). The
+cap + Z-score assay used here is for visualization only and is
+computed fresh from raw counts; it was not part of how Harmony was
+run. After inspecting the dot plot and UMAP, broad cell type labels
+are assigned manually via a lookup table.
+
+---
+
+## 1. Load Libraries
+
+```{r libraries}
+library(imcRtools)
+library(tidyverse)
+library(dittoSeq)
+library(viridis)
+library(scater)
+library(scran)
+library(bluster)
+library(patchwork)
+library(RColorBrewer)
+```
+
+---
+
+## 2. Paths
+
+All paths for this notebook are built off a single base path below.
+Change `analysis_path` here if the project moves; everything else is
+derived with `file.path()`.
+
+```{r paths}
+analysis_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis"
+
+# input
+spe_path <- file.path(analysis_path, "batch_correction", "spe_combined_harmony_r4.rds")
+
+# clustering outputs
+clustering_path   <- file.path(analysis_path, "clustering")
+intermediate_path <- file.path(clustering_path, "h4_k20_clusters", "harmony_20_clustered_intermediate.rds")
+findmarkers_path  <- file.path(clustering_path, "h4_k20_clusters", "harmony_20_cluster_findmarkers.csv")
+out_path          <- file.path(clustering_path, "h4_k20_clusters", "harmony_20_cluster_annot.rds")
+```
+
+---
+
+## 3. Load Harmonized Data
+
+```{r load-data}
+spe <- readRDS(spe_path)
+
+cat("Cells:", ncol(spe), "\n")
+cat("Patients:", n_distinct(spe$patient_id), "\n")
+cat("ROIs:", n_distinct(spe$sample_id), "\n")
+cat("Channels:", nrow(spe), "\n")
+cat("Reduced dims available:", paste(reducedDimNames(spe), collapse = ", "), "\n")
+cat("Assays available:", paste(assayNames(spe), collapse = ", "), "\n")
+```
+
+---
+
+## 4. Marker Sets
+
+```{r markers}
+# core markers for broad annotation and UMAP overlays
+core_markers <- c("SMA", "CD4", "CD8a", "CD19", "CD15",
+                  "CD14", "CD86", "LAMP3", "CD163", "EpCAM")
+core_markers <- core_markers[core_markers %in% rownames(spe)]
+cat("Core markers found:", paste(core_markers, collapse = ", "), "\n")
+cat("Missing:", paste(setdiff(
+  c("SMA", "CD4", "CD8a", "CD19", "CD15", "CD14", "CD86", "LAMP3", "CD163", "EpCAM"),
+  rownames(spe)), collapse = ", "), "\n")
+
+# full panel, used to investigate clusters that don't separate on core markers
+full_markers <- c(
+  "SMA", "CD4", "CD8a", "CD19", "CD15", "CD14", "CD86", "LAMP3",
+  "Ki67", "MKI67", "CD138", "PD1", "PDL1", "FoxP3", "CD68", "CD163",
+  "TIM3", "CD141", "CD11c", "CD56", "CD117", "EpCAM", "CD38",
+  "CD45RO", "LAG3", "CD1c", "GATA3", "TTF1orCD16"
+)
+full_markers <- full_markers[full_markers %in% rownames(spe)]
+cat("Full panel markers found:", length(full_markers), "\n")
+cat("Missing:", paste(setdiff(
+  c("SMA", "CD4", "CD8a", "CD19", "CD15", "CD14", "CD86", "LAMP3",
+    "Ki67", "MKI67", "CD138", "PD1", "PDL1", "FoxP3", "CD68", "CD163",
+    "TIM3", "CD141", "CD11c", "CD56", "CD117", "EpCAM", "CD38",
+    "CD45RO", "LAG3", "CD1c", "GATA3", "TTF1orCD16"),
+  rownames(spe)), collapse = ", "), "\n")
+```
+
+---
+
+## 5. Preprocessing: 99th Percentile Cap + Z-score
+
+```{r helpers}
+cap_99 <- function(mat) {
+  t(apply(mat, 1, function(x) {
+    q99 <- quantile(x, 0.99)
+    pmin(x, q99)
+  }))
+}
+
+zscore_rows <- function(mat) {
+  t(scale(t(mat)))
+}
+```
+
+```{r preprocess}
+mat_0100 <- counts(spe) |> cap_99() |> zscore_rows()
+assay(spe, "scaled_0100") <- mat_0100
+
+cat("Assays in SPE:", paste(assayNames(spe), collapse = ", "), "\n")
+```
+
+---
+
+## 6. Louvain Clustering on Harmony Embeddings
+
+Clustering runs on the Harmony corrected embeddings, which serve the
+same role as PCA on top variable features in the Xi et al. approach.
+Resolution 1.0 as per the preprint's first pass. The clustered SPE is
+saved immediately after so clustering does not need to rerun on every
+render.
+
+```{r cluster}
+if (file.exists(intermediate_path)) {
+  cat("Loading existing clustered SPE from intermediate file.\n")
+  spe <- readRDS(intermediate_path)
+  cat("Number of broad clusters:", nlevels(spe$broad_clusters), "\n")
+  print(table(spe$broad_clusters))
+} else {
+  set.seed(220225)
+
+  harmony_mat <- reducedDim(spe, "Harmony")
+  cat("Harmony embedding dimensions:", dim(harmony_mat), "\n")
+
+  g     <- buildSNNGraph(t(harmony_mat), k = 20, type = "rank")
+  clust <- igraph::cluster_louvain(g)
+  spe$broad_clusters <- factor(clust$membership)
+
+  cat("Number of broad clusters:", nlevels(spe$broad_clusters), "\n")
+  print(table(spe$broad_clusters))
+
+  # ensure the parent directory exists before saving
+  dir.create(dirname(intermediate_path), recursive = TRUE, showWarnings = FALSE)
+  saveRDS(spe, intermediate_path)
+  cat("Saved clustered intermediate SPE to:", intermediate_path, "\n")
+}
+```
+
+---
+
+## 7. UMAP on Harmony Embeddings
+
+`UMAP_harmony` already exists in this object from the batch correction
+step, so it is reused here instead of recomputed.
+
+```{r umap}
+if ("UMAP_harmony" %in% reducedDimNames(spe)) {
+  cat("Reusing existing UMAP_harmony from batch correction step.\n")
+} else {
+  set.seed(220225)
+  spe <- runUMAP(spe, dimred = "Harmony", name = "UMAP_harmony")
+  cat("UMAP computed.\n")
+}
+```
+
+---
+
+## 8. Subset for Visualization
+
+20,000 cells per ROI cap to keep plots manageable.
+
+```{r subset}
+set.seed(220225)
+cells_per_roi  <- split(seq_len(ncol(spe)), spe$sample_id)
+sampled_cells  <- unlist(lapply(cells_per_roi, function(idx) {
+  sample(idx, min(20000, length(idx)))
+}))
+spe_sub <- spe[, sampled_cells]
+cat("Cells in subset:", ncol(spe_sub), "\n")
+```
+
+---
+
+## 9. UMAP Colored by Patient
+
+```{r umap-patient, fig.width=10, fig.height=7}
+n_patients    <- n_distinct(spe$patient_id)
+patient_cols  <- setNames(
+  colorRampPalette(brewer.pal(9, "Set1"))(n_patients),
+  unique(spe$patient_id)
+)
+
+p_patient <- dittoDimPlot(spe_sub, var = "patient_id",
+                          reduction.use = "UMAP_harmony", size = 0.2) +
+  scale_color_manual(values = patient_cols) +
+  ggtitle("UMAP colored by Patient ID (Harmony, no asinh)")
+print(p_patient)
+```
+
+## 11. UMAP Colored by Broad Cluster
+
+```{r umap-clusters, fig.width=10, fig.height=7}
+p_clusters <- dittoDimPlot(spe_sub, var = "broad_clusters",
+                           reduction.use = "UMAP_harmony",
+                           size = 0.2, do.label = TRUE, labels.size = 3) +
+  ggtitle("UMAP colored by Broad Louvain Cluster") +
+  theme(legend.position = "right")
+print(p_clusters)
+```
+
+---
+
+## 12. UMAP Per Core Marker
+
+Used to visually match clusters to known marker expression before
+annotating.
+
+```{r umap-markers, fig.width=8, fig.height=6}
+for (marker in core_markers) {
+  p <- dittoDimPlot(spe_sub, var = marker,
+                    reduction.use = "UMAP_harmony",
+                    assay = "scaled_0100", size = 0.2) +
+    scale_color_viridis(name = marker) +
+    ggtitle(paste("UMAP:", marker))
+  print(p)
+}
+```
+
+---
+
+## 13. Dot Plot: Core Marker Expression per Cluster
+
+The primary tool for annotating clusters. Each row is a marker, each
+column is a cluster. Look for which clusters show high expression of
+the core lineage markers.
+
+```{r make-dotplot}
+make_dotplot <- function(spe, assay_name, cluster_col, marker_set, title) {
+  expr_mat   <- assay(spe, assay_name)[marker_set, ]
+  cluster_id <- spe[[cluster_col]]
+
+  mean_expr <- sapply(levels(cluster_id), function(cl) {
+    idx <- which(cluster_id == cl)
+    rowMeans(expr_mat[, idx, drop = FALSE])
+  })
+
+  global_med <- apply(expr_mat, 1, median)
+  frac_expr  <- sapply(levels(cluster_id), function(cl) {
+    idx <- which(cluster_id == cl)
+    rowMeans(expr_mat[, idx, drop = FALSE] > global_med)
+  })
+
+  mean_df <- as.data.frame(mean_expr) |>
+    rownames_to_column("marker") |>
+    pivot_longer(-marker, names_to = "cluster", values_to = "mean_exprs")
+
+  frac_df <- as.data.frame(frac_expr) |>
+    rownames_to_column("marker") |>
+    pivot_longer(-marker, names_to = "cluster", values_to = "frac_expressing")
+
+  plot_df <- left_join(mean_df, frac_df, by = c("marker", "cluster"))
+  plot_df$cluster <- factor(plot_df$cluster, levels = levels(cluster_id))
+
+  marker_order <- rownames(mean_expr)[hclust(dist(mean_expr))$order]
+  plot_df$marker <- factor(plot_df$marker, levels = marker_order)
+
+  ggplot(plot_df, aes(x = cluster, y = marker)) +
+    geom_point(aes(size = frac_expressing, color = mean_exprs)) +
+    scale_color_viridis(option = "magma", name = "Mean\nZ-score expr") +
+    scale_size_continuous(range = c(0.5, 6), name = "Fraction\nexpressing") +
+    labs(title = title, x = "Cluster", y = "Marker") +
+    theme_bw(base_size = 12) +
+    theme(
+      axis.text.x      = element_text(angle = 0, hjust = 0.5),
+      axis.text.y      = element_text(size = 9),
+      panel.grid.major = element_line(color = "grey90"),
+      legend.position  = "right"
+    )
+}
+```
+
+```{r dotplot-core, fig.width=16, fig.height=6}
+p_dot_core <- make_dotplot(spe, "scaled_0100", "broad_clusters",
+                           core_markers,
+                           "Harmony (no asinh): Core Marker Expression per Broad Louvain Cluster")
+print(p_dot_core)
+```
+
+---
+
+## 14. Full Panel Dot Plot for Low-Signal Clusters
+
+Several clusters may not show a clear standout marker on the 10 core
+markers above, this can happen for macrophage/myeloid populations
+where markers like CD14, CD86, CD163 are broadly and continuously
+expressed rather than sharply spiking in one cluster, or because the
+cluster is actually separated by markers outside the core panel
+(e.g. PD1, Ki67, FoxP3, CD45RO), since this Harmony run was computed
+on raw counts across the full panel, not just the 10 core markers.
+Borderline or low quality segmented cells are also possible. Use this
+expanded dot plot to investigate clusters that look flat above before
+calling them "Unknown."
+
+```{r dotplot-full, fig.width=18, fig.height=10}
+p_dot_full <- make_dotplot(spe, "scaled_0100", "broad_clusters",
+                           full_markers,
+                           "Harmony (no asinh): Full Panel Marker Expression per Broad Louvain Cluster")
+print(p_dot_full)
+```
+
+---
+
+## 15. Statistical Marker Discovery (findMarkers)
+
+For clusters with no obvious standout marker on either dot plot,
+`findMarkers()` ranks markers by how distinctly they separate that
+cluster from all others, accounting for variance rather than just
+mean difference. This can surface subtle but consistent shifts that
+don't show up clearly in a Z-score dot plot averaged across thousands
+of cells.
+
+```{r findmarkers}
+markers_de <- findMarkers(spe,
+                          groups     = spe$broad_clusters,
+                          assay.type = "scaled_0100",
+                          subset.row = full_markers)
+
+# save all clusters to CSV
+all_markers <- lapply(levels(spe$broad_clusters), function(cl) {
+  df <- as.data.frame(markers_de[[cl]])
+  data.frame(
+    cluster = cl,
+    marker  = rownames(df),
+    Top     = df$Top,
+    FDR     = df$FDR,
+    logFC   = df$summary.logFC
+  )
+})
+
+all_markers_df <- do.call(rbind, all_markers)
+
+write.csv(all_markers_df, findmarkers_path, row.names = FALSE)
+
+# print top 5 positive markers per cluster
+df <- read.csv(findmarkers_path)
+
+# summary table: top positive marker per cluster at a glance
+top1_summary <- do.call(rbind, lapply(levels(spe$broad_clusters), function(cl) {
+  sub <- df[df$cluster == cl & df$logFC > 1.0, ]
+  sub <- sub[order(sub$Top, -sub$logFC), ]
+  if (nrow(sub) == 0) {
+    data.frame(cluster = cl, top_markers = "none above logFC 1.0")
+  } else {
+    data.frame(cluster = cl,
+               top_markers = paste(head(sub$marker, 5), collapse = ", "))
+  }
+}))
+
+cat("Top positive markers (logFC > 1.0) per cluster:\n")
+print(knitr::kable(top1_summary, col.names = c("Cluster", "Top Positive Markers")))
+
+cat("\n\nDetailed tables:\n")
+
+# detailed table per cluster, positive logFC only
+for (cl in levels(spe$broad_clusters)) {
+  sub <- df[df$cluster == cl & df$Top <= 5 & df$logFC > 1.0, ]
+  sub <- sub[order(sub$Top, -sub$logFC), ]
+  if (nrow(sub) == 0) {
+    cat("Cluster", cl, ": no markers with logFC > 1.0 in top 5\n\n")
+  } else {
+    print(knitr::kable(sub[, c("marker", "Top", "FDR", "logFC")],
+                       caption = paste("Cluster", cl),
+                       digits  = 3))
+  }
+}
+```
+--- 
+
+## 15b. Trying to Find "Unknown" Clusters
+
+```{r}
+for (cl in c("3","5","21","22")) {
+  sub <- df[df$cluster == cl, ]
+  sub <- sub[order(sub$Top, -sub$logFC), ]
+  print(knitr::kable(sub[, c("marker", "Top", "FDR", "logFC")],
+                     caption = paste("Cluster", cl, "(all markers)"),
+                     digits  = 3))
+}
+```
+
+## 16. Diagnostic: Area and Patient Composition for Ambiguous Clusters
+
+```{r diagnostic-unknown, fig.width=10, fig.height=5}
+ambiguous_clusters <- c("3","5","21","22")
+
+# cell area boxplot
+df_area <- data.frame(
+  area    = spe$area,
+  cluster = as.character(spe$broad_clusters)
+)
+
+# reference: median area across all annotated clusters
+df_area_ref <- df_area[!df_area$cluster %in% ambiguous_clusters, ]
+ref_median   <- median(df_area_ref$area)
+
+p_area <- ggplot(df_area[df_area$cluster %in% ambiguous_clusters, ],
+                 aes(x = cluster, y = area, fill = cluster)) +
+  geom_boxplot(outlier.size = 0.5, outlier.alpha = 0.3) +
+  geom_hline(yintercept = ref_median, linetype = "dashed", color = "grey40") +
+  annotate("text", x = 0.6, y = ref_median + 5,
+           label = "median (annotated clusters)", size = 3, color = "grey40") +
+  labs(title = "Cell Area Distribution for Ambiguous Clusters",
+       x = "Cluster", y = "Cell Area (pixels)") +
+  theme_bw() +
+  theme(legend.position = "none")
+print(p_area)
+```
+
+```{r diagnostic-patient, fig.width=12, fig.height=5}
+# patient composition per ambiguous cluster
+comp_df <- as.data.frame(
+  table(cluster   = as.character(spe$broad_clusters),
+        patient   = spe$patient_id)
+)
+comp_df <- comp_df[comp_df$cluster %in% ambiguous_clusters & comp_df$Freq > 0, ]
+
+p_comp <- ggplot(comp_df, aes(x = patient, y = Freq, fill = patient)) +
+  geom_col() +
+  facet_wrap(~ cluster, scales = "free_y", nrow = 2) +
+  labs(title = "Patient Composition for Ambiguous Clusters",
+       x = "Patient", y = "Cell Count") +
+  theme_bw() +
+  theme(axis.text.x  = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+print(p_comp)
+```
+
+## 17. Manual Broad Annotation
+
+After inspecting the dot plots and `findMarkers()` output above, fill
+in the lookup table below. Map each cluster number to one of:
+
+```{r annotate, echo=TRUE}
+broad_annotation <- c(
+  "1"  = "cDC1", #CD141 canonical cDC1 marker, TIM3 suggests checkpoint expressing subset
+  "2"  = "Stroma", #SMA marks myofibroblasts/pericytes, PDL1/TIM3 checkpoint markers, CD19 likely spillover
+  "3"  = "Low Stain", #no markers clear logFC 1.0, matches k150 cluster 2 suppression pattern
+  "4"  = "Mixed DC/Mast/Treg", #LAMP3 mature migratory DC, CD117 mast cell, PD1/FoxP3 Treg or exhausted T contact, TTF1orCD16 near tumor
+  "5"  = "Epithelial", #low confidence, only EpCAM and FoxP3 clear at logFC 0.5, FoxP3 likely Treg admixture
+  "6"  = "CD8 T Cell", #CD8a/CD45RO core, TIM3/FoxP3 exhaustion or Treg admixture, CD138 likely spillover
+  "7"  = "Myeloid", #CD14/CD11c/CD68/CD86 monocyte macrophage markers, MKI67 proliferation
+  "8"  = "Tumor Epithelial", #TTF1orCD16 and EpCAM core tumor signature, FoxP3/CD15/CD1c likely infiltrating immune cells
+  "9"  = "Memory T/Plasma Cell", #CD45RO and CD138 suggest boundary between memory T zone and plasma cell niche
+  "10" = "Mast Cell", #CD117 defining mast cell marker, CD11c/TIM3 suggest myeloid DC proximity
+  "11" = "Treg", #FoxP3 defines Treg, CD15/PDL1/TTF1orCD16 suggest tumor associated granulocyte proximity
+  "12" = "Granulocyte", #CD15 defines granulocyte lineage, CD45RO/PDL1/CD138 mixed lymphoid signal
+  "13" = "B Cell/Plasmablast", #matches CD38/FoxP3 leaning B cell subtype from notebook 07
+  "14" = "Monocyte", #CD14 alone, clean monocyte signature
+  "15" = "CD4 T Cell", #CD4/CD45RO memory helper T cells, TIM3/FoxP3 exhaustion or Treg identity, CD138 likely plasma cell admixture
+  "16" = "Plasma Cell", #CD138/CD19 define lineage, CD86/PDL1 suggest activated state
+  "17" = "Memory T Cell", #CD45RO defines memory T cells, CD1c admixture suggests nearby cDC2
+  "18" = "cDC2", #CD1c alone, clean cDC2 signature
+  "19" = "Proliferating Cells", #MKI67 only, no lineage marker to assign identity
+  "20" = "NK Cell", #CD56 alone, clean NK signature
+  "21" = "T Cells", #low confidence
+  "22" = "Low Stain" #same suppression pattern as cluster 3, only LAG3 clears zero at rank 2, not enough to call a distinct population
+)
+
+if (length(broad_annotation) > 0) {
+  spe$broad_celltype <- broad_annotation[as.character(spe$broad_clusters)]
+  cat("Annotation applied.\n")
+  print(table(spe$broad_celltype, useNA = "ifany"))
+} else {
+  cat("No annotation provided yet. Fill in broad_annotation above after inspecting plots.\n")
+}
+
+
+if (length(broad_annotation) > 0) {
+  spe$broad_celltype <- broad_annotation[as.character(spe$broad_clusters)]
+  cat("Annotation applied.\n")
+  print(table(spe$broad_celltype))
+} else {
+  cat("No annotation provided yet. Fill in broad_annotation above after inspecting plots.\n")
+}
+```
+---
+
+## 18. UMAP Colored by Broad Cell Type
+
+Run this chunk after filling in the annotation above.
+
+```{r umap-celltype, fig.width=10, fig.height=7}
+if ("broad_celltype" %in% colnames(colData(spe))) {
+  spe_sub$broad_celltype <- spe$broad_celltype[match(colnames(spe_sub), colnames(spe))]
+
+  p_celltype <- dittoDimPlot(spe_sub, var = "broad_celltype",
+                             reduction.use = "UMAP_harmony",
+                             size = 0.2, do.label = TRUE, labels.size = 3) +
+    ggtitle("UMAP colored by Broad Cell Type") +
+    theme(legend.position = "right")
+  print(p_celltype)
+} else {
+  cat("Run chunk 17 first to apply annotations.\n")
+}
+```
+
+---
+
+## 19. Save Annotated SPE
+
+```{r save}
+if ("broad_celltype" %in% colnames(colData(spe))) {
+  dir.create(dirname(out_path), recursive = TRUE, showWarnings = FALSE)
+  saveRDS(spe, out_path)
+  cat("Saved annotated SPE to:", out_path, "\n")
+} else {
+  cat("Annotation not yet applied. Fill in chunk 17 before saving.\n")}
+```
+
+---
+
+## Notes
+
+- All paths in this notebook are built from a single `analysis_path`
+  base variable in chunk 2, using `file.path()`, matching the pattern
+  used in the other clustering notebooks
+- Input `spe_combined_harmony_r3.rds` has Harmony embeddings computed
+  via PCA on raw `counts`, no asinh and no cap/Z-score; the cap +
+  Z-score assay used in this notebook is for visualization only and
+  was not part of how Harmony was run
+- Because raw counts can have a long right tail, this PCA/Harmony run
+  is more exposed to outlier driven distortion than the asinh or
+  cap+Z-score versions; worth keeping in mind when comparing UMAPs
+  and cluster quality across the three conditions
+- Preprocessing: counts already 0 to 100 filtered; 99th percentile cap + Z-score applied and stored as `scaled_0100` assay
+- Clustering uses Harmony corrected embeddings (`reducedDim(spe, "Harmony")`),
+  which play the same role as PCA on top 2,000 variable features in Xi et al.
+- Dot plot and UMAP marker overlays use `scaled_0100` assay
+- `igraph::cluster_louvain` does not accept a resolution parameter; if the
+  number of clusters is too coarse or too fine, switch to
+  `igraph::cluster_leiden(g, resolution_parameter = 1.0)` from the `leiden`
+  package
+- Doublet like clusters (hybrid marker expression across lineages) should be
+  assigned "Unknown" and flagged for removal before subclustering
+- Note: rerunning this notebook may shuffle Louvain cluster numbers; if you
+  need to preserve a finalized annotation across reruns, save the clustered
+  SPE before annotating and load it separately
