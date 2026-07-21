@@ -193,8 +193,7 @@ pheatmap(
 )
 ```
 
-Raw composition alone is misleading. A patient who simply contributes more cells overall will naturally show up more in every cluster. Instead compute an ENRICHMENT score: each patient's share
-of a cluster, divided by that patient's share of the whole dataset.
+Raw composition alone is misleading. A patient who simply contributes more cells overall will naturally show up more in every cluster. Instead compute an ENRICHMENT score: each patient's share of a cluster, divided by that patient's share of the whole dataset.
 
 Enrichment near 1 = patient is represented in this cluster about as much as expected. 
 Enrichment >> 1 for ONE patient, with no obvious biological reason, is the signature of under-correction (that patient's batch effect is still driving its own sub-cluster).

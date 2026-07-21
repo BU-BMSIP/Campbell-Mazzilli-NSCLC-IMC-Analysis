@@ -1,0 +1,414 @@
+---
+title: "Tumor IMC - Batch Correction and Dimensionality Reduction (Run 5)"
+author: "Vaidehi Gupta"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setup
+
+```{r libraries}
+.libPaths(c("/restricted/projectnb/camplab/home/vgupta7/R_libs", .libPaths()))
+
+library(imcRtools)
+library(SpatialExperiment)
+library(SingleCellExperiment)
+library(ggplot2)
+library(dplyr)
+library(stringr)
+library(harmony)
+library(scater)
+library(dittoSeq)
+library(viridis)
+library(cowplot)
+
+set.seed(42)
+```
+
+## Load Data
+
+Adding back in Patient20's 5/19 acquisition to increase total cell counts. 
+The 230 vs. 430 scale difference reflects a larger capture
+area at the same resolution, not a calibration/resolution mismatch,
+so cell segmentation and marker intensities should be directly
+comparable between the two acquisitions. This is checked explicitly
+(not just assumed) in the `check-sample-id-collision` and downstream
+overcorrection notebook. Patient17's ROI 1 and ROI 4 are still faulty
+and are removed after loading, once `sample_id` is available.
+
+```{r paths}
+base_dir <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/steinbock/"
+
+figures_dir <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/figures/batch_correction_umaps/run5"
+dir.create(figures_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Patient20_519 added back in
+steinbock_dirs <- list(
+  Patient10   = file.path(base_dir, "p10_results"),
+  Patient11   = file.path(base_dir, "p11_results"),
+  Patient12   = file.path(base_dir, "p12_results"),
+  Patient13   = file.path(base_dir, "p13_results"),
+  Patient14   = file.path(base_dir, "p14_results"),
+  Patient15   = file.path(base_dir, "p15_results"),
+  Patient16   = file.path(base_dir, "p16_results"),
+  Patient17   = file.path(base_dir, "p17_results"),
+  Patient18   = file.path(base_dir, "p18_results"),
+  Patient19   = file.path(base_dir, "p19_results"),
+  Patient20_425 = file.path(base_dir, "p20_4_25_results"),
+  Patient20_519 = file.path(base_dir, "p20_5_19_results")
+)
+```
+
+```{r read-steinbock}
+spe_list <- lapply(names(steinbock_dirs), function(patient) {
+  cat("Loading:", patient, "\n")
+  spe <- read_steinbock(steinbock_dirs[[patient]])
+  spe$patient_id  <- patient
+  spe
+})
+names(spe_list) <- names(steinbock_dirs)
+
+# Check cells loaded per patient
+for (p in names(spe_list)) {
+  cat(p, ":", ncol(spe_list[[p]]), "cells\n")
+}
+```
+
+## Metadata
+
+Both Patient20 acquisitions are now in the cohort, so `disease_state`
+includes both `Patient20_425` and `Patient20_519` (same disease state --
+same patient, just two acquisitions).
+
+```{r disease-state}
+# Disease state metadata
+disease_state <- c(
+  Patient10    = "Benign",
+  Patient11    = "Lower",
+  Patient12    = "Higher",
+  Patient13    = "Higher",
+  Patient14    = "Lower",
+  Patient15    = "Higher",
+  Patient16    = "Lower",
+  Patient17    = "Lower",
+  Patient18    = "Lower",
+  Patient19    = "Higher",
+  Patient20_425 = "Lower",
+  Patient20_519 = "Lower"
+)
+```
+
+## Combine All Patients
+
+```{r combine}
+spe_combined <- do.call(cbind, spe_list)
+spe_combined$disease_state <- disease_state[spe_combined$patient_id]
+
+cat("Total cells before filtering:", ncol(spe_combined), "\n")
+cat("Total markers:", nrow(spe_combined), "\n")
+
+# Check cells per patient
+table(spe_combined$patient_id)
+```
+
+## Check for sample_id Collision Between Patient20 Acquisitions
+
+Harmony's batch variable is `sample_id`, not `patient_id`. It has no
+concept that Patient20_425 and Patient20_519 are the same underlying
+patient. `sample_id` is assigned automatically by `read_steinbock()`
+per directory, so if both acquisitions happen to generate the same ROI
+names (e.g. both producing `"Patient20-T_ROI_001_1"`), cells from two
+genuinely different acquisitions would collapse onto one `sample_id`
+after `cbind()` -- meaning Harmony would treat them as a single batch
+and never separately correct for any technical difference between the
+two scans. This check must run BEFORE Harmony, since fixing a collision
+after the fact would require rerunning the correction anyway.
+
+```{r check-sample-id-collision}
+p20_ids <- unique(spe_combined$sample_id[spe_combined$patient_id %in% c("Patient20_425", "Patient20_519")])
+
+p20_check <- data.frame(
+  sample_id  = p20_ids,
+  patient_id = sapply(p20_ids, function(s) {
+    pids <- unique(spe_combined$patient_id[spe_combined$sample_id == s])
+    paste(pids, collapse = " & ")  # collapse shows the collision directly if one exists
+  })
+)
+print(p20_check)
+
+# n_patients_per_sample_id > 1 anywhere below means a real collision
+collision_check <- sapply(p20_ids, function(s) {
+  length(unique(spe_combined$patient_id[spe_combined$sample_id == s]))
+})
+
+cat("\nsample_id values shared between Patient20_425 and Patient20_519:",
+    sum(collision_check > 1), "out of", length(collision_check), "\n")
+
+if (any(collision_check > 1)) {
+  cat("\nCOLLISION DETECTED -- disambiguating sample_id by patient_id before Harmony.\n")
+  spe_combined$sample_id <- paste(spe_combined$patient_id, spe_combined$sample_id, sep = "_")
+  # NOTE: this changes sample_id strings for ALL patients, not just
+  # Patient20, to keep the column internally consistent. If you rely on
+  # exact sample_id string matches elsewhere (e.g. the Patient17 ROI
+  # exclusion filter below), update those strings to match the new format.
+} else {
+  cat("\nNo collision -- Patient20_425 and Patient20_519 already have distinct sample_id values.\n")
+  cat("Harmony will correctly treat their ROIs as separate batches without any changes needed.\n")
+}
+```
+
+## Remove Faulty ROIs (Patient17 ROI 1 and ROI 4)
+
+`sample_id` follows the pattern `Patient_<n>T_ROI_<roi#>_<index>`, e.g.
+`Patient_17T_ROI_001_1`. We exclude ROI 001 and ROI 004 from Patient17.
+
+```{r remove-faulty-rois}
+rois_exclude <- c("Patient_17T_ROI_001_1", "Patient_17T_ROI_004_4")
+
+cat("Cells in excluded Patient17 ROIs:\n")
+print(table(spe_combined$sample_id[spe_combined$sample_id %in% rois_exclude]))
+
+spe_combined <- spe_combined[, !spe_combined$sample_id %in% rois_exclude]
+
+cat("Total cells after removing faulty Patient17 ROIs:", ncol(spe_combined), "\n")
+```
+
+## Filter by Cell Area
+
+```{r area-filter}
+spe_combined <- spe_combined[, spe_combined$area >= 20 & spe_combined$area < 500]
+
+cat("Total cells after area filtering:", ncol(spe_combined), "\n")
+```
+
+## Select Markers
+
+```{r markers}
+# Exclude structural/QC markers
+markers_exclude <- c("DNA191", "DNA193", "Membrane")
+markers_use <- rownames(spe_combined)[!rownames(spe_combined) %in% markers_exclude]
+
+cat("Markers used for batch correction:", length(markers_use), "\n")
+print(markers_use)
+```
+
+## PCA and UMAP Before Batch Correction
+
+No asinh transformation is applied - steinbock already performed 0-100
+normalization/filtering on all patients, so PCA is run directly on `counts`.
+
+```{r pca-uncorrected}
+spe_combined <- runPCA(spe_combined,
+                       assay.type = "counts",
+                       subset_row = markers_use,
+                       ncomponents = min(30, length(markers_use) - 1),
+                       name = "PCA_uncorrected")
+
+cat("PCA complete\n")
+```
+
+```{r umap-uncorrected}
+spe_combined <- runUMAP(spe_combined,
+                        dimred = "PCA_uncorrected",
+                        name = "UMAP_uncorrected")
+
+cat("UMAP complete\n")
+```
+
+```{r plot-uncorrected, fig.width=12, fig.height=5}
+# Color by patient
+p1 <- plotReducedDim(spe_combined,
+                     dimred = "UMAP_uncorrected",
+                     colour_by = "patient_id",
+                     point_size = 0.3,
+                     point_alpha = 0.3) +
+  labs(title = "UMAP Before Batch Correction",
+       subtitle = "Colored by patient") +
+  theme_bw() +
+  guides(color = guide_legend(override.aes = list(size = 4, alpha = 1)))
+
+# Color by sample_id
+p2 <- plotReducedDim(spe_combined,
+                     dimred = "UMAP_uncorrected",
+                     colour_by = "sample_id",
+                     point_size = 0.3,
+                     point_alpha = 0.3) +
+  labs(title = "UMAP Before Batch Correction",
+       subtitle = "Colored by sample_id (ROI)") +
+  theme_bw() +
+  theme(legend.position = "none")
+
+plot_grid(p1, p2, ncol = 2)
+
+ggsave(file.path(figures_dir, "umap_before_harmony.png"),
+       width = 12, height = 10, dpi = 300)
+```
+
+## Run Harmony
+
+```{r harmony}
+# Extract PCA embeddings
+pca_mat <- reducedDim(spe_combined, "PCA_uncorrected")
+
+# Run Harmony using sample_id as batch variable
+harmony_embeddings <- harmony::RunHarmony(
+  pca_mat,
+  meta_data = as.data.frame(colData(spe_combined)),
+  vars_use  = "sample_id",
+  verbose   = TRUE
+)
+```
+
+```{r store-harmony}
+# Store corrected embeddings
+reducedDim(spe_combined, "Harmony") <- harmony_embeddings
+
+cat("Harmony batch correction complete\n")
+```
+
+## UMAP After Batch Correction
+
+```{r umap-harmony}
+spe_combined <- runUMAP(spe_combined,
+                        dimred = "Harmony",
+                        name = "UMAP_harmony")
+
+cat("UMAP on Harmony embeddings complete\n")
+```
+
+```{r plot-harmony, fig.width=12, fig.height=5}
+# Color by patient
+p3 <- plotReducedDim(spe_combined,
+                     dimred = "UMAP_harmony",
+                     colour_by = "patient_id",
+                     point_size = 0.3,
+                     point_alpha = 0.3) +
+  labs(title = "UMAP After Harmony Batch Correction",
+       subtitle = "Colored by patient") +
+  theme_bw() +
+  guides(color = guide_legend(override.aes = list(size = 4, alpha = 1)))
+
+# Color by sample_id
+p4 <- plotReducedDim(spe_combined,
+                     dimred = "UMAP_harmony",
+                     colour_by = "sample_id",
+                     point_size = 0.3,
+                     point_alpha = 0.3) +
+  labs(title = "UMAP After Harmony Batch Correction",
+       subtitle = "Colored by sample_id (ROI)") +
+  theme_bw() +
+  theme(legend.position = "none")
+
+plot_grid(p3, p4, ncol = 2)
+
+ggsave(file.path(figures_dir, "umap_after_harmony.png"),
+       width = 14, height = 10, dpi = 300)
+```
+
+```{r plot-disease-state, fig.width=6, fig.height=5}
+p5 <- plotReducedDim(spe_combined,
+                     dimred = "UMAP_harmony",
+                     colour_by = "disease_state",
+                     point_size = 0.3,
+                     point_alpha = 0.3) +
+  labs(title = "UMAP After Harmony Batch Correction",
+       subtitle = "Colored by disease state") +
+  theme_bw() +
+  guides(color = guide_legend(override.aes = list(size = 4, alpha = 1)))
+
+p5
+
+ggsave(file.path(figures_dir, "umap_harmony_disease_state.png"),
+       plot = p5,
+       width = 8, height = 6, dpi = 300)
+```
+
+```{r plot-disease-state-separated, fig.width=12, fig.height=5}
+# Same UMAP, but split into one panel per disease state for easier comparison
+p5_split <- plotReducedDim(spe_combined,
+                     dimred = "UMAP_harmony",
+                     colour_by = "disease_state",
+                     point_size = 0.3,
+                     point_alpha = 0.5) +
+  facet_wrap(~ spe_combined$disease_state) +
+  labs(title = "UMAP After Harmony Batch Correction",
+       subtitle = "Split by disease state") +
+  theme_bw() +
+  theme(legend.position = "none")
+
+p5_split
+
+ggsave(file.path(figures_dir, "umap_harmony_disease_state_split.png"),
+       plot = p5_split,
+       width = 12, height = 5, dpi = 300)
+```
+
+```{r plot-comparison, fig.width=12, fig.height=10}
+comparison_plot <- plot_grid(p1, p2, p3, p4, ncol = 2)
+comparison_plot
+
+ggsave(file.path(figures_dir, "umap_before_after_harmony.png"),
+       plot = comparison_plot,
+       width = 14, height = 10, dpi = 300)
+```
+
+```{r plot-per-patient, fig.width=12, fig.height=10}
+# Check if patients mix well after correction
+# Good batch correction = patients mix in UMAP
+# Bad batch correction = patients still cluster separately
+per_patient_plot <- plotReducedDim(spe_combined,
+               dimred = "UMAP_harmony",
+               colour_by = "patient_id",
+               point_size = 0.3,
+               point_alpha = 0.5) +
+  facet_wrap(~ spe_combined$patient_id) +
+  labs(title = "UMAP After Harmony - Per Patient") +
+  theme_bw() +
+  theme(legend.position = "none")
+
+per_patient_plot
+
+ggsave(file.path(figures_dir, "umap_harmony_per_patient.png"),
+       plot = per_patient_plot,
+       width = 14, height = 10, dpi = 300)
+```
+
+## Save Output
+
+```{r save}
+output_path <- file.path(base_dir, "../analysis/spe_combined_harmony_r5.rds")
+saveRDS(spe_combined, output_path)
+cat("Saved combined SPE object to:", output_path, "\n")
+```
+
+## Summary
+
+```{r summary}
+cat("=== Batch Correction Summary ===\n")
+cat("Total cells:", ncol(spe_combined), "\n")
+cat("Total markers:", nrow(spe_combined), "\n")
+cat("Markers used for correction:", length(markers_use), "\n")
+cat("Batch variable: sample_id\n")
+cat("Method: Harmony\n")
+cat("Included: Patient20 5/19 acquisition (added back per PI request for more cells); Patient17 ROI 1 and ROI 4 still excluded (faulty)\n")
+
+cat("\nCells per patient:\n")
+print(table(spe_combined$patient_id))
+
+cat("\nCells per ROI (sample_id):\n")
+print(table(spe_combined$sample_id))
+```

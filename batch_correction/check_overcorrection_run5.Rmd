@@ -1,0 +1,375 @@
+---
+title: "Checking for Harmony Overcorrection (Run 5)"
+author: "Vaidehi Gupta"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cerulean
+    code_folding: show
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 12, fig.height = 6)
+set.seed(42)
+```
+
+## Overview
+
+Quick overcorrection check before re-clustering on the run5 object
+(Patient20_519 added back in).
+
+Three checks, in order:
+
+1. **Marker pre- vs. post-Harmony** -- same flagged markers as before.
+2. **Per-cluster patient composition / enrichment** -- same as before,
+   plus a quick filtered look at just the two Patient20 columns, since
+   that's the one thing that's actually new this run.
+3. **LISI** -- cohort-wide before/after, same as before.
+
+---
+
+## 1. Load Libraries
+
+```{r libraries}
+.libPaths(c("/restricted/projectnb/camplab/home/vgupta7/R_libs", .libPaths()))
+
+library(imcRtools)
+library(SpatialExperiment)
+library(SingleCellExperiment)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(scater)
+library(viridis)
+library(patchwork)
+library(cowplot)
+library(pheatmap)
+library(RColorBrewer)
+
+# lisi is not on CRAN -- install once from GitHub if not already available:
+#remotes::install_github("immunogenomics/LISI")
+library(lisi)
+```
+
+---
+
+## 2. Load Data
+
+```{r load-data}
+spe_combined_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/batch_correction/spe_combined_harmony_r5.rds"
+spe_combined <- readRDS(spe_combined_path)
+
+spe_clustered_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/final_cell_annotation/h5_cluster.rds"
+spe_clustered <- readRDS(spe_clustered_path)
+
+cat("spe_combined:", ncol(spe_combined), "cells |", "reducedDims:", paste(reducedDimNames(spe_combined), collapse = ", "), "\n")
+cat("spe_clustered:", ncol(spe_clustered), "cells |", nlevels(factor(spe_clustered$broad_clusters)), "clusters\n")
+```
+
+Match by cell barcode rather than assuming identical row order/length.
+
+```{r align-cells}
+common_cells <- intersect(colnames(spe_combined), colnames(spe_clustered))
+
+cat(sprintf("Shared cells: %d (%.1f%% of spe_combined, %.1f%% of spe_clustered)\n",
+           length(common_cells),
+           100 * length(common_cells) / ncol(spe_combined),
+           100 * length(common_cells) / ncol(spe_clustered)))
+
+meta_common <- data.frame(
+  cell_id        = common_cells,
+  patient_id     = spe_combined$patient_id[match(common_cells, colnames(spe_combined))],
+  sample_id      = spe_combined$sample_id[match(common_cells, colnames(spe_combined))],
+  disease_state  = spe_combined$disease_state[match(common_cells, colnames(spe_combined))],
+  broad_clusters = spe_clustered$broad_clusters[match(common_cells, colnames(spe_clustered))],
+  row.names      = common_cells
+)
+```
+
+---
+
+## 3. Check 1 -- Marker Expression: Before vs. After Harmony
+
+```{r marker-pre-post-function}
+plot_marker_pre_post <- function(spe, marker) {
+
+  umap_before <- reducedDim(spe, "UMAP_uncorrected")
+  umap_after  <- reducedDim(spe, "UMAP_harmony")
+  expr        <- assay(spe, "counts")[marker, ]
+
+  df_before <- data.frame(UMAP1 = umap_before[, 1], UMAP2 = umap_before[, 2], expr = expr)
+  df_after  <- data.frame(UMAP1 = umap_after[, 1],  UMAP2 = umap_after[, 2],  expr = expr)
+
+  p_before <- ggplot(df_before, aes(UMAP1, UMAP2, color = expr)) +
+    geom_point(size = 0.3, alpha = 0.3) +
+    scale_color_viridis_c(option = "viridis") +
+    labs(title = paste(marker, "- BEFORE Harmony"), color = marker) +
+    theme_bw()
+
+  p_after <- ggplot(df_after, aes(UMAP1, UMAP2, color = expr)) +
+    geom_point(size = 0.3, alpha = 0.3) +
+    scale_color_viridis_c(option = "viridis") +
+    labs(title = paste(marker, "- AFTER Harmony"), color = marker) +
+    theme_bw()
+
+  p_before | p_after
+}
+```
+
+Same flagged markers as the run3/run4 check: CD19, FoxP3, plus EpCAM/CD68 as the "should stay clean" contrast.
+
+**7/16 edit: Added a couple more markers (CD38, CD8a, SMA) for more comparisons.**
+
+```{r marker-pre-post-run, fig.width=12, fig.height=5}
+markers_to_check <- c("CD19", "CD38", "CD8a","FoxP3", "EpCAM", "SMA", "CD68")
+
+for (marker in markers_to_check) {
+  print(plot_marker_pre_post(spe_combined, marker))
+}
+```
+
+---
+
+## Check 1.5: Is CD19's diffuse signal spillover-related?
+
+CD19 (Nd142) sits in a block of five consecutive Neodymium isotopes on
+the panel (SMA/Pr141 | CD19/Nd142 | TIM3/Nd143 | EpCAM/Nd144 |
+TBet/Nd145 | RORgT/Nd146). Same-element isotopes are harder to purify
+apart than different elements, making isotopic impurity-driven
+crosstalk more likely within this block. This checks whether CD19
+correlates more strongly with its Nd-block neighbors than with
+biologically/panel-unrelated markers -- if so, that supports spillover
+over a genuine diffuse biological signal.
+
+```{r cd19-spillover-check}
+nd_block <- c("SMA", "CD19", "TIM3", "EpCAM", "TBet", "RORgT")
+nd_block <- nd_block[nd_block %in% rownames(spe_combined)]
+
+unrelated_markers <- c("CD14", "CD8a", "CD4")  # different elements, far apart on panel
+unrelated_markers <- unrelated_markers[unrelated_markers %in% rownames(spe_combined)]
+
+check_markers <- c(nd_block, unrelated_markers)
+expr_df <- as.data.frame(t(assay(spe_combined, "counts")[check_markers, ]))
+
+cor_matrix <- cor(expr_df, method = "spearman")
+
+cat("Correlation of CD19 with panel markers:\n")
+print(round(sort(cor_matrix["CD19", ], decreasing = TRUE), 3))
+```
+
+These are Spearman correlations for the raw values of each marker for every single cell in the dataset. When one marker's value goes up, does the other marker's value tend to go up as well, across all cells?
+
+For example, for the correlation between CD19 and TIM3:
+- All the cells are ranked from lowest to highest on CD19, then they are separately ranked lowest to highest on TIM3, and then we check how well those two rankings line up.
+- 0.131 means "If you know a cell's CD19 rank, you can predict almost nothing about its TIM3 rank".
+
+These correlations are quite low, which doesn't confirm the spillover hypothesis. However, this may instead point to non-specific binding (an antibody-level issue, where the signal is just diffusely elevated everywhere at a low level). Could also be a staining issue, rather than a specific channel bleeding into CD19's channel.
+
+## 4. Check 2 -- Per-Cluster Patient Composition and Enrichment
+
+# Patient Composition
+
+For each row (cluster), what percentage of that cluster's cells came from each patient?
+
+```{r patient-composition}
+comp_counts <- table(cluster = meta_common$broad_clusters, patient = meta_common$patient_id)
+comp_props  <- prop.table(comp_counts, margin = 1)
+
+if ("broad_celltype" %in% colnames(colData(spe_clustered))) {
+  celltype_lookup <- setNames(
+    spe_clustered$broad_celltype[match(levels(factor(spe_clustered$broad_clusters)), as.character(spe_clustered$broad_clusters))],
+    levels(factor(spe_clustered$broad_clusters))
+  )
+  rownames(comp_counts) <- paste0(rownames(comp_counts), " - ", celltype_lookup[rownames(comp_counts)])
+  rownames(comp_props)  <- rownames(comp_counts)
+} else {
+  cat("No broad_celltype annotation yet -- using cluster numbers only.\n")
+}
+
+pheatmap(
+  comp_props,
+  cluster_rows    = FALSE,
+  cluster_cols    = FALSE,
+  display_numbers = TRUE,
+  number_format   = "%.2f",
+  color           = colorRampPalette(brewer.pal(9, "YlOrRd"))(100),
+  main            = "Cluster composition by patient (row-normalized %)",
+  fontsize_number = 7,
+  angle_col       = 45
+)
+```
+
+
+# Patient Enrichment
+
+Enrichment = each patient's share of a cluster, divided by that patient's share of the whole dataset. ~1 = expected, >2 = flagged (with enough cells to trust the ratio).
+
+```{r patient-enrichment}
+overall_patient_frac <- prop.table(table(meta_common$patient_id))
+
+enrichment <- sweep(comp_props, 2, overall_patient_frac[colnames(comp_props)], "/")
+
+pheatmap(
+  enrichment,
+  cluster_rows    = FALSE,
+  cluster_cols    = FALSE,
+  display_numbers = TRUE,
+  number_format   = "%.1f",
+  color           = colorRampPalette(rev(brewer.pal(9, "RdBu")))(100),
+  breaks          = seq(0, 4, length.out = 101),
+  main            = "Patient enrichment per cluster (1 = expected, >2 = flagged)",
+  fontsize_number = 7,
+  angle_col       = 45
+)
+```
+
+```{r patient20-enrichment-wide}
+p20_cols <- grep("Patient20", colnames(enrichment), value = TRUE)
+
+p20_wide <- as.data.frame(as.table(enrichment)) |>
+  rename(cluster = cluster, patient = patient, enrichment = Freq) |>
+  filter(patient %in% p20_cols) |>
+  pivot_wider(names_from = patient, values_from = enrichment) |>
+  mutate(diff = abs(Patient20_425 - Patient20_519)) |>
+  mutate(across(where(is.numeric), \(x) round(x, 2))) |>
+  arrange(desc(diff))
+
+print(p20_wide)
+```
+Both Patient 20 acquisition datasets are pretty consistent with each other across clusters, which is a good sign they're mixing.
+
+
+```{r enrichment-flags-table}
+enrichment_flags <- as.data.frame(as.table(enrichment)) |>
+  rename(cluster = cluster, patient = patient, enrichment = Freq) |>
+  left_join(
+    as.data.frame(as.table(comp_counts)) |> rename(cluster = cluster, patient = patient, n_cells = Freq),
+    by = c("cluster", "patient")
+  ) |>
+  filter(enrichment > 2, n_cells > 50) |>
+  arrange(desc(enrichment))
+
+cat("Flagged (cluster, patient) pairs with enrichment > 2x expected and > 50 cells:\n")
+print(enrichment_flags)
+```
+Cluster 16: flagged for both Patient20_425 (2.47, 3374 cells) and Patient13 (2.26, 3766 cells)
+
+Cluster 4: flagged for both Patient14 (2.35, 840 cells) and Patient16 (2.28, 759 cells)
+
+```{r check-patient17}
+# Compare Patient17's overall dataset share before vs after ROI removal
+p17_frac_now <- overall_patient_frac["Patient17"]
+cat("Patient17's current share of the whole dataset:", round(p17_frac_now, 4), "\n")
+
+# For reference: how big was cluster 19 in total, and how much of that is Patient17?
+cluster19_total <- sum(comp_counts["19", ])
+cluster19_p17   <- comp_counts["19", "Patient17"]
+cat("Cluster 19 total cells:", cluster19_total, "\n")
+cat("Cluster 19 Patient17 cells:", cluster19_p17, sprintf("(%.1f%%)\n", 100 * cluster19_p17 / cluster19_total))
+```
+
+```{r cluster19-patient17-roi-breakdown}
+# Which of Patient17's two remaining ROIs are cluster 19's Patient17 cells coming from?
+cluster19_p17_cells <- meta_common |>
+  filter(broad_clusters == "19", patient_id == "Patient17")
+
+cat("Cluster 19, Patient17 cells by ROI:\n")
+print(table(cluster19_p17_cells$sample_id))
+
+# For context: how many total cells does each of Patient17's ROIs contribute
+# to the whole dataset, so you can see if cluster 19 is disproportionate
+# relative to each ROI's overall size (not just its raw count)
+p17_roi_totals <- meta_common |>
+  filter(patient_id == "Patient17") |>
+  count(sample_id, name = "total_cells_in_roi")
+
+cluster19_by_roi <- cluster19_p17_cells |>
+  count(sample_id, name = "cluster19_cells")
+
+roi_summary <- left_join(p17_roi_totals, cluster19_by_roi, by = "sample_id") |>
+  mutate(cluster19_cells = replace_na(cluster19_cells, 0),
+         pct_of_roi_in_cluster19 = round(100 * cluster19_cells / total_cells_in_roi, 1))
+
+print(roi_summary)
+```
+Need to determine Cluster 19's top markers to really determine what's going on here.
+
+If the top markers are CD56 and those related to neuroendocrine, that would make sense as they align with Patient 17's neuroendocrine histology annotation. If the markers are not related to that, then it could be a technical issue (maybe ROI 2 and 3 have quality issues as well).
+
+---
+
+## 5. Check 3 -- LISI
+
+```{r lisi-compute}
+set.seed(42)
+
+subsample_cells <- meta_common |>
+  group_by(patient_id) |>
+  slice_sample(prop = 0.20) |>
+  pull(cell_id)
+
+cat("Subsampled cells:", length(subsample_cells), "out of", nrow(meta_common),
+   sprintf("(%.1f%%)\n", 100 * length(subsample_cells) / nrow(meta_common)))
+
+pca_before_mat    <- reducedDim(spe_combined, "PCA_uncorrected")[subsample_cells, ]
+harmony_after_mat <- reducedDim(spe_combined, "Harmony")[subsample_cells, ]
+
+lisi_meta <- meta_common[subsample_cells, c("sample_id", "broad_clusters")]
+
+lisi_before <- compute_lisi(pca_before_mat, lisi_meta, c("sample_id", "broad_clusters"))
+lisi_after  <- compute_lisi(harmony_after_mat, lisi_meta, c("sample_id", "broad_clusters"))
+
+lisi_summary <- data.frame(
+  metric   = c("Batch LISI (sample_id) -- want HIGH", "Cluster LISI (broad_clusters) -- want LOW"),
+  before   = c(median(lisi_before$sample_id), median(lisi_before$broad_clusters)),
+  after    = c(median(lisi_after$sample_id),  median(lisi_after$broad_clusters))
+)
+
+knitr::kable(lisi_summary, digits = 2,
+            caption = "Median LISI before (PCA_uncorrected) vs. after (Harmony), 20% stratified subsample")
+```
+
+
+```{r lisi-plot, fig.width=10, fig.height=5}
+lisi_long <- bind_rows(
+  lisi_before |> mutate(stage = "Before Harmony"),
+  lisi_after  |> mutate(stage = "After Harmony")
+) |>
+  pivot_longer(cols = c(sample_id, broad_clusters), names_to = "label_type", values_to = "lisi") |>
+  mutate(
+    label_type = recode(label_type,
+                        sample_id = "Batch LISI (sample_id) -- want HIGH",
+                        broad_clusters = "Cluster LISI (broad_clusters) -- want LOW"),
+    stage = factor(stage, levels = c("Before Harmony", "After Harmony"))
+  )
+
+ggplot(lisi_long, aes(x = stage, y = lisi, fill = stage)) +
+  geom_violin(trim = TRUE) +
+  geom_boxplot(width = 0.15, outlier.size = 0.3, fill = "white") +
+  facet_wrap(~ label_type, scales = "free_y") +
+  theme_bw() +
+  labs(title = "LISI distributions before vs. after Harmony", y = "LISI", x = NULL) +
+  theme(legend.position = "none")
+```
+
+---
+
+## Notes
+
+- **Check 1 (marker pre/post):** equally diffuse before and after =
+  background/spillover, not overcorrection.
+- **Check 2 (enrichment):** enrichment > 2x with n_cells > 50 is the
+  flag to act on. Watch the Patient20 columns specifically this round --
+  that's the one new variable in run5 vs. run4.
+- **Check 3 (LISI):** batch-LISI should improve (higher); cluster-LISI
+  should hold steady or improve (lower/same) -- rising cluster-LISI is
+  the direct signature of overcorrection.

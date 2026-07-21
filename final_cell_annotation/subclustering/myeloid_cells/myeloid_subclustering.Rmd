@@ -1,0 +1,380 @@
+---
+title: "Subclustering: Macrophage/Monocyte (Clusters 8 & 14)"
+author: "Vaidehi Gupta"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 12, fig.height = 8)
+set.seed(42)
+```
+
+## Overview
+
+Subclustering the Macrophage (cluster 8) and Monocyte (cluster 14)
+populations from the broad k=20 annotation. 
+These two looked mixed together at the broad resolution and may
+resolve into cleaner myeloid subtypes at finer resolution.
+
+Myeloid: immune cell lineage that includes monocytes, macrophages, neutrophils/granulocytes, dendritic cells, and mast cells. 
+
+---
+
+## 1. Load Libraries
+
+```{r libraries}
+# Only run this if you start a new RStudio session
+.libPaths(c("/restricted/projectnb/camplab/home/vgupta7/R_libs", .libPaths()))
+
+library(imcRtools)
+library(tidyverse)
+library(dittoSeq)
+library(viridis)
+library(scater)
+library(scran)
+library(bluster)
+library(patchwork)
+library(RColorBrewer)
+library(ComplexHeatmap)
+library(circlize)
+```
+
+---
+
+## 2. Paths
+
+```{r paths}
+analysis_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis"
+
+spe_path <- file.path(analysis_path, "final_cell_annotation", "h5_cluster_annot.rds")
+out_path <- file.path(analysis_path, "final_cell_annotation", "subclustering",
+                      "myeloid_subcluster.rds")
+findmarkers_path <- file.path(analysis_path, "final_cell_annotation", "subclustering",
+                              "myeloid_subcluster_findmarkers.csv")
+```
+
+---
+
+## 3. Load Annotated Data and Subset
+
+```{r load-and-subset}
+spe <- readRDS(spe_path)
+
+myeloid_clusters <- c("8", "14")
+spe_myeloid <- spe[, spe$broad_clusters %in% myeloid_clusters]
+
+cat("Cells in myeloid subset:", ncol(spe_myeloid), "\n")
+cat("From cluster 8 (Macrophage):", sum(spe_myeloid$broad_clusters == "8"), "\n")
+cat("From cluster 14 (Monocyte):", sum(spe_myeloid$broad_clusters == "14"), "\n")
+```
+
+---
+
+## 4. Re-cluster the Subset on the Existing Harmony Embedding
+
+Using a smaller k (10 instead of 20) to encourage finer splits, since
+the goal here is specifically to reveal subtypes that got merged at
+the broader resolution.
+
+```{r subcluster}
+# this just pulls out the already corrected coordinates from the run5 spe object
+# builds a fresh neighbor graph
+harmony_sub <- reducedDim(spe_myeloid, "Harmony")
+cat("Harmony embedding dimensions (subset):", dim(harmony_sub), "\n")
+
+set.seed(220225)
+g_sub     <- buildSNNGraph(t(harmony_sub), k = 10, type = "rank")
+clust_sub <- igraph::cluster_louvain(g_sub)
+spe_myeloid$sub_clusters <- factor(clust_sub$membership)
+
+cat("Number of myeloid subclusters:", nlevels(spe_myeloid$sub_clusters), "\n")
+print(table(spe_myeloid$sub_clusters))
+```
+
+---
+
+## 5. UMAP on the Subset
+
+```{r umap-sub}
+set.seed(220225)
+spe_myeloid <- runUMAP(spe_myeloid, dimred = "Harmony", name = "UMAP_sub")
+```
+
+```{r plot-umap-sub-clusters, fig.width=10, fig.height=7}
+p_sub_clusters <- dittoDimPlot(spe_myeloid, var = "sub_clusters",
+                               reduction.use = "UMAP_sub",
+                               size = 0.4, do.label = TRUE, labels.size = 4) +
+  ggtitle("Myeloid Subset: UMAP colored by Subcluster") +
+  theme(legend.position = "right")
+print(p_sub_clusters)
+```
+
+```{r plot-umap-sub-original, fig.width=10, fig.height=7}
+p_sub_original <- dittoDimPlot(spe_myeloid, var = "broad_celltype",
+                               reduction.use = "UMAP_sub",
+                               size = 0.4) +
+  ggtitle("Myeloid Subset: UMAP colored by Original Broad Label") +
+  theme(legend.position = "right")
+print(p_sub_original)
+```
+When comparing this with the subcluster UMAP, seems like subcluster 7 has mixed composition (both macrophage and myeloid). It also has CD14 as its only top positive marker.
+
+---
+
+## 6. Marker Sets for Myeloid Subtyping
+
+```{r markers}
+myeloid_markers <- c(
+  "CD14", "CD11c", "CD68", "CD86", "CD163", "CD1c", "MKI67",
+  "PDL1", "PD1", "TIM3", "LAMP3", "CD15", "HLADRB", "CD38"
+)
+myeloid_markers <- myeloid_markers[myeloid_markers %in% rownames(spe_myeloid)]
+cat("Markers found:", paste(myeloid_markers, collapse = ", "), "\n")
+```
+
+---
+
+## 7. Violin Plots per Subcluster
+
+```{r make-violinplot}
+make_violinplot <- function(spe, assay_name, cluster_col, marker_set, title, ncol = 3) {
+  expr_mat   <- assay(spe, assay_name)[marker_set, , drop = FALSE]
+  cluster_id <- spe[[cluster_col]]
+
+  mean_expr <- sapply(levels(cluster_id), function(cl) {
+    idx <- which(cluster_id == cl)
+    rowMeans(expr_mat[, idx, drop = FALSE])
+  })
+
+  if (is.matrix(mean_expr) && nrow(mean_expr) > 1) {
+    marker_order <- rownames(mean_expr)[hclust(dist(mean_expr))$order]
+  } else {
+    marker_order <- marker_set
+  }
+
+  plot_df <- as.data.frame(t(expr_mat)) |>
+    mutate(cluster = cluster_id) |>
+    pivot_longer(-cluster, names_to = "marker", values_to = "expr")
+
+  plot_df$marker  <- factor(plot_df$marker, levels = marker_order)
+  plot_df$cluster <- factor(plot_df$cluster, levels = levels(cluster_id))
+
+  ggplot(plot_df, aes(x = cluster, y = expr, fill = cluster)) +
+    geom_violin(scale = "width", trim = TRUE, linewidth = 0.2) +
+    stat_summary(fun = median, geom = "point", size = 0.6, color = "black") +
+    facet_wrap(~ marker, scales = "free_y", ncol = ncol) +
+    labs(title = title, x = "Subcluster", y = "Z-score expression") +
+    theme_bw(base_size = 11) +
+    theme(
+      axis.text.x      = element_text(angle = 0, hjust = 0.5, size = 9),
+      strip.text        = element_text(face = "bold"),
+      panel.grid.major.x = element_blank(),
+      legend.position   = "none"
+    )
+}
+```
+
+```{r violin-myeloid, fig.width=16, fig.height=12}
+p_violin_myeloid <- make_violinplot(spe_myeloid, "scaled_0100", "sub_clusters",
+                                    myeloid_markers,
+                                    "Myeloid Subset: Marker Expression per Subcluster",
+                                    ncol = 3)
+print(p_violin_myeloid)
+```
+
+---
+
+## 8. Statistical Marker Discovery (findMarkers) on Subclusters
+
+```{r findmarkers}
+markers_de <- findMarkers(spe_myeloid,
+                          groups     = spe_myeloid$sub_clusters,
+                          assay.type = "scaled_0100",
+                          subset.row = myeloid_markers)
+
+all_markers <- lapply(levels(spe_myeloid$sub_clusters), function(cl) {
+  df <- as.data.frame(markers_de[[cl]])
+  data.frame(
+    subcluster = cl,
+    marker     = rownames(df),
+    Top        = df$Top,
+    FDR        = df$FDR,
+    logFC      = df$summary.logFC
+  )
+})
+
+all_markers_df <- do.call(rbind, all_markers)
+dir.create(dirname(findmarkers_path), recursive = TRUE, showWarnings = FALSE)
+write.csv(all_markers_df, findmarkers_path, row.names = FALSE)
+
+top1_summary <- do.call(rbind, lapply(levels(spe_myeloid$sub_clusters), function(cl) {
+  sub <- all_markers_df[all_markers_df$subcluster == cl & all_markers_df$logFC > 1.0, ]
+  sub <- sub[order(sub$Top, -sub$logFC), ]
+  if (nrow(sub) == 0) {
+    data.frame(subcluster = cl, top_markers = "none above logFC 1.0")
+  } else {
+    data.frame(subcluster = cl,
+               top_markers = paste(head(sub$marker, 5), collapse = ", "))
+  }
+}))
+
+cat("Top positive markers (logFC > 1.0) per subcluster:\n")
+print(knitr::kable(top1_summary, col.names = c("Subcluster", "Top Positive Markers")))
+```
+
+Subclusters 4, 10, and 11 (none above logFC 1.0): not patient-driven, their ambiguity is most likely a marker-resolution problem (weakly differentiated cells sitting between clean states).
+
+Subcluster 4 is the largest subcluster and maps almost entirely to Monocyte. Could be a less-activated monocyte population.
+---
+
+## 9. Subcluster Composition By Original Broad Cluster
+
+```{r composition-broad-heatmap, fig.width=12, fig.height=6}
+
+comp_broad <- table(subcluster = spe_myeloid$sub_clusters,
+                    original_broad = spe_myeloid$broad_clusters)
+comp_broad_props <- prop.table(comp_broad, margin = 1)
+
+col_fun <- colorRamp2(c(0, 0.5, 1), rev(brewer.pal(3, "RdBu")))
+
+ht <- Heatmap(
+  comp_broad_props,
+  name              = "Proportion",
+  col               = col_fun,
+  cluster_rows      = FALSE,
+  cluster_columns   = FALSE,
+  column_title      = "Broad Cluster",
+  column_title_side = "bottom",
+  row_title         = "Subcluster",
+  column_names_rot  = 45,
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    val <- comp_broad_props[i, j]
+    text_col <- if (val < 0.2 || val > 0.8) "white" else "black"
+    grid.text(sprintf("%.2f", val), x, y, gp = gpar(col = text_col, fontsize = 7))
+  }
+)
+
+draw(ht, column_title = "Subcluster composition by original broad cluster (row-normalized %)")
+```
+Subcluster 7 has 58% macrophage and 42% monocyte. Could be a transitional population.
+
+Subcluster 11 has 87% monocyte and 13% macrophage.
+
+The rest of the subclusters either are entirely in Cluster 8 (Macrophage) or Cluster 14 (Monocyte), which means that the split we see with the broad clusters still holds true.
+
+---
+
+## 10: Subcluster Composition by Patient 
+
+```{r composition-patient-heatmap, fig.width=12, fig.height=6}
+comp_patient <- table(subcluster = spe_myeloid$sub_clusters,
+                      patient = spe_myeloid$patient_id)
+comp_patient_props <- prop.table(comp_patient, margin = 1)
+
+col_fun_patient <- colorRamp2(c(0, 0.5, 1), rev(brewer.pal(3, "RdBu")))
+
+ht_patient <- Heatmap(
+  comp_patient_props,
+  name              = "Proportion",
+  col               = col_fun_patient,
+  cluster_rows      = FALSE,
+  cluster_columns   = FALSE,
+  column_title      = "Patient",
+  column_title_side = "bottom",
+  row_title         = "Subcluster",
+  column_names_rot  = 45,
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    val <- comp_patient_props[i, j]
+    text_col <- if (val < 0.2 || val > 0.8) "white" else "black"
+    grid.text(sprintf("%.2f", val), x, y, gp = gpar(col = text_col, fontsize = 7))
+  }
+)
+
+draw(ht_patient, column_title = "Subcluster composition by patient (row-normalized %)")
+```
+Subclusters 2 (45% Patient 10) and 3 (48% Patient 10) have roughly 4x their expected share.
+---
+
+## 11. Manual Subcluster Annotation
+
+```{r annotate-sub, echo=TRUE}
+myeloid_subannotation <- c(
+  "1"  = "1. Macrophage, Antigen-Presenting (HLADRB+)", # Multi-marker
+  "2"  = "2. Macrophage, Proliferating (MKI67+)",  # Real signature, but 45% Patient 10
+  "3"  = "3. Monocyte (PD1+)",
+  "4"  = "4. Monocyte (Generic)",  # Largest subcluster, flat patient composition, likely an undifferentiated monocyte population
+  "5"  = "5. Macrophage, M2-like (CD163+)", # CD163 is an M2/anti-inflammatory macrophage marker
+  "6"  = "6. Macrophage (CD68+)",
+  "7"  = "7. Monocyte-Macrophage Transitional (CD14+)",  # This subcluster has the 58/42 blend and sits spatially between the two 
+  "8"  = "8. Macrophage, Mixed Signal (PDL1+)", 
+  "9"  = "9. Macrophage, Proliferating (HLADRB+)", # Different from subcluster 2 because it has MKI67
+  "10"  = "10. Monocyte, Unresolved", # Has no marker above 1.0, weak signal
+  "11"  = "11. Monocyte-Macrophage, Unresolved", # Has no marker above 1.0, 87% Monocyte / 13% Macrophage 
+  "12"  = "12. Macrophage (CD11c+)"
+)
+
+if (length(myeloid_subannotation) > 0) {
+  spe_myeloid$sub_celltype <- myeloid_subannotation[as.character(spe_myeloid$sub_clusters)]
+  cat("Subcluster annotation applied.\n")
+  print(table(spe_myeloid$sub_celltype, useNA = "ifany"))
+} else {
+  cat("No subcluster annotation yet. Fill in myeloid_subannotation above.\n")
+}
+```
+
+## 12. UMAP colored by subcluster cell type
+
+```{r umap-sub-celltype, fig.width=10, fig.height=7}
+if ("sub_celltype" %in% colnames(colData(spe_myeloid))) {
+
+  spe_myeloid$sub_celltype <- factor(spe_myeloid$sub_celltype, levels = myeloid_subannotation)
+
+  n_types <- nlevels(spe_myeloid$sub_celltype)
+  subtype_cols <- setNames(
+    colorRampPalette(brewer.pal(12, "Paired"))(n_types),
+    levels(spe_myeloid$sub_celltype)
+  )
+
+  p_sub_celltype <- dittoDimPlot(spe_myeloid, var = "sub_celltype",
+                                 reduction.use = "UMAP_sub",
+                                 size = 0.4, do.label = TRUE, labels.size = 3.5) +
+    scale_color_manual(values = subtype_cols) +
+    ggtitle("Myeloid Subset: UMAP colored by Subcluster Cell Type") +
+    theme(legend.position = "right")
+  print(p_sub_celltype)
+
+} else {
+  cat("Run the annotate-sub chunk first to apply subcluster annotations.\n")
+}
+```
+---
+
+## 13. Save Subclustered/Annotated Object
+
+```{r save}
+dir.create(dirname(out_path), recursive = TRUE, showWarnings = FALSE)
+saveRDS(spe_myeloid, out_path)
+cat("Saved myeloid subcluster object to:", out_path, "\n")
+```
+
+
+## Notes
+
+- 10 of the 12 subclusters are purely either Macrophage or Monocyte. The other two subclusters (7 and 11) have evidence of a blend.
+
+- Subcluster 7 has a 58% macrophage and 42% monocyte blend and a CD14 only signature, sitting spatially between two territories on the UMAP. Looks like a genuine transitional population, or cells caught in the process of differentiating from monocyte into macrophage. This is probably what is mixed together within these two groups.
+
+- Subclusters 2 and 3 (both ~45-48% Patient 10) could be because that patient's tissue is producing a cell state that doesn't look like anyone else's, which makese sense as it is a benign hamartoma patient. 
+

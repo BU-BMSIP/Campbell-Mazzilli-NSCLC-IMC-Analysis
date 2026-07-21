@@ -1,0 +1,174 @@
+---
+title: "Marker Heatmaps"
+author: "Tazein Shah"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+## 1. Load Libraries
+```{r setup}
+library(SpatialExperiment)
+library(SingleCellExperiment)
+library(scuttle)
+library(dittoSeq)
+library(viridis)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+```
+
+## 2. Defining Paths
+```{r paths}
+analysis_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis"
+spe_path <- file.path(analysis_path, "final_cell_annotation", "h5_cluster_annot.rds")
+
+out_path <- file.path(analysis_path, "final_cell_annotation", "marker_heatmaps")
+dir.create(out_path, showWarnings = FALSE, recursive = TRUE)
+```
+
+## 3. Loading in Intensities (Asinh Normal + w/o)
+```{r load}
+spe <- readRDS(spe_path)
+cluster_col <- "broad_clusters"
+
+# add exprs assay (asinh-normalized) alongside existing counts assay
+assay(spe, "exprs") <- asinh(assay(spe, "counts") / 1)
+
+# all 41 channels are rownames, but 3 are technical (not real markers) - exclude them
+technical_channels <- c("DNA191", "DNA193", "Membrane")
+use_channels <- setdiff(rownames(spe), technical_channels)
+
+# assay types to run: raw counts and asinh-normalized
+assay_types <- c(counts = "Intensities", exprs = "Asinh Intensities")
+```
+
+## 4. Mean Expression Heatmaps
+```{r mean-heatmap}
+for (a in names(assay_types)) {
+  cluster_mean <- aggregateAcrossCells(as(spe, "SingleCellExperiment"),
+                                        ids = colData(spe)[[cluster_col]],
+                                        statistics = "mean",
+                                        use.assay.type = a,
+                                        subset_row = use_channels)
+
+  mat <- assay(cluster_mean, a)
+  cluster_ids <- colData(cluster_mean)[[cluster_col]]
+  ncells_vec <- colData(cluster_mean)$ncells
+
+  cluster_colors <- setNames(dittoColors()[seq_along(sort(unique(cluster_ids)))],
+                              sort(unique(cluster_ids)))
+
+  col_anno <- HeatmapAnnotation(
+    ncells = ncells_vec,
+    broad_clusters = factor(cluster_ids),
+    col = list(
+      ncells = colorRamp2(range(ncells_vec), c("white", "#c9184a")),
+      broad_clusters = cluster_colors
+    ),
+    annotation_name_side = "left"
+  )
+
+  ht <- Heatmap(mat,
+                name = paste0("Mean ", assay_types[[a]]),
+                col = colorRamp2(seq(min(mat), max(mat), length.out = 100), viridis(100)),
+                top_annotation = col_anno,
+                column_title = paste0("Mean Marker Expression per Cluster\n", assay_types[[a]]),
+                cluster_rows = TRUE,
+                cluster_columns = TRUE,
+                show_column_names = FALSE,
+                row_names_gp = gpar(fontsize = 8))
+
+  png(file.path(out_path, paste0("h5_cluster_mean_heatmap_", a, ".png")),
+      width = 3800, height = 2800, res = 300)
+  draw(ht, merge_legend = TRUE)
+  dev.off()
+}
+```
+
+## 5. SD Heatmaps
+```{r sd-heatmap}
+sd_df_list <- list()
+
+for (a in names(assay_types)) {
+  mat <- assay(spe, a)[use_channels, ]
+  cluster_ids <- colData(spe)[[cluster_col]]
+
+  sd_df <- as.data.frame(t(mat)) %>%
+    mutate(cluster = cluster_ids) %>%
+    pivot_longer(-cluster, names_to = "marker", values_to = "value") %>%
+    group_by(cluster, marker) %>%
+    summarise(sd = sd(value), .groups = "drop") %>%
+    pivot_wider(names_from = cluster, values_from = sd)
+
+  sd_df_list[[a]] <- sd_df
+
+  sd_mat <- as.matrix(sd_df[, -1])
+  rownames(sd_mat) <- sd_df$marker
+
+  # z-score each marker (row) across clusters, so color reflects
+  # relative SD per marker rather than each marker's absolute scale
+  sd_mat_z <- t(scale(t(sd_mat)))
+
+  ht <- Heatmap(sd_mat_z,
+                name = paste0("Z-scored SD\n(", assay_types[[a]], ")"),
+                col = colorRamp2(c(-2, 0, 2), c("#440154", "white", "#fde725")),
+                column_title = paste0("Relative SD of Marker Expression per Cluster\n", assay_types[[a]]),
+                cluster_rows = TRUE,
+                cluster_columns = TRUE,
+                row_names_gp = gpar(fontsize = 8))
+
+  png(file.path(out_path, paste0("h5_cluster_sd_heatmap_", a, ".png")),
+      width = 3800, height = 2900, res = 300)
+  draw(ht)
+  grid.text(paste0(cluster_col, " (cluster ID)"),
+            x = unit(0.5, "npc"), y = unit(0.015, "npc"),
+            gp = gpar(fontsize = 11, fontface = "bold"))
+  dev.off()
+}
+```
+
+## 6. Flagging High-SD Marker/Cluster Combinations (Asinh Only)
+```{r sd-flagging}
+sd_long <- sd_df_list[["exprs"]] %>%
+  pivot_longer(-marker, names_to = "cluster", values_to = "sd")
+
+sd_flags <- sd_long %>%
+  group_by(marker) %>%
+  mutate(marker_mean_sd = mean(sd), marker_sd_of_sd = sd(sd)) %>%
+  ungroup() %>%
+  filter(sd > marker_mean_sd + marker_sd_of_sd) %>%
+  arrange(cluster, desc(sd))
+
+write.csv(sd_flags, file.path(out_path, "h5_high_sd_flags_exprs.csv"), row.names = FALSE)
+```
+
+## 7. SD Distribution per Cluster (Asinh Only, Single Image)
+```{r sd-boxplot}
+sd_long <- sd_df_list[["exprs"]] %>%
+  pivot_longer(-marker, names_to = "cluster", values_to = "sd") %>%
+  mutate(cluster = factor(cluster, levels = as.character(sort(as.numeric(unique(cluster))))))
+
+p <- ggplot(sd_long, aes(x = cluster, y = sd)) +
+  geom_boxplot(outlier.shape = NA, fill = "grey85") +
+  geom_jitter(width = 0.15, size = 1, alpha = 0.6, color = "grey30") +
+  labs(title = "Distribution of Marker SD within Each Cluster",
+       subtitle = "Asinh Intensities - each point is one marker's SD in that cluster",
+       x = "Cluster (broad_clusters)", y = "SD of Asinh Intensity") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+png(file.path(out_path, "h5_cluster_sd_distribution_exprs.png"),
+    width = 3200, height = 2000, res = 300)
+print(p)
+dev.off()
+```
