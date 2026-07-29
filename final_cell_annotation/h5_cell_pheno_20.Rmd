@@ -37,7 +37,7 @@ manual annotation.
 ## 1. Load Libraries
 
 ```{r libraries}
-.libPaths(c("/restricted/projectnb/camplab/home/vgupta7/R_libs", .libPaths()))
+#.libPaths(c("/restricted/projectnb/camplab/home/vgupta7/R_libs", .libPaths()))
 
 library(imcRtools)
 library(tidyverse)
@@ -558,6 +558,40 @@ colData(spe) |>
   mutate(pct_of_roi = round(100 * cluster17_cells / total_cells_in_roi, 1))
 ```
 
+Cluster 17 cells are uniform across all four Patient 12 ROIs, regardless of histology.
+
+```{r cluster17-full-marker-check}
+df <- read.csv(findmarkers_path)
+
+df |>
+  dplyr::filter(cluster == "17", logFC > 1.0) |>
+  dplyr::arrange(desc(logFC)) |>
+  dplyr::select(marker, Top, FDR, logFC)
+
+nrow(df)
+unique(df$cluster)
+df |> dplyr::filter(cluster == "17") |> nrow()
+
+spe$total_counts <- colSums(assay(spe, "counts"))
+
+colData(spe) |>
+  as.data.frame() |>
+  mutate(group = ifelse(broad_clusters == "17", "Cluster 17", "Rest of dataset")) |>
+  group_by(group) |>
+  summarise(
+    n = n(),
+    mean_area = mean(area, na.rm = TRUE),
+    mean_total_counts = mean(total_counts, na.rm = TRUE),
+    median_total_counts = median(total_counts, na.rm = TRUE)
+  )
+```
+Cluster 17 has no markers clearing threshold even without the top 5 restriction. 
+Zero of those 27 markers clear logFC > 1.0
+
+When looking closer at the total counts for cluster 17 in relation to the rest of the dataset, the total counts are dramatically lower (same for mean and median). These cells are likely poorly stained (these cells simply didn't pick up enough antibody signal to be reliably characterized). Cluster 17's mean area is also higher than the rest of the dataset, which is consistent with the long tail of outlier cells seen earlier in the boxplots.
+
+Two technical issues: larger, potentially merged segmentation objects and substantially lower total signal.
+
 ---
 
 ## 16. Manual Broad Annotation
@@ -581,7 +615,7 @@ broad_annotation <- c(
   "12"  = "12. Epithelial (EpCAM+)", # Weak EpCAM, low confidence
   "13"  = "13. PMN-MDSC",  # Polymorphonuclear myeloid-derived suppressor. Has a strong CD15 spike but there's moderate FoxP3 elevation, and these cells are known to recruit Tregs
   "14"  = "14. Monocyte (CD14+)", # Weak CD14 alone without any of cluster 8's other myeloid markers, low confidence
-  "15"  = "15. T Cell/Plasma Cell (CD4+/CD138+)",  # CD4 dominant, but positive for CD138 which is a plasma cell marker. Definitely needs to be subclustered
+  "15" = "15. CD4+ T Cell/Treg, Heterogeneous",  # CD138 initially suggested plasma cells, but subclustering showed it's an intensity artifact, not real expression. Resolves into CD4/Treg subtypes + some low-quality subclusters
   "16"  = "16. Plasma Cell (CD19+)", # CD19 dominant, CD138, CD15
   "17"  = "17. Unknown/Low Quality",  # No markers with logFC > 1.0 in top 5
   "18"  = "18. Proliferating Cells",   # MKI67 single marker dominant, strong logFC value
@@ -602,6 +636,23 @@ if (length(broad_annotation) > 0) {
 ```
 
 ---
+## Broad cluster summary table
+
+```{r broad-cluster-summary-table}
+cluster_counts <- table(spe$broad_clusters)
+
+cluster_summary <- data.frame(
+  Cluster = names(cluster_counts),
+  Label   = broad_annotation[names(cluster_counts)],
+  N_Cells = as.integer(cluster_counts)
+)
+
+# order numerically rather than alphabetically (1, 2, 3... not 1, 10, 11...)
+cluster_summary <- cluster_summary[order(as.integer(cluster_summary$Cluster)), ]
+
+knitr::kable(cluster_summary, row.names = FALSE,
+            caption = "Broad cluster cell counts and annotations")
+```
 
 ## 17. UMAP Colored by Broad Cell Type
 
@@ -618,10 +669,11 @@ if ("broad_celltype" %in% colnames(colData(spe))) {
   )
 
   # manually override colors that are too visually similar to their neighbors
+  celltype_cols["5. Treg"] <- "#6A329F"
   celltype_cols["7. Memory T Cell"] <- "#E7298A"
   celltype_cols["11. Mast Cell"] <- "#191970"
   celltype_cols["13. PMN-MDSC"] <- "#FFB7CE"
-  celltype_cols["16. Plasma Cell (CD19+)"] <- "#66101F"                      # dark maroon
+  celltype_cols["16. Plasma Cell (CD19+)"] <- "#66101F"
   celltype_cols["18. Proliferating Cells"] <- "#FFD700" 
 
   p_celltype <- dittoDimPlot(spe_sub, var = "broad_celltype",
@@ -672,3 +724,6 @@ if ("broad_celltype" %in% colnames(colData(spe))) {
   cluster numbers; if you need to preserve a finalized annotation
   across reruns, don't rerun clustering after annotating without
   saving the annotated object first.
+- Need to ask Campbell if the 41K cells that are labeled as "Unknown"
+  should be excluded before spatial analysis to prevent distortion of 
+  the niche composition and diluting the real spatial signal.

@@ -137,7 +137,7 @@ When comparing this with the subcluster UMAP, seems like subcluster 7 has mixed 
 
 ```{r markers}
 myeloid_markers <- c(
-  "CD14", "CD11c", "CD68", "CD86", "CD163", "CD1c", "MKI67",
+  "CD14", "CD11c", "CD141", "CD68", "CD86", "CD163", "CD1c", "MKI67",
   "PDL1", "PD1", "TIM3", "LAMP3", "CD15", "HLADRB", "CD38"
 )
 myeloid_markers <- myeloid_markers[myeloid_markers %in% rownames(spe_myeloid)]
@@ -194,6 +194,30 @@ p_violin_myeloid <- make_violinplot(spe_myeloid, "scaled_0100", "sub_clusters",
 print(p_violin_myeloid)
 ```
 
+## Check: Is Subcluster 12 cDC1 (CD141+) or a Different DC Subtype?
+
+```{r cd141-check}
+if ("CD141" %in% rownames(spe_myeloid)) {
+
+  cd141_by_subcluster <- data.frame(
+    sub_clusters = spe_myeloid$sub_clusters,
+    CD141 = assay(spe_myeloid, "scaled_0100")["CD141", ]
+  ) |>
+    group_by(sub_clusters) |>
+    summarise(
+      n = n(),
+      median_CD141 = median(CD141),
+      mean_CD141 = mean(CD141)
+    ) |>
+    arrange(desc(median_CD141))
+
+  print(cd141_by_subcluster)
+
+} else {
+  cat("CD141 not in myeloid marker panel/rownames -- check the full panel with:\n")
+  cat("grep('CD141', rownames(spe_myeloid), value = TRUE)\n")
+}
+```
 ---
 
 ## 8. Statistical Marker Discovery (findMarkers) on Subclusters
@@ -313,16 +337,16 @@ Subclusters 2 (45% Patient 10) and 3 (48% Patient 10) have roughly 4x their expe
 myeloid_subannotation <- c(
   "1"  = "1. Macrophage, Antigen-Presenting (HLADRB+)", # Multi-marker
   "2"  = "2. Macrophage, Proliferating (MKI67+)",  # Real signature, but 45% Patient 10
-  "3"  = "3. Monocyte (PD1+)",
-  "4"  = "4. Monocyte (Generic)",  # Largest subcluster, flat patient composition, likely an undifferentiated monocyte population
+  "3"  = "3. Monocyte (PD1+)", #Single marker only, 48% Patient 10, isolated UMAP spike. Intensity effect concern
+  "4"  = "4. Monocyte (Generic)",  # Largest subcluster, no marker above 1.0, flat patient composition, likely an undifferentiated monocyte population
   "5"  = "5. Macrophage, M2-like (CD163+)", # CD163 is an M2/anti-inflammatory macrophage marker
-  "6"  = "6. Macrophage (CD68+)",
-  "7"  = "7. Monocyte-Macrophage Transitional (CD14+)",  # This subcluster has the 58/42 blend and sits spatially between the two 
-  "8"  = "8. Macrophage, Mixed Signal (PDL1+)", 
-  "9"  = "9. Macrophage, Proliferating (HLADRB+)", # Different from subcluster 2 because it has MKI67
-  "10"  = "10. Monocyte, Unresolved", # Has no marker above 1.0, weak signal
+  "6"  = "6. Macrophage (CD68+)", # Clean macrophage signature
+  "7"  = "7. Monocyte-Macrophage Transitional (CD14+)",  # This subcluster has the 58/42 blend and sits spatially between the two on the UMAP
+  "8"  = "8. Macrophage, Mixed Signal (PDL1+)", # spans macrophage/DC/granulocyte markers at once, uncertain about this 
+  "9"  = "9. Macrophage, Proliferating (HLADRB+)", # HLADRB and MKI67 only, distinct marker profile from subcluster 2 (which includes CD68/PDL1/CD14), could be a k-driven split? 
+  "10"  = "10. Monocyte, Unresolved", # Has no marker above 1.0, smallest subcluster, weak signal
   "11"  = "11. Monocyte-Macrophage, Unresolved", # Has no marker above 1.0, 87% Monocyte / 13% Macrophage 
-  "12"  = "12. Macrophage (CD11c+)"
+  "12"  = "12. Dendritic Cell (CD11c+)" #Elevated in CD11c, low CD1c and CD141, kept as general DC label
 )
 
 if (length(myeloid_subannotation) > 0) {

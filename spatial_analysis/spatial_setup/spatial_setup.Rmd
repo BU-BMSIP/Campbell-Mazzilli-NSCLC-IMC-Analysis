@@ -1,0 +1,148 @@
+---
+title: "Spatial Setup: Final Cell Type Annotation Merge"
+author: "Vaidehi Gupta"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+This notebook performs the final annotation merge (myeloid + cluster15 +
+B cell/plasma subclustering results), strips the tracking-number prefixes
+from cell type labels, excludes confirmed low-quality clusters, and saves
+the finalized `spe_final_celltype.rds` object.
+
+This does NOT re-derive the cluster 15 / subclustering QC checks themselves
+(those were already done and are documented separately) — this notebook
+assumes the subcluster label objects already exist and just combines them.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+```
+
+```{r libraries}
+.libPaths(c("/restricted/projectnb/camplab/home/vgupta7/R_libs", .libPaths()))
+
+library(tidyverse)
+library(SingleCellExperiment)
+library(SpatialExperiment)
+library(scater)
+
+# Adjust to your actual project paths
+analysis_path <- "/restricted/projectnb/camplab/home/vgupta7/analysis"
+```
+
+# Load intermediate subclustering objects
+
+`r # FILL IN: load whatever intermediate objects hold your finalized subcluster`
+`r # labels for myeloid, cluster 15, and B cell/plasma -- adjust object/file`
+`r # names below to match what you actually saved during subclustering.`
+
+```{r load-intermediates}
+spe <- readRDS(file.path(analysis_path, "spe_broad_clusters.rds"))
+
+myeloid_labels    <- readRDS(file.path(analysis_path, "myeloid_subcluster_labels.rds"))
+cluster15_labels  <- readRDS(file.path(analysis_path, "cluster15_subcluster_labels.rds"))
+bcell_labels      <- readRDS(file.path(analysis_path, "bcell_subcluster_labels.rds"))
+```
+
+# Final merge
+
+Order matters: myeloid → cluster15 → bcell (filtered to exclude
+cluster-15-origin cells), so cluster 15 cells consistently use the
+cluster-15-derived T cell labels rather than being overwritten by the
+partner's independently-run B cell/plasma subclustering.
+
+```{r final-merge}
+spe$final_celltype <- as.character(spe$broad_celltype)
+
+# Myeloid subcluster labels
+spe$final_celltype[match(names(myeloid_labels), colnames(spe))] <- myeloid_labels
+
+# Cluster 15 subcluster labels
+spe$final_celltype[match(names(cluster15_labels), colnames(spe))] <- cluster15_labels
+
+# B cell/plasma subcluster labels, EXCLUDING cluster-15-origin cells
+# (avoids overwriting the cluster-15 resolution with the disproved
+# plasma-cell labeling from the independent B cell subclustering)
+bcell_labels_filtered <- bcell_labels[!(names(bcell_labels) %in% names(cluster15_labels))]
+spe$final_celltype[match(names(bcell_labels_filtered), colnames(spe))] <- bcell_labels_filtered
+
+spe$final_celltype <- factor(spe$final_celltype)
+
+cat("Cell types after merge:", nlevels(spe$final_celltype), "\n")
+cat("NAs:", sum(is.na(spe$final_celltype)), "\n")
+```
+
+# Strip tracking-number prefixes from labels
+
+The leading numbers (e.g. `"10. Memory T/Plasma Cell (CD45RO+)"`) were only
+ever meant as an internal bookkeeping aid during annotation, but they
+interfere with downstream niche annotation, so they're removed here at the
+source before saving the final object.
+
+```{r strip-label-numbers}
+spe$final_celltype <- factor(gsub("^\\d+\\.\\s*", "", as.character(spe$final_celltype)))
+
+# Sanity check: confirm no unintended matches, and no numbers remain
+levels(spe$final_celltype)
+```
+
+# Exclude confirmed low-quality clusters
+
+Cluster 17 (broad-level, confirmed low quality) and cluster 15 subclusters
+2/4 (same signature as cluster 17 — no markers clear threshold, lower total
+counts not explained by cell area) are excluded here. Note: the ~22-cell
+tiny leftover categories from the cluster-15/B-cell merge conflict are
+intentionally NOT excluded here — they stay in this base annotated object,
+and are excluded downstream on an as-needed basis (e.g. before sccomp or
+the spatial graph), so this file remains a complete record of every
+annotated cell.
+
+```{r exclude-low-quality}
+n_before <- ncol(spe)
+
+spe <- spe[, spe$broad_clusters != "17"]
+
+low_quality_labels <- c("Unresolved/Low Quality")
+spe <- spe[, !(spe$final_celltype %in% low_quality_labels)]
+
+n_after <- ncol(spe)
+
+cat("Cells before exclusion:", n_before, "\n")
+cat("Cells after excluding low-quality clusters:", n_after, "\n")
+cat("Cells removed:", n_before - n_after,
+    sprintf("(%.1f%% of dataset)\n", 100 * (n_before - n_after) / n_before))
+
+spe$final_celltype <- droplevels(spe$final_celltype)
+```
+
+# Final cell type counts
+
+```{r final-celltype-table}
+spe$final_celltype |>
+  table(useNA = "ifany") |>
+  as.data.frame() |>
+  setNames(c("CellType", "Count")) |>
+  arrange(desc(Count)) |>
+  knitr::kable(caption = "Final cell type counts after merge and QC exclusion")
+```
+
+# Save finalized object
+
+```{r save-final}
+saveRDS(spe, file.path(analysis_path, "spe_final_celltype.rds"))
+```
+
+# Handoff notes
+
+- `spe_final_celltype.rds` now has unnumbered cell type labels — any
+  downstream code (sccomp exclusion lists, spatial graph exclusion lists,
+  niche annotation) that references the old numbered label strings
+  (e.g. `"10. Memory T/Plasma Cell (CD45RO+)"`) needs to be updated to the
+  new unnumbered versions before re-running.
+- This file still contains the small (~1-2 cell) leftover categories from
+  the cluster-15/B-cell merge conflict — exclude these explicitly in each
+  downstream analysis as needed, rather than assuming they're already gone.

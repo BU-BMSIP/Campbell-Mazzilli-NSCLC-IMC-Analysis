@@ -1,0 +1,661 @@
+---
+title: "Spatial Analysis: Final Annotation Merge, Spatial Graph, Cell Type Association"
+author: "Vaidehi Gupta"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 12, fig.height = 8)
+set.seed(42)
+```
+
+## Overview
+
+Three things happen in this notebook, in order:
+
+1. Merge broad annotations + all subclustering results (Myeloid,
+   Cluster 15, B Cell) into one `final_celltype` column --
+   excluding Cluster 17 (Unknown/Low Quality) because of segmentation/staining 
+   issue concentrated in Patient12, confirmed via no distinguishing markers, 
+   CD56 negative, ~42% lower total counts, uniform across all four of 
+   Patient12's histologically distinct ROIs).
+2. Build the spatial neighbor graph on the full, cleaned dataset
+   (`buildSpatialGraph`, threshold = 20, which matches the manuscript text
+   and supplementary figure.
+3. Run `sccomp` cell type composition association against disease
+   state (Benign/Lower/Higher). This doesn't depend on the spatial
+   graph, but is included here since it only needs `final_celltype`,
+   which this notebook already produces.
+
+Niche generation (`aggregateNeighbors` + `kmeans`) and niche
+association are handled in a separate, follow-on notebook once the
+spatial graph here has been reviewed.
+
+---
+
+## 1. Load Libraries
+
+```{r libraries}
+.libPaths(c("/restricted/projectnb/camplab/home/vgupta7/R_libs", .libPaths()))
+
+library(imcRtools)
+library(tidyverse)
+library(SingleCellExperiment)
+library(SpatialExperiment)
+library(scater)
+
+#install.packages("cmdstanr", repos = c("https://stan-dev.r-universe.dev/", getOption("repos")))
+library(cmdstanr)
+packageVersion("cmdstanr")
+
+if (!requireNamespace("sccomp", quietly = TRUE)) {
+  cat("sccomp not installed -- install with:\n")
+  cat('devtools::install_github("stemangiola/sccomp")\n')
+} else {
+  library(sccomp)
+  cat("sccomp loaded successfully.\n")
+}
+```
+
+---
+
+## 2. Paths
+
+```{r paths}
+analysis_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis"
+
+broad_path      <- file.path(analysis_path, "final_cell_annotation", "h5_cluster_annot.rds")
+
+myeloid_path    <- file.path(analysis_path, "final_cell_annotation", "subclustering", "myeloid_cells", "myeloid_subcluster.rds")
+cluster15_path  <- file.path(analysis_path, "final_cell_annotation", "subclustering", "cluster15", "cluster15_subcluster.rds")
+bcell_path <- file.path(analysis_path, "final_cell_annotation", "subclustering", "bcells", "bcell_subclustering_clean.rds")
+
+merged_out_path <- file.path(analysis_path, "final_cell_annotation", "spe_final_celltype.rds")
+
+spatial_graph_out_path <- file.path(analysis_path, "spatial_analysis", "spe_spatial_graph.rds")
+sccomp_celltype_out_path <- file.path(analysis_path, "spatial_analysis", "sccomp_celltype_association.rds")
+```
+
+---
+
+## 3. Load and Merge All Annotations
+
+```{r load-all}
+spe <- readRDS(broad_path)
+
+spe_myeloid    <- readRDS(myeloid_path)
+spe_15         <- readRDS(cluster15_path)
+spe_bcell      <- readRDS(bcell_path)
+
+cat("Broad object:", ncol(spe), "cells\n")
+cat("Myeloid subcluster object:", ncol(spe_myeloid), "cells\n")
+cat("Cluster 15 subcluster object:", ncol(spe_15), "cells\n")
+cat("B Cell subcluster object:", ncol(spe_bcell), "cells\n")
+
+```
+Issue: I labeled Cluster 15 as T cell/Treg, Heterogeneous, but Tazein incorporated Cluster 15 in her B cell/Plasma labeling. This would make the final annotation merge messy and unclear. 
+
+### How many of Cluster 15's cells were kept in Tazein's clean B cell object?
+
+```{r check}
+cluster15_cells <- colnames(spe)[spe$broad_clusters == "15"]
+in_her_clean_file <- cluster15_cells %in% colnames(spe_bcell)
+
+cat("Cluster 15 cells kept in her clean B cell object:", sum(in_her_clean_file),
+   "out of", length(cluster15_cells), "\n")
+
+# Cross-check: do the cells she removed line up with what you called Treg/Unresolved?
+your_labels_for_removed <- spe_15$sub_celltype[colnames(spe_15) %in% cluster15_cells[!in_her_clean_file]]
+print(table(your_labels_for_removed))
+```
+### Cluster 15 labeling (from Tazein's B cell subclustering)
+
+```{r check2}
+cluster15_kept_cells <- cluster15_cells[in_her_clean_file]
+
+her_labels_for_kept <- spe_bcell$sub_celltype_clean[match(cluster15_kept_cells, colnames(spe_bcell))]
+print(table(her_labels_for_kept))
+```
+### Looking for CD38 and CD19 signal in "Plasma Cell" clusters that are CD138+
+
+```{r check3}
+plasma_labeled_idx <- her_labels_for_kept %in%
+  c("Plasma Cell, Exhausted/Effector (CD138+CD45RO+TIM3+PD1+)",
+    "Plasma Cell, Memory-like (CD138+CD45RO+)")
+
+plasma_labeled_cells <- cluster15_kept_cells[plasma_labeled_idx]
+
+check_df <- data.frame(
+  CD38 = assay(spe_bcell, "scaled_0100")["CD38", plasma_labeled_cells],
+  CD19 = assay(spe_bcell, "scaled_0100")["CD19", plasma_labeled_cells]
+)
+summary(check_df)
+```
+CD38 is flat, with a mean of 0.001 and median -0.14, so there's no signal for CD38 in these 18,405 cells. CD19 is slightly more positive with a mean of 0.33, but as I've established in my Cluster 15 subclustering, CD19 was found to be diffusely elevated across huge areas of the dataset independent of real B cell identity (it's background/spillover).
+
+### Checking the other 851 cells 
+
+```{r check4}
+real_bcell_idx <- her_labels_for_kept %in%
+  c("Plasmablast/Activated B Cell (CD38+)",
+    "Plasmablast, Strongly Activated (CD38++)",
+    "Transitional B Cell/Plasmablast (CD19+CD138+)",
+    "B Cell, Weak (CD19+)",
+    "B Cell (CD19+)")
+
+real_bcell_cells <- cluster15_kept_cells[real_bcell_idx]
+
+cat("Cells checked:", length(real_bcell_cells), "\n")
+
+check_df_real <- data.frame(
+  CD38 = assay(spe_bcell, "scaled_0100")["CD38", real_bcell_cells],
+  CD19 = assay(spe_bcell, "scaled_0100")["CD19", real_bcell_cells]
+)
+summary(check_df_real)
+```
+CD19's median jumped from 0.18 to 0.94, and mean from 0.33 to 0.97. CD38 also improved (mean 0.50 vs. 0.001 before), but its median is still slightly negative, meaning more than half these cells still aren't clearly CD38-elevated.
+
+This means that these cells are most likely a mixed group, not a uniformly real B cell population. Some cells are probably genuine, weakly B lineage cells, while others are likely riding the same intensity/spillover pattern that inflated the larger group.
+
+### From B cell subclustering, exclude cells that originated from cluster 15 
+
+This way, Cluster 15's cells get the labels generated from my Cluster 15 subclustering, not from Tazein's B cell subclustering. 
+
+```{r filter-bcell-exclude-cluster15origin}
+
+# Exclude cells that originated from broad cluster 15, keeping only
+# cells from her intended scope (broad clusters 3, 10, 16), since her
+# cluster-15-origin B/Plasma calls don't hold up against CD38/CD19
+# (see validation check above: ~96% show flat CD38, weak/unreliable CD19)
+
+spe_bcell_filtered <- spe_bcell[, !(colnames(spe_bcell) %in% cluster15_cells)]
+
+cat("B cell object before filtering:", ncol(spe_bcell), "cells\n")
+cat("B cell object after excluding cluster-15-origin cells:", ncol(spe_bcell_filtered), "cells\n")
+```
+
+
+```{r overwrite-function}
+overwrite_with_subcluster <- function(spe_full, spe_sub, label_col = "sub_celltype") {
+  if (is.null(spe_sub)) return(spe_full)
+  if (!(label_col %in% colnames(colData(spe_sub)))) {
+    cat("Warning:", label_col, "not found in subcluster object -- skipping merge for this group.\n")
+    return(spe_full)
+  }
+  matched_cells <- intersect(colnames(spe_full), colnames(spe_sub))
+  spe_full$final_celltype[match(matched_cells, colnames(spe_full))] <-
+    as.character(colData(spe_sub)[[label_col]][match(matched_cells, colnames(spe_sub))])
+  spe_full
+}
+```
+
+```{r merge-final-celltype}
+spe$final_celltype <- as.character(spe$broad_celltype)
+
+spe <- overwrite_with_subcluster(spe, spe_myeloid)
+spe <- overwrite_with_subcluster(spe, spe_15)
+spe <- overwrite_with_subcluster(spe, spe_bcell_filtered, label_col = "sub_celltype_clean")
+
+spe$final_celltype <- factor(spe$final_celltype)
+
+cat("Final cell type counts (before Cluster 17 exclusion):\n")
+print(table(spe$final_celltype, useNA = "ifany"))
+```
+
+```{r merge-sanity-check}
+cat("Total cells:", ncol(spe), "\n")
+cat("Cells with NA final_celltype:", sum(is.na(spe$final_celltype)), "\n")
+
+if (sum(is.na(spe$final_celltype)) > 0) {
+  cat("\nWarning: some cells have no label. Check for filtering\n")
+  cat("differences between subcluster objects and the broad object\n")
+  cat("before proceeding.\n")
+}
+```
+
+---
+
+```{r subcluster7-quality-check}
+spe_15$total_counts <- colSums(assay(spe_15, "counts"))
+
+quality_check_7 <- colData(spe_15) |>
+  as.data.frame() |>
+  mutate(group = ifelse(sub_clusters == "7", "Subcluster 7", "Rest of Cluster 15")) |>
+  group_by(group) |>
+  summarise(
+    n = n(),
+    mean_area = mean(area, na.rm = TRUE),
+    median_area = median(area, na.rm = TRUE),
+    mean_total_counts = mean(total_counts, na.rm = TRUE),
+    median_total_counts = median(total_counts, na.rm = TRUE)
+  )
+
+print(quality_check_7)
+```
+Total counts are only modestly lower (in comparison to the ~38% drop that was found for subclusters 2 and 4). 
+
+Subcluster 7: 410 cells, no marker clearing threshold, and ~69% concentrated in both Patient 20 acquistion sets. So it's not quite a technical issue or a real, distinct cell type either. I'll just keep it Unresolved for now.
+
+## 4. Exclude Unknown/Low Quality Clusters
+
+```{r exclude-low-quality}
+n_before <- ncol(spe)
+
+# Cluster 17: broad-level, confirmed low quality
+spe <- spe[, spe$broad_clusters != "17"]
+
+# Cluster 15 subclusters 2 and 4: same signature as cluster 17 (no
+# markers clear threshold, lower total counts, not explained by area)
+low_quality_labels <- c("Unresolved/Low Quality")
+spe <- spe[, !(spe$final_celltype %in% low_quality_labels)]
+
+n_after <- ncol(spe)
+cat("Cells before exclusion:", n_before, "\n")
+cat("Cells after excluding low-quality clusters:", n_after, "\n")
+cat("Cells removed:", n_before - n_after, sprintf("(%.1f%% of dataset)\n", 100 * (n_before - n_after) / n_before))
+
+spe$final_celltype <- droplevels(spe$final_celltype)
+
+print(table(spe$final_celltype, useNA = "ifany"))
+```
+
+
+```{r save-merged}
+dir.create(dirname(merged_out_path), recursive = TRUE, showWarnings = FALSE)
+saveRDS(spe, merged_out_path)
+cat("Saved merged, cleaned object to:", merged_out_path, "\n")
+```
+
+---
+
+## 5. Build Spatial Neighbor Graph (Full Dataset)
+
+Using threshold = 20, matching the manuscript text and supplementary
+figure legend (both describe a 20-unit radius; pixels and microns are
+equivalent here since IMC's standard resolution is 1 pixel = 1 um).
+The actual preprint code used threshold = 50 -- flagged for Yusuke to
+confirm which is correct; this can be re-run with a different
+threshold later without needing to redo anything upstream.
+
+```{r load-final-celltype}
+spe <- readRDS(merged_out_path)
+
+cat("Cells:", ncol(spe), "\n")
+cat("Cell types:", nlevels(spe$final_celltype), "\n")
+#print(table(spe$final_celltype))
+```
+
+```{r build-spatial-graph}
+t0 <- Sys.time()
+
+spe <- buildSpatialGraph(spe, img_id = "sample_id",
+                        type = "expansion", threshold = 20,
+                        name = "expansion_interaction_graph")
+
+t1 <- Sys.time()
+cat("Spatial graph built on full dataset in",
+   round(as.numeric(t1 - t0, units = "mins"), 2), "minutes\n")
+```
+```{r spatial-graph-summary}
+graph_obj <- colPair(spe, "expansion_interaction_graph")
+
+cat("Total edges in graph:", length(graph_obj), "\n")
+cat("Mean neighbors per cell:",
+   round(length(graph_obj) / ncol(spe), 2), "\n")
+```
+
+```{r}
+graph_obj <- colPair(spe, "expansion_interaction_graph")
+from_idx <- from(graph_obj)
+to_idx <- to(graph_obj)
+
+# should be 0, confirms neighbors are only ever within the same ROI
+sum(spe$sample_id[from_idx] != spe$sample_id[to_idx])
+```
+This confirms that the graph is respecting ROI boundaries (i.e. the cells aren't being connected to "neighbors" in a completely different ROI)
+
+```{r save-spatial-graph}
+dir.create(dirname(spatial_graph_out_path), recursive = TRUE, showWarnings = FALSE)
+saveRDS(spe, spatial_graph_out_path)
+cat("Saved object with spatial graph to:", spatial_graph_out_path, "\n")
+```
+
+---
+
+## 6. Cell Type Composition Association (sccomp)
+
+Tests whether `final_celltype` proportions are associated with disease
+state (Benign / Lower / Higher). Doesn't depend on the spatial graph
+above -- included here since `final_celltype` is already built in this
+notebook. `Patient` included as a random effect since each patient
+contributes multiple ROIs, following the same modeling structure the
+preprint used for their LN association analysis.
+
+```{r exclude-leftover-cells}
+
+# Exclude the ~19 leftover broad-label cells + tiny subcluster-label cells 
+# rather than letting them sit as their own near-empty
+# categories in the sccomp model
+
+tiny_leftover_labels <- c("3. B Cell (CD38+)", 
+                          "10. Memory T/Plasma Cell (CD45RO+)", 
+                          "16. Plasma Cell (CD19+)",
+                          "Plasma Cell, Exhausted/Effector (CD138+CD45RO+TIM3+PD1+)",
+                          "Plasma Cell, Memory-like (CD138+CD45RO+)")
+spe <- spe[, !(spe$final_celltype %in% tiny_leftover_labels)]
+spe$final_celltype <- droplevels(spe$final_celltype)
+
+cat("Cell types after removing tiny leftover categories:", nlevels(spe$final_celltype), "\n")
+
+sort(table(spe$final_celltype))
+
+```
+
+```{r sccomp-prep}
+sceIMC <- SingleCellExperiment(list(counts = assay(spe, "counts")))
+sceIMC$Patient      <- factor(spe$patient_id)
+sceIMC$Sample       <- factor(spe$sample_id)
+sceIMC$DiseaseState <- factor(spe$disease_state, levels = c("Benign", "Lower", "Higher"))
+sceIMC$CellType     <- factor(spe$final_celltype)
+
+cat("Patients:", n_distinct(sceIMC$Patient), "\n")
+cat("Disease states:", paste(levels(sceIMC$DiseaseState), collapse = ", "), "\n")
+cat("Cell types:", n_distinct(sceIMC$CellType), "\n")
+```
+
+The first level of a factor becomes the reference category in a model formula by default. So ~ DiseaseState + (1 | Patient) automatically produces two contrasts, both relative to Benign.
+
+DiseaseStateLower = Lower vs. Benign
+DiseaseStateHigher = Higher vs. Benign
+
+
+```{r}
+packageVersion("cmdstanr")
+packageVersion("instantiate")
+
+# check if `threads` is still a real parameter of $compile() on your build
+mod <- cmdstanr::cmdstan_model(
+  cmdstanr::write_stan_file("parameters{real y;} model{y~normal(0,1);}")
+)
+"threads" %in% names(formals(mod$compile))
+```
+
+
+```{r sccomp-run, message=FALSE, warning=FALSE}
+
+if (file.exists(sccomp_celltype_out_path)) {
+  sccomp_celltype_res <- readRDS(sccomp_celltype_out_path)
+} else {
+  sccomp_celltype_res <- sceIMC |>
+    sccomp_estimate(
+      formula_composition = ~ DiseaseState + (1 | Patient),
+      .sample     = Sample,
+      .cell_group = CellType,
+      verbose = FALSE
+    ) |>
+    sccomp_test()
+
+dir.create(dirname(sccomp_celltype_out_path), recursive = TRUE, showWarnings = FALSE)
+saveRDS(sccomp_celltype_res, sccomp_celltype_out_path)
+}
+cat("Saved sccomp cell type association results to:", sccomp_celltype_out_path, "\n")
+```
+
+
+```{r sccomp-results-table}
+library(kableExtra)
+
+sccomp_results_df <- sccomp_celltype_res |>
+  arrange(c_FDR) |>
+  as.data.frame() |>
+  select(CellType, parameter, c_effect, c_lower, c_upper, c_FDR)   # trim to essentials
+
+sccomp_results_df |>
+  knitr::kable(digits = 3, caption = "Cell type composition association with disease state",
+               format = "latex", booktabs = TRUE, longtable = TRUE) |>
+  kable_styling(latex_options = c("striped", "repeat_header", "hold_position"),
+                font_size = 8)
+```
+
+### Sccomp Volcano Plot (Cell Type Composition vs. Disease State)
+
+```{r sccomp-volcano, fig.width=10, fig.height=10}
+plot_df <- sccomp_celltype_res |>
+  as.data.frame() |>
+  filter(!is.nan(c_FDR)) |>
+  mutate(
+    LogFDR = -log(c_FDR),
+    Significant = ifelse(c_FDR < 0.05, "FDR < 0.05", "Not significant")
+  )
+
+ggplot(plot_df, aes(x = c_effect, y = LogFDR, color = Significant)) +
+  geom_point(size = 2) +
+  ggrepel::geom_text_repel(
+    data = filter(plot_df, c_FDR < 0.05),
+    aes(label = CellType), size = 3, show.legend = FALSE
+  ) +
+  scale_color_manual(values = c("FDR < 0.05" = "firebrick", "Not significant" = "grey70")) +
+  theme_classic() +
+  labs(x = "Effect size", y = "-log(FDR)",
+       title = "Cell type composition vs. disease state")
+```
+X-axis: Effect size, log fold-change in proportion for a given contrast. 
+Points that are right of zero mean that cell type is more abundant in the higher-stage/comparison group, left means less abundant. 
+
+Y-axis: -log(FDR), significance (higher = more significant). 
+For example, cDC1 (the top-right point) is the strongest signal here. cDC1 proportion increases substantially with disease stage and is extremely significant. 
+
+
+```{r sccomp-volcano2, fig.width=10, fig.height=10, eval=FALSE}
+plot_df <- sccomp_celltype_res |>
+  as.data.frame() |>
+  filter(!is.nan(c_FDR))
+
+# Floor exact-zero FDRs at the smallest non-zero FDR actually observed,
+# rather than machine epsilon -- keeps -log(FDR) on a realistic scale
+nonzero_min_fdr <- min(plot_df$c_FDR[plot_df$c_FDR > 0], na.rm = TRUE)
+
+plot_df <- plot_df |>
+  mutate(
+    c_FDR_floor = ifelse(c_FDR == 0, nonzero_min_fdr, c_FDR),
+    LogFDR = -log(c_FDR_floor),
+    Significant = ifelse(c_FDR < 0.05, "FDR < 0.05", "Not significant")
+  )
+
+labels_df <- plot_df |>
+  filter(c_FDR < 0.05) |>
+  arrange(desc(LogFDR), desc(abs(c_effect))) |>   # break tied FDR==0 rows by effect size
+  slice_head(n = 25)
+
+ggplot(plot_df, aes(x = c_effect, y = LogFDR, color = Significant)) +
+  geom_point(size = 2) +
+  ggrepel::geom_text_repel(
+    data = labels_df,
+    aes(label = CellType), size = 3, show.legend = FALSE,
+    max.overlaps = Inf,
+    force = 2, force_pull = 0.5,
+    box.padding = 0.3
+  ) +
+  scale_color_manual(values = c("FDR < 0.05" = "firebrick", "Not significant" = "grey70")) +
+  scale_y_continuous(expand = expansion(mult = c(0.02, 0.15))) +
+  coord_cartesian(clip = "off") +
+  theme_classic() +
+  theme(plot.margin = margin(t = 20, r = 10, b = 10, l = 10)) +
+  labs(x = "Effect size", y = "-log(FDR)",
+       title = "Cell type composition vs. disease state")
+```
+sccomp's FDR is a Bayesian posterior-based estimate, and it's bounded below by the number of posterior draws.
+
+### Cell Type Composition vs. Benign (Forest Plot)
+
+```{r sccomp-effect-ranked, fig.width=12, fig.height=12}
+library(tidytext)
+
+effect_df <- sccomp_celltype_res |>
+  as.data.frame() |>
+  filter(parameter %in% c("DiseaseStateLower", "DiseaseStateHigher")) |>
+  filter(c_FDR < 0.05) |>
+  mutate(CellType_ordered = reorder_within(CellType, c_effect, parameter))
+
+ggplot(effect_df, aes(x = c_effect, y = CellType_ordered)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_errorbarh(aes(xmin = c_lower, xmax = c_upper), height = 0, color = "grey40") +
+  geom_point(aes(color = c_effect > 0), size = 2, show.legend = FALSE) +
+  scale_color_manual(values = c("TRUE" = "firebrick", "FALSE" = "steelblue")) +
+  scale_y_reordered() +
+  facet_wrap(~ parameter, scales = "free_y") +
+  theme_classic() +
+  theme(axis.text.y = element_text(size = 8)) +
+  labs(
+    x = "Effect size (logit fold-change)",
+    y = NULL,
+    title = "Cell type composition: Lower and Higher vs. Benign",
+    subtitle = "FDR < 0.05 only, sorted by effect size within each contrast; red = increases, blue = decreases"
+  )
+```
+This is showing "How does disease progression diverge from the non-cancerous baseline?". The two plots are showing two contrasts, both relative to Benign. This isn't lower vs. higher directly, it's each stage compared back to the benign baseline.
+
+DiseaseStateLower = Lower vs. Benign
+DiseaseStateHigher = Higher vs. Benign
+
+Reminder that the whole model is built on ROI-level samples + Patient random effect. If that changes, then these effect sizes could shift. 
+
+**Because Campbell specifically asked to compare lower vs. higher stage directly, I'm going to re-run sccomp with Lower as the reference level.**
+
+```{r sccomp-run-lowvhigh, message=FALSE, warning=FALSE}
+sccomp_lowvhigh_out_path <- file.path(analysis_path, "spatial_analysis", "sccomp_lowvhigh_association.rds")
+
+if (file.exists(sccomp_lowvhigh_out_path)) {
+  sccomp_lowvhigh_res <- readRDS(sccomp_lowvhigh_out_path)
+} else {
+  sceIMC_lvh <- sceIMC
+  sceIMC_lvh$DiseaseState <- factor(spe$disease_state, levels = c("Lower", "Higher", "Benign"))
+
+  sccomp_lowvhigh_res <- sceIMC_lvh |>
+    sccomp_estimate(
+      formula_composition = ~ DiseaseState + (1 | Patient),
+      .sample     = Sample,
+      .cell_group = CellType,
+      verbose = FALSE
+    ) |>
+    sccomp_test()
+
+  saveRDS(sccomp_lowvhigh_res, sccomp_lowvhigh_out_path)
+}
+```
+
+```{r}
+unique(sccomp_lowvhigh_res$parameter)
+```
+Use "DiseaseStateHigher", which represents the Higher vs Lower comparison that I want. 
+
+### Cell Type Composition: Higher vs. Lower (Forest Plot)
+
+```{r sccomp-effect-ranked-lowvhigh, fig.width=8, fig.height=12}
+library(tidytext)
+
+effect_df_lvh <- sccomp_lowvhigh_res |>
+  as.data.frame() |>
+  filter(parameter == "DiseaseStateHigher") |>   # Higher vs. Lower, since Lower is now the reference
+  filter(c_FDR < 0.05) |>
+  mutate(CellType = factor(CellType, levels = CellType[order(c_effect)]))
+
+ggplot(effect_df_lvh, aes(x = c_effect, y = CellType)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_errorbarh(aes(xmin = c_lower, xmax = c_upper), height = 0, color = "grey40") +
+  geom_point(aes(color = c_effect > 0), size = 2, show.legend = FALSE) +
+  scale_color_manual(values = c("TRUE" = "firebrick", "FALSE" = "steelblue")) +
+  theme_classic() +
+  theme(axis.text.y = element_text(size = 9)) +
+  labs(
+    x = "Effect size (log fold-change)",
+    y = NULL,
+    title = "Cell type composition: Higher vs. Lower disease stage",
+    subtitle = "FDR < 0.05 only, sorted by effect size; red = increases, blue = decreases"
+  )
+```
+
+**Findings:**
+
+1. Most confident increases with higher stage: Proliferating cells, Macrophage M2-like, Treg, and Monocyte-Macrophage Transitional.
+
+This makes sense biologically. More proliferation, presense of immunosuppressive macrophage phenotype (M2-like), and more Tregs together suggest a shift towards more immunosuppresive, actively remodeling tumor microenvironment as stage increases. This is consistent with typical NSCLC progression biology. 
+
+2. Most confident decreases with higher stage: Tumor Epithelial (Neuroendocrine), Unresolved, DC/mregDC, B Cell (CD19+), and Mast Cell
+
+Seeing a drop in conventional DCs and B cells alongside a rise in Tregs and M2 macrophages. When both DCs and B cells go down, it suggests that the tumor is getting worse at being recognized as a threat. Tumors are known to recruit Tregs and macrophages to actively suppress the immune system. 
+
+Less detection + more active suppression --> sign of cancer progression
+
+3. Borderline/less confident calls: Fibroblast/Stroma, Plasmablast Strongly Activated (CD38++), and cDC1. 
+
+These markers all have CIs close to zero.
+
+### Posterior Predictive Check
+```{r sccomp-boxplot-half1, fig.width=16, fig.height=12}
+all_celltypes <- sccomp_celltype_res |> distinct(CellType) |> pull(CellType)
+half1 <- all_celltypes[1:ceiling(length(all_celltypes) / 2)]
+
+sccomp_celltype_res |>
+  filter(CellType %in% half1) |>
+  sccomp_boxplot(factor = "DiseaseState") +
+  theme(
+    strip.text = element_text(size = 12),
+    panel.spacing = unit(1, "lines"),
+    axis.text.x = element_text(size = 12, angle = 45, hjust = 1)
+  )
+```
+
+```{r sccomp-boxplot-half2, fig.width=16, fig.height=12}
+half2 <- all_celltypes[(ceiling(length(all_celltypes) / 2) + 1):length(all_celltypes)]
+
+sccomp_celltype_res |>
+  filter(CellType %in% half2) |>
+  sccomp_boxplot(factor = "DiseaseState") +
+  theme(
+    strip.text = element_text(size = 8),
+    panel.spacing = unit(1, "lines"),
+    axis.text.x = element_text(size = 7, angle = 45, hjust = 1)
+  )
+```
+
+```{r}
+sccomp_celltype_res |>
+  filter(CellType == "1. cDC1") |>
+  select(CellType, parameter, c_effect, c_lower, c_upper, c_FDR)
+```
+
+```{r}
+sccomp_celltype_res |>
+  filter(c_FDR < 0.05) |>
+  mutate(ci_crosses_zero = c_lower < 0 & c_upper > 0) |>
+  filter(ci_crosses_zero) |>
+  select(CellType, parameter, c_effect, c_lower, c_upper, c_FDR)
+```
+---
+
+
+## Notes
+
+- Cluster 17 (~41,500 cells, ~12% of dataset) excluded because of 
+  segmentation/staining artifact concentrated in Patient12.
+- Spatial graph uses threshold = 20; may need to confirm with Yusuke on
+  whether the preprint's actual analysis used 20 or 50 (code and
+  manuscript text disagree). Easy to re-run with a different threshold
+  if needed, this notebook's structure doesn't depend on the exact
+  value chosen.
+- Niche generation (`aggregateNeighbors` + `kmeans`) and niche-level
+  `sccomp` association are handled in a separate follow-on notebook,
+  reading in `spe_spatial_graph.rds` from this notebook's output.

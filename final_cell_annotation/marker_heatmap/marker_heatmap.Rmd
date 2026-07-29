@@ -12,8 +12,13 @@ output:
     code_folding: show
 ---
 
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+set.seed(42)
+```
+
 ## 1. Load Libraries
-```{r setup}
+```{r libraries}
 library(SpatialExperiment)
 library(SingleCellExperiment)
 library(scuttle)
@@ -32,7 +37,7 @@ library(grid)
 analysis_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis"
 spe_path <- file.path(analysis_path, "final_cell_annotation", "h5_cluster_annot.rds")
 
-out_path <- file.path(analysis_path, "final_cell_annotation", "marker_heatmaps")
+out_path <- file.path(analysis_path, "final_cell_annotation", "marker_heatmap")
 dir.create(out_path, showWarnings = FALSE, recursive = TRUE)
 ```
 
@@ -53,7 +58,7 @@ assay_types <- c(counts = "Intensities", exprs = "Asinh Intensities")
 ```
 
 ## 4. Mean Expression Heatmaps
-```{r mean-heatmap}
+```{r mean-heatmap,fig.width=10, fig.height=10}
 for (a in names(assay_types)) {
   cluster_mean <- aggregateAcrossCells(as(spe, "SingleCellExperiment"),
                                         ids = colData(spe)[[cluster_col]],
@@ -88,15 +93,18 @@ for (a in names(assay_types)) {
                 show_column_names = FALSE,
                 row_names_gp = gpar(fontsize = 8))
 
-  png(file.path(out_path, paste0("h5_cluster_mean_heatmap_", a, ".png")),
+  png(file.path(out_path, paste0("mean_heatmap_", a, ".png")),
       width = 3800, height = 2800, res = 300)
   draw(ht, merge_legend = TRUE)
   dev.off()
+
+  # print again so it displays inline when knit
+  draw(ht, merge_legend = TRUE)
 }
 ```
 
 ## 5. SD Heatmaps
-```{r sd-heatmap}
+```{r sd-heatmap,fig.width=10, fig.height=10}
 sd_df_list <- list()
 
 for (a in names(assay_types)) {
@@ -115,8 +123,6 @@ for (a in names(assay_types)) {
   sd_mat <- as.matrix(sd_df[, -1])
   rownames(sd_mat) <- sd_df$marker
 
-  # z-score each marker (row) across clusters, so color reflects
-  # relative SD per marker rather than each marker's absolute scale
   sd_mat_z <- t(scale(t(sd_mat)))
 
   ht <- Heatmap(sd_mat_z,
@@ -127,48 +133,74 @@ for (a in names(assay_types)) {
                 cluster_columns = TRUE,
                 row_names_gp = gpar(fontsize = 8))
 
-  png(file.path(out_path, paste0("h5_cluster_sd_heatmap_", a, ".png")),
+  png(file.path(out_path, paste0("sd_heatmap_", a, ".png")),
       width = 3800, height = 2900, res = 300)
   draw(ht)
   grid.text(paste0(cluster_col, " (cluster ID)"),
             x = unit(0.5, "npc"), y = unit(0.015, "npc"),
             gp = gpar(fontsize = 11, fontface = "bold"))
   dev.off()
+
+  # print again so it displays inline when knit
+  draw(ht)
+  grid.text(paste0(cluster_col, " (cluster ID)"),
+            x = unit(0.5, "npc"), y = unit(0.015, "npc"),
+            gp = gpar(fontsize = 11, fontface = "bold"))
 }
 ```
 
-## 6. Flagging High-SD Marker/Cluster Combinations (Asinh Only)
-```{r sd-flagging}
-sd_long <- sd_df_list[["exprs"]] %>%
-  pivot_longer(-marker, names_to = "cluster", values_to = "sd")
+## 6. Boxplots of High/Low Markers within Each Cluster (Asinh Only)
+```{r extreme-marker-boxplots, fig.width=12, fig.height=14}
+n_extreme <- 10 # number of high + low markers to show per cluster
 
-sd_flags <- sd_long %>%
-  group_by(marker) %>%
-  mutate(marker_mean_sd = mean(sd), marker_sd_of_sd = sd(sd)) %>%
+exprs_mat <- assay(spe, "exprs")[use_channels, ]
+cluster_ids <- as.character(colData(spe)[[cluster_col]])
+
+long_df <- as.data.frame(t(exprs_mat)) %>%
+  mutate(cluster = cluster_ids) %>%
+  pivot_longer(-cluster, names_to = "marker", values_to = "value")
+
+# per-cluster marker means, used only to pick which markers are "high" or "low"
+cluster_means <- long_df %>%
+  group_by(cluster, marker) %>%
+  summarise(mean_val = mean(value), .groups = "drop")
+
+# for each cluster, keep the top n_extreme highest and n_extreme lowest markers
+extreme_markers <- cluster_means %>%
+  group_by(cluster) %>%
+  slice_max(mean_val, n = n_extreme) %>%
+  mutate(direction = "High") %>%
+  bind_rows(
+    cluster_means %>%
+      group_by(cluster) %>%
+      slice_min(mean_val, n = n_extreme) %>%
+      mutate(direction = "Low")
+  ) %>%
   ungroup() %>%
-  filter(sd > marker_mean_sd + marker_sd_of_sd) %>%
-  arrange(cluster, desc(sd))
+  select(cluster, marker, direction)
 
-write.csv(sd_flags, file.path(out_path, "h5_high_sd_flags_exprs.csv"), row.names = FALSE)
-```
-
-## 7. SD Distribution per Cluster (Asinh Only, Single Image)
-```{r sd-boxplot}
-sd_long <- sd_df_list[["exprs"]] %>%
-  pivot_longer(-marker, names_to = "cluster", values_to = "sd") %>%
+# subset the full per-cell data down to only these marker/cluster combos
+plot_df <- long_df %>%
+  inner_join(extreme_markers, by = c("cluster", "marker")) %>%
   mutate(cluster = factor(cluster, levels = as.character(sort(as.numeric(unique(cluster))))))
 
-p <- ggplot(sd_long, aes(x = cluster, y = sd)) +
-  geom_boxplot(outlier.shape = NA, fill = "grey85") +
-  geom_jitter(width = 0.15, size = 1, alpha = 0.6, color = "grey30") +
-  labs(title = "Distribution of Marker SD within Each Cluster",
-       subtitle = "Asinh Intensities - each point is one marker's SD in that cluster",
-       x = "Cluster (broad_clusters)", y = "SD of Asinh Intensity") +
+p <- ggplot(plot_df, aes(x = reorder(marker, value, FUN = median), y = value, fill = direction)) +
+  geom_boxplot(outlier.size = 0.3) +
+  facet_wrap(~cluster, scales = "free", ncol = 4) +
+  scale_fill_manual(values = c(High = "#fde725", Low = "#440154")) +
+  coord_flip() +
+  labs(title = "Highest and Lowest Expressed Markers within Each Cluster",
+       subtitle = paste0("Asinh Intensities - top/bottom ", n_extreme, " markers by mean, per cluster"),
+       x = "Marker", y = "Asinh Intensity", fill = "Direction") +
   theme_bw() +
-  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+  theme(strip.text = element_text(size = 8),
+        axis.text.y = element_text(size = 7))
 
-png(file.path(out_path, "h5_cluster_sd_distribution_exprs.png"),
-    width = 3200, height = 2000, res = 300)
+png(file.path(out_path, "extreme_markers_boxplots_by_cluster_exprs.png"),
+    width = 4800, height = 5600, res = 300)
 print(p)
 dev.off()
+
+# print again so it displays inline when knit
+print(p)
 ```

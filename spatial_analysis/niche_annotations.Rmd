@@ -1,0 +1,292 @@
+---
+title: "Niche Annotation: Composition Summary for Significant Niches"
+author: "Tazein Shah"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    code_folding: show
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 8)
+
+suppressPackageStartupMessages({
+  library(SpatialExperiment)
+  library(tidyverse)
+  library(pheatmap)
+})
+```
+
+## Overview
+
+This notebook summarizes the average neighborhood composition
+(`spe$aggregatedNeighbors`) for niches found significant in the
+`sccomp` N-status and Stage models from the niche generation
+notebook, to support manual niche annotation following the same
+convention used for cluster annotation.
+
+---
+
+## 1. Paths
+
+Reuses `niche_path` from the niche generation notebook (unchanged).
+
+```{r paths}
+analysis_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis"
+niche_path    <- file.path(analysis_path, "spatial_analysis", "niche_k50_thresh20")
+
+niche_spe_path      <- file.path(niche_path, "spe_niche.rds")
+sccomp_nstatus_path <- file.path(niche_path, "sccomp_nstatus.rds")
+sccomp_stage_path   <- file.path(niche_path, "sccomp_stage.rds")
+
+composition_out_path   <- file.path(niche_path, "niche_avg_composition.csv")
+heatmap_out_path       <- file.path(niche_path, "niche_composition_heatmap.pdf")
+top_celltypes_out_path <- file.path(niche_path, "niche_top_celltypes.csv")
+```
+
+---
+
+## 2. Load objects
+
+```{r load}
+spe <- readRDS(niche_spe_path)
+sccomp_niche_nstatus <- readRDS(sccomp_nstatus_path)
+sccomp_niche_stage   <- readRDS(sccomp_stage_path)
+```
+
+---
+
+## 2b. Diagnose cell type naming
+
+Confirmed: the raw names are already clean at the source, no mangling
+here. The actual bug turned out to be downstream -- `column_to_rownames()`
+(used to build matrices for the dot plot and heatmap) internally calls
+`as.data.frame()` with `check.names = TRUE` and no way to override it,
+silently re-mangling clean names every time it's called. Fixed in
+Sections 4b and 5 by building those matrices manually with `as.matrix()`
+instead, which doesn't touch names.
+
+```{r diagnose-names}
+cat("Column names of spe$aggregatedNeighbors:\n")
+print(colnames(spe$aggregatedNeighbors))
+
+cat("\nLevels of spe$final_celltype:\n")
+print(levels(spe$final_celltype))
+```
+
+---
+
+## 3. Identify significant niches
+
+Significant niches (FDR < 0.05) from each model, unioned.
+
+```{r significant-niches}
+sig_nstatus <- sccomp_niche_nstatus |>
+  filter(factor == "N_status", c_FDR < 0.05) |>
+  pull(Niche) |>
+  unique()
+
+sig_stage <- sccomp_niche_stage |>
+  filter(factor == "Stage", c_FDR < 0.05) |>
+  pull(Niche) |>
+  unique()
+
+sig_niches <- union(sig_nstatus, sig_stage)
+
+cat("Significant niches (N-status):", length(sig_nstatus), "\n")
+cat("Significant niches (Stage):", length(sig_stage), "\n")
+cat("Significant niches (union):", length(sig_niches), "\n")
+print(sort(as.numeric(as.character(sig_niches))))
+```
+
+---
+
+## 3b. Significant niches: effect size and FDR
+
+Combined table of every niche x contrast pair that cleared FDR < 0.05
+in either model, for reference alongside the composition/annotation
+work below.
+
+```{r significant-niches-table}
+sig_nstatus_table <- sccomp_niche_nstatus |>
+  filter(factor == "N_status", c_FDR < 0.05) |>
+  select(Niche, factor, parameter, c_effect, c_FDR)
+
+sig_stage_table <- sccomp_niche_stage |>
+  filter(factor == "Stage", c_FDR < 0.05) |>
+  select(Niche, factor, parameter, c_effect, c_FDR)
+
+sig_niches_table <- bind_rows(sig_nstatus_table, sig_stage_table) |>
+  arrange(Niche, c_FDR)
+
+sig_niches_table |>
+  as.data.frame() |>
+  knitr::kable(digits = 3, caption = "Significant niches: effect size and FDR (N-status and Stage models)")
+```
+
+---
+
+## 4. Average neighborhood composition per niche
+
+All 50 niches, saved for reference.
+
+```{r composition}
+# Confirmed via the diagnostic chunk above: spe$aggregatedNeighbors' column
+# names and levels(spe$final_celltype) are already clean (no mangling at the
+# source). check.names = FALSE just guards against as.data.frame() re-
+# mangling them at this conversion step.
+neighbor_mat <- as.data.frame(spe$aggregatedNeighbors, check.names = FALSE)
+neighbor_mat$Niche <- spe$Niche
+
+niche_composition <- neighbor_mat |>
+  group_by(Niche) |>
+  summarise(across(everything(), mean), .groups = "drop")
+
+write_csv(niche_composition, composition_out_path)
+cat("Saved full niche composition table to:", composition_out_path, "\n")
+
+# Re-read the CSV rather than continuing to use the in-memory object.
+# read_csv() takes the header row literally (no make.names-style checking,
+# unlike as.data.frame()/column_to_rownames()), so every chunk below now
+# works from a guaranteed-clean, disk-verified copy of the names.
+niche_composition <- read_csv(composition_out_path, show_col_types = FALSE)
+```
+
+---
+
+## 4b. Detailed composition dot plot (all niches)
+
+Dot size and color both encode mean fraction; niches and cell types
+are hierarchically clustered so similar composition profiles sit next
+to each other, giving a more detailed view across all 50 niches than
+a single heatmap panel.
+
+```{r composition-dotplot, fig.width=14, fig.height=10}
+# column_to_rownames() internally converts via as.data.frame() with
+# check.names = TRUE (no way to override), which re-mangles the clean tibble
+# column names. Build the matrix manually with as.matrix() instead, which
+# doesn't touch names at all.
+niche_mat_full <- niche_composition |> select(-Niche) |> as.matrix()
+rownames(niche_mat_full) <- niche_composition$Niche
+
+niche_order    <- rownames(niche_mat_full)[hclust(dist(niche_mat_full))$order]
+celltype_order <- colnames(niche_mat_full)[hclust(dist(t(niche_mat_full)))$order]
+
+niche_long <- niche_composition |>
+  pivot_longer(-Niche, names_to = "cell_type", values_to = "mean_fraction") |>
+  mutate(
+    Niche = factor(Niche, levels = niche_order),
+    cell_type = factor(cell_type, levels = celltype_order)
+  )
+
+ggplot(niche_long, aes(x = Niche, y = cell_type, size = mean_fraction, color = mean_fraction)) +
+  geom_point() +
+  scale_color_viridis_c() +
+  scale_size_continuous(range = c(0.5, 6)) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 7),
+        axis.text.y = element_text(size = 8)) +
+  labs(x = "Niche", y = "Cell type", color = "Mean fraction", size = "Mean fraction",
+       title = "Average neighborhood composition per niche (all 50 niches)")
+```
+
+---
+
+## 5. Heatmap (significant niches only)
+
+```{r heatmap}
+suppressPackageStartupMessages({
+  library(RColorBrewer)
+})
+
+niche_composition_sig <- niche_composition |>
+  filter(Niche %in% sig_niches)
+
+# Drop cell types with near-zero variance across these niches. Column
+# z-scoring (scale = "column") divides by each column's SD -- a flat/near-zero
+# column has a tiny SD, so a single stray value blows up into an extreme
+# z-score. That's what was producing the noisy, extreme-red heatmap.
+range_cutoff_sig <- 0.05
+
+celltype_range_sig <- niche_composition_sig |>
+  select(-Niche) |>
+  summarise(across(everything(), ~ max(.x) - min(.x))) |>
+  pivot_longer(everything(), names_to = "cell_type", values_to = "range")
+
+keep_celltypes_sig <- celltype_range_sig |>
+  filter(range > range_cutoff_sig) |>
+  pull(cell_type)
+
+cat("Keeping", length(keep_celltypes_sig), "of", ncol(niche_composition_sig) - 1,
+    "cell types (range >", range_cutoff_sig, ")\n")
+
+niche_composition_sig_filtered <- niche_composition_sig |>
+  select(Niche, all_of(keep_celltypes_sig))
+
+niche_mat_sig <- niche_composition_sig_filtered |> select(-Niche) |> as.matrix()
+rownames(niche_mat_sig) <- niche_composition_sig_filtered$Niche
+
+# Pre-scale (column z-score) ourselves so we can force symmetric, well-
+# contrasted breaks around zero rather than relying on pheatmap's default
+# range, which produced the washed-out/inconsistent coloring above.
+niche_mat_scaled <- scale(niche_mat_sig)
+max_abs <- max(abs(niche_mat_scaled), na.rm = TRUE)
+breaks <- seq(-max_abs, max_abs, length.out = 101)
+heat_colors <- colorRampPalette(rev(brewer.pal(11, "RdBu")))(100)
+
+pdf(heatmap_out_path, width = 14, height = 10)
+pheatmap(niche_mat_scaled,
+         scale = "none",
+         color = heat_colors,
+         breaks = breaks,
+         fontsize_row = 9,
+         fontsize_col = 9,
+         border_color = NA,
+         angle_col = 45,
+         main = "Average neighborhood composition: significant niches only")
+dev.off()
+cat("Saved heatmap to:", heatmap_out_path, "\n")
+
+pheatmap(niche_mat_scaled,
+         scale = "none",
+         color = heat_colors,
+         breaks = breaks,
+         fontsize_row = 9,
+         fontsize_col = 9,
+         border_color = NA,
+         angle_col = 45,
+         main = "Average neighborhood composition: significant niches only")
+```
+
+---
+
+## 6. Top dominant cell types per significant niche
+
+For writing the usual `#Niche N: cell_type1, cell_type2: reasoning`
+annotation comments.
+
+```{r top-celltypes}
+top_n <- 5
+
+niche_top_celltypes <- niche_composition_sig |>
+  pivot_longer(-Niche, names_to = "cell_type", values_to = "mean_fraction") |>
+  group_by(Niche) |>
+  slice_max(mean_fraction, n = top_n) |>
+  arrange(Niche, desc(mean_fraction))
+
+write_csv(niche_top_celltypes, top_celltypes_out_path)
+cat("Saved top-", top_n, " cell types per significant niche to:", top_celltypes_out_path, "\n")
+
+niche_top_celltypes |>
+  as.data.frame() |>
+  knitr::kable(digits = 3, caption = "Top dominant cell types per significant niche")
+```

@@ -36,7 +36,7 @@ spillover on one of the two marker sets.
 
 ```{r libraries}
 # Only run this if you start a new RStudio session
-.libPaths(c("/restricted/projectnb/camplab/home/vgupta7/R_libs", .libPaths()))
+#.libPaths(c("/restricted/projectnb/camplab/home/vgupta7/R_libs", .libPaths()))
 
 library(imcRtools)
 library(tidyverse)
@@ -210,6 +210,140 @@ cat("Top positive markers (logFC > 1.0) per subcluster:\n")
 print(knitr::kable(top1_summary, col.names = c("Subcluster", "Top Positive Markers")))
 ```
 
+Everywhere CD4 (T cell marker) goes up, CD138 (B cell marker) goes up right alongside it. Doesn't really prove that these are two distinct cell populations.
+
+If there were real plasma cells embedded in this cluster, we'd expect to see at least one subcluster to show CD38 (the plasma marker) light up along with CD138, but that doesn't happen. This could be evidence that CD138's signal here is background/spillover, not plasma cell contamination.
+
+Cluster 15 most likely is a CD4 T cell population with many distinct activation/differentiation states, with CD138 riding along as noise.
+
+```{r logfc-wide-table-formatted}
+logfc_wide <- all_markers_df |>
+  select(subcluster, marker, logFC) |>
+  mutate(logFC = round(logFC, 2)) |>
+  pivot_wider(names_from = subcluster, values_from = logFC)
+
+knitr::kable(logfc_wide, caption = "logFC per marker, per subcluster (Cluster 15 subset)")
+```
+```{r findmarkers-per-subcluster-tables}
+cat("Detailed tables:\n\n")
+
+for (cl in levels(spe_15$sub_clusters)) {
+  sub <- all_markers_df[all_markers_df$subcluster == cl & all_markers_df$Top <= 5, ]
+  sub <- sub[order(sub$Top, -sub$logFC), ]
+  if (nrow(sub) == 0) {
+    cat("Subcluster", cl, ": no markers in top 5\n\n")
+  } else {
+    print(knitr::kable(sub[, c("marker", "Top", "FDR", "logFC")],
+                       caption = paste("Subcluster", cl),
+                       digits  = 3))
+  }
+}
+```
+
+Subclusters 2 and 4: no markers clear threshold, very isolated on the right of the UMAP, doesn't blend in with the main cluster mass.
+
+Subcluster 3: CD4+ T cell, but is elevated for CD11c, which is a dendritic/myeloid marker
+
+Subcluster 4: low quality noise most likely
+
+Subcluster 5: TIM3 elevated, likely Exhausted T cell
+
+Subcluster 6: has a sharp, isolated FoxP3 signal and nothing else. Looks like a real Treg population.
+
+Subcluster 8: strong PD1 signal (confirmed by LogFC value and violin plot). Looks like a real, distinct exhausted/checkpoint-high CD4 population
+
+Subcluster 9: elevated in CD45RO and CD4, likely Memory T Cell
+
+## Subcluster 2 and 4 Quality Check
+
+```{r subcluster2-4-quality-check}
+spe_15$total_counts <- colSums(assay(spe_15, "counts"))
+
+quality_check <- colData(spe_15) |>
+  as.data.frame() |>
+  mutate(group = ifelse(sub_clusters %in% c("2", "4"), "Subcluster 2/4", "Other subclusters")) |>
+  group_by(group) |>
+  summarise(
+    n = n(),
+    mean_area = mean(area, na.rm = TRUE),
+    median_area = median(area, na.rm = TRUE),
+    mean_total_counts = mean(total_counts, na.rm = TRUE),
+    median_total_counts = median(total_counts, na.rm = TRUE)
+  )
+
+print(quality_check)
+```
+Area is nearly identical, so this isn't a segmentation-size issue. 
+However, the total counts are much lower. This is evidence that these cells didn't stain well.
+
+## CD138 Spillover Check
+
+```{r cd138-spillover-check}
+check_markers <- c("CD138", "EpCAM", "CD4", "CD45RO", "CD19", "CD38")
+check_markers <- check_markers[check_markers %in% rownames(spe_15)]
+
+expr_df <- as.data.frame(t(assay(spe_15, "counts")[check_markers, ]))
+cor_matrix <- cor(expr_df, method = "spearman")
+
+cat("Correlation of CD138 with panel markers, within cluster 15:\n")
+print(round(sort(cor_matrix["CD138", ], decreasing = TRUE), 3))
+```
+
+CD138 has a noticeable correlation with CD4 (0.59) and CD45RO (0.51) (they tend to be high in the same cells), which means that the CD138 signal in this cluster might be real, low-level expression on activated/memory CD4+ T cells, rather than plasma cell contamination.
+
+## CD138 vs. Total Counts (Checking for Generalized Intensity Effect)
+
+```{r cd138-total-counts-check}
+spe_15$total_counts <- colSums(assay(spe_15, "counts"))
+cor(assay(spe_15, "counts")["CD138", ], spe_15$total_counts, method = "spearman")
+```
+
+This points to the possibility of a generalized intensity effect. Cells with more total signal overall show elevated CD138 along with the other markers, simply because those markers are also picking up more signal in high-intensity cells.
+
+## Subcluster 5 Checkpoint Marker Correlations (Checking for Intensity Confound in TIM3)
+
+```{r subcluster5-checkpoint-check}
+checkpoint_markers <- c("TIM3", "PD1", "LAG3", "CTLA4", "CD138")
+checkpoint_markers <- checkpoint_markers[checkpoint_markers %in% rownames(spe_15)]
+
+expr_df <- as.data.frame(t(assay(spe_15, "counts")[checkpoint_markers, ]))
+expr_df$total_counts <- spe_15$total_counts
+
+cor(expr_df, method = "spearman")["TIM3", ]
+```
+
+TIM3 correlates more strongly with total_counts (0.57) than with any of the checkpoint/exhaustion markers. This further supports a generalized intensity effect that we are seeing with CD138, rather than a real exhaustion signature.
+
+## Correlate PD1 against the other checkpoint markers in Subcluster 8
+
+```{r subcluster8-checkpoint-check}
+checkpoint_markers <- c("PD1", "TIM3", "LAG3", "CTLA4", "CD138")
+checkpoint_markers <- checkpoint_markers[checkpoint_markers %in% rownames(spe_15)]
+
+sub8_cells <- spe_15$sub_clusters == "8"
+
+expr_df <- as.data.frame(t(assay(spe_15, "counts")[checkpoint_markers, sub8_cells]))
+expr_df$total_counts <- spe_15$total_counts[sub8_cells]
+
+cor(expr_df, method = "spearman")["PD1", ]
+```
+
+Within subcluster 8, PD1 and TIM3 (the two main exhausion markers) don't track together at all. Total_counts drops to 0.21, which means that within the cells that actually make up subcluster 8, PD1 is not strongly explained by overall intensity.
+
+## PD1 check (across all subclusters)
+
+```{r pd1-checkpoint-check-full-cluster}
+checkpoint_markers <- c("PD1", "TIM3", "LAG3", "CTLA4", "CD138")
+checkpoint_markers <- checkpoint_markers[checkpoint_markers %in% rownames(spe_15)]
+
+expr_df <- as.data.frame(t(assay(spe_15, "counts")[checkpoint_markers, ]))
+expr_df$total_counts <- spe_15$total_counts
+
+cor(expr_df, method = "spearman")["PD1", ]
+```
+
+At the whole-cluster level, PD1 shows the same intensity-tracking signature found for CD138 and TIM3. This may be driven by cross-subcluster differences (subclusters with generally higher total signal also happen to have somewhat higher PD1 on average), not by a within-population intensity confound.
+
 ## 9. Composition Check: Patient Composition of Each Subcluster
 
 Cluster 15 is a single broad cluster (not a merge of two, like the
@@ -244,18 +378,26 @@ ht_patient <- Heatmap(
 draw(ht_patient, column_title = "Subcluster composition by patient (row-normalized %)")
 ```
 
+Subcluster 7 definitely looks patient driven, with Patient20_519 making up 47% and Patient20_425 making up 22%, which means 69% of this subcluster is from one patient. It is also sitting as an isolated island in the UMAP, so this is probably a technical/segmentation artifact.
+
 ## 10. Manual Subcluster Annotation
 
 ```{r annotate-sub, echo=TRUE}
 cluster15_subannotation <- c(
-  # "1"  = "",
-  # "2"  = "",
-  # ...fill in after reviewing violin plots + findMarkers output
+  "1"  = "1. Memory/Activated T Cell (CD4++)",  # CD4++, CD45RO+, FoxP3, PD1
+  "2"  = "2. Unresolved/Low Quality", # no marker above logFC 1.0
+  "3"  = "3. CD4+ T Cell", # CD4, CD138, CD11c (could be contamination), CD45RO+
+  "4"  = "4. Unresolved/Low Quality",  # no marker above logFC 1.0
+  "5"  = "5. T Cell (TIM3+)",  # Has TIM3 as its top marker
+  "6"  = "6. Treg (FoxP3+)", # Has FoxP3 as its top marker
+  "7"  = "7. Unresolved",  # no marker above logFC 1.0, patient-driven, likely technical artifact
+  "8"  = "8. T Cell, Exhausion-leaning (PD1++)", # Highly elevated in PD1
+  "9"  = "9. Memory T Cell (CD45RO+)" # CD45RO+ and CD4+
 )
 
 if (length(cluster15_subannotation) > 0) {
   spe_15$sub_celltype <- cluster15_subannotation[as.character(spe_15$sub_clusters)]
-  spe_15$sub_celltype <- factor(spe_15$sub_celltype, levels = cluster15_subannotation)
+  spe_15$sub_celltype <- factor(spe_15$sub_celltype, levels = unique(cluster15_subannotation))
   cat("Subcluster annotation applied.\n")
   print(table(spe_15$sub_celltype, useNA = "ifany"))
 } else {
@@ -271,6 +413,10 @@ if ("sub_celltype" %in% colnames(colData(spe_15))) {
     colorRampPalette(brewer.pal(12, "Paired"))(n_types),
     levels(spe_15$sub_celltype)
   )
+
+  subtype_cols["T Cell, Exhausion-leaning (PD1++)"] <- "#4B0082" 
+  subtype_cols["T Cell (TIM3+)"] <- "#009DC4"
+  subtype_cols["Memory/Activated T Cell (CD4++)"] <- "#C30F16"
 
   p_sub_celltype <- dittoDimPlot(spe_15, var = "sub_celltype",
                                  reduction.use = "UMAP_sub",
@@ -292,4 +438,33 @@ dir.create(dirname(out_path), recursive = TRUE, showWarnings = FALSE)
 saveRDS(spe_15, out_path)
 cat("Saved cluster 15 subcluster object to:", out_path, "\n")
 ```
+
+## Notes
+
+- **Cluster 15 isn't really T Cell/Plasma Cell (Mixed).** CD138 never separates from CD4, and CD38/CD19 stay flat throughout, so there's no real plasma cell population hiding in here. It's a heterogeneous CD4+ T Cell/Treg population with some technical noise (from subclusters 2, 4 and 7).
+
+- **CD138's presence turned out to be a generalized intensity effect, not biology or spillover.** It correlates more strongly with total counts than with CD4 or CD45R0, and doesn't correlate with EpCAM or SMA, ruling out segmentation spillover from neighboring cells. Cells with more total signal overall simply read higher on CD138 along with everything else.
+
+- **This same intensity effect explains subcluster 5's TIM3 signal.** TIM3
+  correlates more with total_counts (0.57) than with PD1, LAG3, or CTLA4
+  (0.20-0.30) -- if this were a real, coordinated exhaustion phenotype, TIM3
+  should track with the other checkpoint markers more tightly than with
+  generic intensity. Labeled as "CD4+ T Cell (TIM3+, unconfirmed)" rather
+  than "Exhausted T Cell" until corroborated by additional checkpoint
+  markers.
+
+- **Subclusters 2 and 4 are low-quality, not a real cell state.** Every
+  marker checked (including CD4, CD45RO, FoxP3, PD1, TIM3) is significantly
+  *lower* than the rest of cluster 15, and total counts are ~38% lower with
+  no difference in cell area -- consistent with poorly-stained cells, the
+  same phenomenon behind the original broad "unknown" cluster, just
+  resurfacing here at finer resolution. Labeled Unresolved/Low Quality.
+
+- **Subcluster 7 is likely a Patient20-specific technical artifact.** No
+  marker clears threshold, and Patient20_425 + Patient20_519 together make
+  up ~69% of this subcluster -- similar pattern to broad cluster 17's
+  Patient12 concentration. 
+
+- **Subcluster 3's CD11c signal is still an open flag.** CD11c is a
+  myeloid/DC marker, not expected alongside CD4/CD138/CD45RO/FoxP3.
 

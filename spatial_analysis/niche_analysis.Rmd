@@ -1,0 +1,403 @@
+---
+title: "Niche Generation and Differential Abundance"
+author: "Tazein Shah"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    code_folding: show
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 12, fig.height = 8)
+
+suppressPackageStartupMessages({
+  library(imcRtools)
+  library(tidyverse)
+  library(SingleCellExperiment)
+  library(SpatialExperiment)
+  library(sccomp)
+  library(ggrepel)
+})
+
+set.seed(12345)
+```
+
+## Overview
+
+This notebook generates cellular neighborhoods (niches) on the fully
+annotated, spatial-graph-equipped dataset, and tests niche composition
+for association with N-status and AJCC stage. Structure follows the
+preprint's original niche generation script as closely as possible.
+
+Two deliberate deviations from that script are noted inline below
+(both flagged where they occur, and summarized in the Notes section
+at the end):
+
+1. **Spatial graph threshold.** This notebook reuses an existing
+   `expansion_interaction_graph` built upstream at `threshold = 20`.
+   The original preprint script used `threshold = 50`. This
+   discrepancy between the manuscript text/figure legend (20) and the
+   actual code (50) has not yet been resolved, so this notebook
+   proceeds with the already-built 20-threshold graph rather than
+   rebuilding at 50.
+2. Everything else -- `aggregateNeighbors`, `kmeans`, and the
+   table/volcano/boxplot outputs -- follows the original script's
+   structure directly. The differential abundance step itself uses
+   `sccomp_estimate() |> sccomp_test()` rather than the original
+   script's `sccomp_glm()`, since that function does not exist in the
+   installed package version (see Notes).
+
+---
+
+## 1. Paths
+
+```{r paths}
+analysis_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis"
+
+spatial_graph_path <- file.path(analysis_path, "spatial_analysis", "spe_spatial_graph.rds")
+
+niche_path <- file.path(analysis_path, "spatial_analysis", "niche_k50_thresh20")
+dir.create(niche_path, recursive = TRUE, showWarnings = FALSE)
+
+niche_spe_out_path      <- file.path(niche_path, "spe_niche.rds")
+sccomp_nstatus_out_path <- file.path(niche_path, "sccomp_nstatus.rds")
+sccomp_stage_out_path   <- file.path(niche_path, "sccomp_stage.rds")
+```
+
+---
+
+## 2. Load spatial graph object
+
+Loads the object that already has `final_celltype` populated (merged
+broad annotations + all subclustering results, low-quality clusters
+excluded) and the `expansion_interaction_graph` colPair already built
+at `threshold = 20`.
+
+```{r load}
+spe <- readRDS(spatial_graph_path)
+
+cat("Cells:", ncol(spe), "\n")
+cat("Cell types:", nlevels(spe$final_celltype), "\n")
+print(table(spe$final_celltype))
+```
+
+---
+
+## 3. Aggregate neighbor composition
+
+```{r aggregate-neighbors}
+# Reusing the existing graph (threshold = 20) rather than rebuilding it.
+# See Overview note above re: 20 vs. 50 discrepancy.
+spe <- aggregateNeighbors(spe,
+                          colPairName = "expansion_interaction_graph",
+                          aggregate_by = "metadata",
+                          count_by = "final_celltype")
+```
+
+---
+
+## 4. K-means niche clustering
+
+```{r kmeans-niches}
+kmeansClust <- 50
+
+cn_1 <- kmeans(spe$aggregatedNeighbors, centers = kmeansClust, iter.max = 10000)
+spe$Niche <- as.factor(cn_1$cluster)
+
+table(spe$Niche)
+```
+
+---
+
+## 5. Patient-level covariates
+
+```{r covariates}
+spe$stage_group <- sapply(spe$patient_id, function(x) {
+  if (x %in% c("Patient12", "Patient15")) return("IIB")
+  else if (x == "Patient13") return("IIIA")
+  else if (x == "Patient19") return("IB")
+  else if (x == "Patient11" || grepl("^Patient20", x)) return("IA3")
+  else if (x %in% c("Patient14", "Patient16", "Patient17", "Patient18")) return("IA2")
+  else if (x == "Patient10") return("Benign")
+  else return(NA)
+})
+
+spe$stage_group <- factor(spe$stage_group,
+                          levels = c("Benign", "IA2", "IA3", "IB", "IIIA", "IIB"))
+
+# Three-tier disease state grouping (Benign / Lower / Higher)
+spe$disease_state <- sapply(spe$patient_id, function(x) {
+  if (x == "Patient10") return("Benign")
+  else if (x %in% c("Patient11", "Patient14", "Patient16", "Patient17", "Patient18") || grepl("^Patient20", x)) return("Lower")
+  else if (x %in% c("Patient12", "Patient13", "Patient15", "Patient19")) return("Higher")
+  else return(NA)
+})
+
+spe$disease_state <- factor(spe$disease_state, levels = c("Benign", "Lower", "Higher"))
+
+# N-status: only IIB (P12, P15) is N1; everything else is N0
+# NOTE: flagging for confirmation -- does IIIA (Patient13) carry N1 status?
+# AJCC IIIA often implies nodal involvement, but this cohort's original
+# stage list only assigned N1 possibility to IIB. Left as-is pending confirmation.
+spe$N_status <- factor(ifelse(spe$stage_group == "IIB", "N1", "N0"),
+                       levels = c("N0", "N1"))
+
+table(spe$patient_id, spe$N_status)
+table(spe$patient_id, spe$stage_group)
+table(spe$patient_id, spe$disease_state)
+```
+
+```{r save-niche-spe}
+saveRDS(spe, niche_spe_out_path)
+cat("Saved object with niches to:", niche_spe_out_path, "\n")
+```
+
+---
+
+## 6. Differential niche abundance (sccomp)
+
+`.sample = Patient`, since N-status and stage are constant within
+patient (not within ROI) -- mirroring how the original script's `LN`
+is the invariant unit for its `TumorStage`/`HighN1` covariates.
+
+```{r sccomp-prep}
+sceIMC <- SingleCellExperiment(list(counts = assay(spe, "counts")))
+sceIMC$Patient   <- factor(spe$patient_id)
+sceIMC$Sample    <- factor(spe$sample_id)
+sceIMC$Niche     <- factor(spe$Niche)
+sceIMC$N_status  <- factor(spe$N_status, levels = c("N0", "N1"))
+sceIMC$Stage     <- factor(spe$stage_group,
+                           levels = c("Benign", "IA2", "IA3", "IB", "IIIA", "IIB"))
+```
+
+### N-status model (parallel to `HighN1` in the original script)
+
+```{r sccomp-nstatus}
+if (file.exists(sccomp_nstatus_out_path)) {
+  cat("Found existing output, loading:", sccomp_nstatus_out_path, "\n")
+  sccomp_niche_nstatus <- readRDS(sccomp_nstatus_out_path)
+} else {
+  sccomp_niche_nstatus <-
+    sceIMC |>
+    sccomp_estimate(
+      formula_composition = ~ N_status + (1 | Patient),
+      .sample = Sample,
+      .cell_group = Niche,
+      bimodal_mean_variability_association = FALSE,
+      variational_inference = FALSE,
+      output_directory = file.path(niche_path, "sccomp_draws_nstatus"),
+      cores = 8
+    ) |>
+    sccomp_test()
+
+  saveRDS(sccomp_niche_nstatus, sccomp_nstatus_out_path)
+}
+```
+
+### Stage model (parallel to `TumorStage` in the original script)
+
+```{r sccomp-stage}
+if (file.exists(sccomp_stage_out_path)) {
+  cat("Found existing output, loading:", sccomp_stage_out_path, "\n")
+  sccomp_niche_stage <- readRDS(sccomp_stage_out_path)
+} else {
+  sccomp_niche_stage <-
+    sceIMC |>
+    sccomp_estimate(
+      formula_composition = ~ Stage + (1 | Patient),
+      .sample = Sample,
+      .cell_group = Niche,
+      bimodal_mean_variability_association = FALSE,
+      variational_inference = FALSE,
+      output_directory = file.path(niche_path, "sccomp_draws_stage"),
+      cores = 8
+    ) |>
+    sccomp_test()
+
+  saveRDS(sccomp_niche_stage, sccomp_stage_out_path)
+}
+```
+
+---
+
+## 7. Results table
+
+```{r results-table}
+sccomp_niche_nstatus <- readRDS(sccomp_nstatus_out_path)
+sccomp_niche_nstatus_sub <- sccomp_niche_nstatus[which(sccomp_niche_nstatus$factor == "N_status"), ]
+
+sccomp_niche_nstatus_sub |>
+  filter(c_FDR < 0.1) |>
+  arrange(c_FDR) |>
+  as.data.frame() |>
+  select(-starts_with("v_")) |>
+  knitr::kable(digits = 3, caption = "Niche composition association with N-status (FDR < 0.1)")
+```
+
+---
+
+## 8. Volcano plot
+
+```{r volcano}
+plot_df <- sccomp_niche_nstatus_sub |>
+  as.data.frame() |>
+  filter(!is.nan(c_FDR), c_FDR < 0.1) |>
+  mutate(
+    LogFDR = -log(c_FDR),
+    Significant = ifelse(c_FDR < 0.05, "FDR < 0.05", "Not significant")
+  )
+
+ggplot(plot_df, aes(x = c_effect, y = LogFDR, color = Significant)) +
+  geom_point(size = 2) +
+  geom_text_repel(
+    aes(label = Niche), size = 3, show.legend = FALSE
+  ) +
+  scale_color_manual(values = c("FDR < 0.05" = "firebrick", "Not significant" = "grey70")) +
+  theme_classic() +
+  labs(x = "Effect size", y = "-log(FDR)",
+       title = "Niche composition vs. N-status")
+```
+
+---
+
+## 9. Results table (Stage)
+
+`factor == "Stage"` covers all 5 non-reference contrasts (each vs.
+`Benign`) at once, distinguished by `parameter`
+(`StageIA2`, `StageIA3`, `StageIB`, `StageIIIA`, `StageIIB`) --
+250 rows total (50 niches x 5 contrasts).
+
+```{r results-table-stage}
+sccomp_niche_stage <- readRDS(sccomp_stage_out_path)
+sccomp_niche_stage_sub <- sccomp_niche_stage[which(sccomp_niche_stage$factor == "Stage"), ]
+
+sccomp_niche_stage_sub |>
+  filter(c_FDR < 0.1) |>
+  arrange(c_FDR) |>
+  as.data.frame() |>
+  select(-starts_with("v_")) |>
+  knitr::kable(digits = 3, caption = "Niche composition association with Stage (vs. Benign, FDR < 0.1)")
+```
+
+---
+
+## 10. Volcano plot (Stage) {.tabset}
+
+Faceted by contrast, since each stage level vs. Benign is a separate
+comparison rather than a single binary effect.
+
+```{r volcano-stage, results = "asis", fig.width = 7, fig.height = 5.5}
+plot_df_stage <- sccomp_niche_stage_sub |>
+  as.data.frame() |>
+  filter(!is.nan(c_FDR), c_FDR < 0.1) |>
+  mutate(
+    LogFDR = -log(c_FDR),
+    Significant = ifelse(c_FDR < 0.05, "FDR < 0.05", "Not significant")
+  )
+
+for (contrast in unique(plot_df_stage$parameter)) {
+  cat("\n\n### ", contrast, "\n\n")
+  df_sub <- plot_df_stage[plot_df_stage$parameter == contrast, ]
+  print(
+    ggplot(df_sub, aes(x = c_effect, y = LogFDR, color = Significant)) +
+      geom_point(size = 2) +
+      geom_text_repel(aes(label = Niche), size = 3, show.legend = FALSE) +
+      scale_color_manual(values = c("FDR < 0.05" = "firebrick", "Not significant" = "grey70")) +
+      theme_classic() +
+      labs(x = "Effect size", y = "-log(FDR)",
+           title = paste0("Niche composition: ", contrast, " vs. Benign"))
+  )
+  cat("\n\n")
+}
+```
+
+---
+
+## 11. Boxplots per niche {.tabset}
+
+```{r boxplots, results = "asis", fig.width = 5, fig.height = 5.5}
+# Only plot niches significant (FDR < 0.1) in either the N-status or
+# Stage model, rather than all 50.
+sig_niches_nstatus <- sccomp_niche_nstatus_sub |>
+  filter(c_FDR < 0.1) |>
+  pull(Niche) |>
+  as.character()
+
+sig_niches_stage <- sccomp_niche_stage_sub |>
+  filter(c_FDR < 0.1) |>
+  pull(Niche) |>
+  as.character()
+
+sig_niches <- union(sig_niches_nstatus, sig_niches_stage)
+
+cat("Niches significant (FDR < 0.1) in N-status model:", length(sig_niches_nstatus), "\n")
+cat("Niches significant (FDR < 0.1) in Stage model:", length(sig_niches_stage), "\n")
+cat("Total unique niches plotted below:", length(sig_niches), "\n")
+
+niche_prop <- table(spe$sample_id, spe$Niche) |>
+  prop.table(margin = 1) |>
+  as.data.frame()
+colnames(niche_prop) <- c("Sample", "Niche", "Value")
+
+niche_prop$Patient <- spe$patient_id[match(niche_prop$Sample, spe$sample_id)]
+niche_prop$Stage <- spe$stage_group[match(niche_prop$Patient, spe$patient_id)]
+
+for (n in sig_niches) {
+  cat("\n\n### Niche", n, "\n\n")
+  df_sub <- niche_prop[niche_prop$Niche == n, ]
+  df_sub$Value <- df_sub$Value * 100
+  print(
+    ggplot(df_sub, aes(x = Stage, y = Value)) +
+      geom_boxplot(outlier.shape = NA) +
+      geom_jitter(aes(color = Patient), width = 0.1, size = 1.5) +
+      theme_classic() +
+      ylab("% within sample") +
+      ggtitle(paste0("Niche ", n))
+  )
+  cat("\n\n")
+}
+```
+
+---
+
+## Notes
+
+- **Graph threshold (20 vs. 50):** this notebook builds on an
+  upstream object whose spatial graph was constructed at
+  `threshold = 20`, matching the manuscript text/figure legend. The
+  original preprint's niche generation script itself used
+  `threshold = 50`. That inconsistency between text and code is
+  unresolved upstream; this notebook did not rebuild the graph and so
+  inherits the 20-threshold version. Easy to regenerate with a
+  different threshold later without touching anything downstream of
+  the graph-building step.
+- **`sccomp_glm()` vs. `sccomp_estimate()`/`sccomp_test()`:** the
+  original script calls `sccomp_glm()` directly, but this installed
+  package version does not have that function at all -- confirmed via
+  a direct "could not find function" error. This notebook uses
+  `sccomp_estimate() |> sccomp_test()` instead. Output object shape
+  (`factor`, `c_effect`, `c_FDR` columns) is the same either way, so
+  nothing downstream (results table, volcano, boxplots) needed to
+  change.
+- **`variational_inference = FALSE`:** the default variational Bayes
+  fitting failed to converge after 5 attempts. Forcing full HMC
+  sampling instead resolved this -- confirmed working (6 chains, no
+  divergences, ~145 seconds total).
+- **`output_directory`:** set explicitly to a subfolder under
+  `niche_path`, since the default working-directory-relative path
+  `sccomp` tries to use was not writable in this environment.
+- `bimodal_mean_variability_association = FALSE` used for both models
+  for consistency with the cell-type-level `sccomp` convention already
+  established in this pipeline.
+- `.sample = Patient` chosen because N-status and stage are constant
+  within patient (not within ROI); confirmed via the
+  `table(spe$patient_id, spe$N_status)` cross-tab above.
