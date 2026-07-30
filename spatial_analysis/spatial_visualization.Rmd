@@ -1,0 +1,229 @@
+---
+title: "Spatial Visualization: Cell Centroids, Graphs, and Cell-Cell Interactions"
+author: "Vaidehi Gupta"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+Builds the spatial graph from the finalized annotated dataset, visualizes
+cell centroids + graph edges per ROI, and runs formal cell-cell interaction
+testing -- addressing the to-do item "visualize the cells' centroids and
+cell-cell interactions as spatial graphs."
+
+**IMPORTANT:** this loads `spe_final_celltype.rds`. As of writing, the final
+annotation is still being finalized (a few label naming/marker-mismatch
+questions are still open) -- re-run this notebook once that file is locked,
+since anything built here on an interim version will need to be redone
+against the final labels before being treated as a result.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+```
+
+# 1. Load Libraries
+
+```{r libraries}
+.libPaths(c("/restricted/projectnb/camplab/home/vgupta7/R_libs", .libPaths()))
+
+library(imcRtools)
+library(tidyverse)
+library(SingleCellExperiment)
+library(SpatialExperiment)
+library(scater)
+library(RColorBrewer)
+```
+
+# 2. Paths
+
+```{r paths}
+analysis_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis"
+
+final_celltype_path <- file.path(analysis_path, "final_cell_annotation", "spe_final_celltype.rds")
+
+spatial_analysis_path <- file.path(analysis_path, "spatial_analysis")
+dir.create(spatial_analysis_path, recursive = TRUE, showWarnings = FALSE)
+
+spatial_graph_out_path <- file.path(spatial_analysis_path, "spe_spatial_graph.rds")
+interactions_out_path  <- file.path(spatial_analysis_path, "cell_interactions.csv")
+```
+
+# 3. Load Finalized Annotated Object
+
+```{r load-spe}
+spe <- readRDS(final_celltype_path)
+
+cat("Cells loaded:", ncol(spe), "\n")
+cat("Cell types:", nlevels(spe$final_celltype), "\n")
+cat("Samples/ROIs:", length(unique(spe$sample_id)), "\n")
+```
+
+# 4. Build Spatial Graph
+
+Using `type = "expansion"` and `threshold = 20`, matching the reference
+publication pipeline's graph-building approach (threshold value per team's
+current working decision -- pending confirmation from Campbell given the
+20 vs. 50 discrepancy between the manuscript text and code).
+
+```{r build-spatial-graph}
+spe <- buildSpatialGraph(
+  spe,
+  img_id    = "sample_id",
+  type      = "expansion",
+  threshold = 20
+)
+
+colPairNames(spe)
+```
+
+```{r graph-diagnostics}
+graph_name <- colPairNames(spe)[1]
+
+neighbor_counts <- imcRtools::countNeighbors(spe, colPairName = graph_name)
+cat("Mean neighbors per cell:", mean(neighbor_counts, na.rm = TRUE), "\n")
+cat("Median neighbors per cell:", median(neighbor_counts, na.rm = TRUE), "\n")
+```
+
+```{r save-spatial-graph}
+saveRDS(spe, spatial_graph_out_path)
+cat("Saved spatial graph object to:", spatial_graph_out_path, "\n")
+```
+
+# 5. Visualize Cell Centroids + Graph Edges
+
+Spot-check individual ROIs to confirm the graph looks reasonable (respects
+ROI boundaries, edges connect physically nearby cells) before running any
+interaction statistics on it.
+
+```{r plot-spatial-single, fig.width=10, fig.height=8}
+one_sample_id <- unique(spe$sample_id)[1]
+one_sample <- spe[, spe$sample_id == one_sample_id]
+
+n_celltypes <- nlevels(spe$final_celltype)
+celltype_colors <- colorRampPalette(brewer.pal(12, "Paired"))(n_celltypes)
+names(celltype_colors) <- levels(spe$final_celltype)
+
+plotSpatial(
+  one_sample,
+  node_color_by = "final_celltype",
+  img_id        = "sample_id",
+  draw_edges    = TRUE,
+  colPairName   = graph_name,
+  node_size_fix = 0.5
+) +
+  scale_color_manual(values = celltype_colors) +
+  labs(title = paste("Spatial graph:", one_sample_id)) +
+  theme(legend.text = element_text(size = 6),
+        legend.key.size = unit(0.3, "cm"))
+```
+
+```{r plot-spatial-multiple, fig.width=16, fig.height=12}
+# Spot-check a few more ROIs across different patients/disease states
+sample_ids_to_check <- unique(spe$sample_id)[1:min(4, length(unique(spe$sample_id)))]
+
+for (sid in sample_ids_to_check) {
+  one_sample <- spe[, spe$sample_id == sid]
+  p <- plotSpatial(
+    one_sample,
+    node_color_by = "final_celltype",
+    img_id        = "sample_id",
+    draw_edges    = TRUE,
+    colPairName   = graph_name,
+    node_size_fix = 0.5
+  ) +
+    scale_color_manual(values = celltype_colors) +
+    labs(title = paste("Spatial graph:", sid)) +
+    theme(legend.position = "none")
+  print(p)
+}
+```
+
+# 6. Cell-Cell Interaction Testing
+
+Formal test of which cell type pairs are spatially enriched or depleted
+relative to chance, using `imcRtools::testInteractions()` (permutation-based
+neighborhood enrichment/depletion, conceptually similar to but distinct from
+the preprint's custom neighbor-composition function --
+see `countInteractionsPerCell()` in `Publication_Code_IMC_Analysis.Rmd` if
+exact methodological consistency with the reference pipeline is required;
+confirm with Campbell/Yusuke which approach the team wants).
+
+```{r test-interactions}
+set.seed(220225)
+interactions <- testInteractions(
+  spe,
+  group_by    = "sample_id",
+  label       = "final_celltype",
+  colPairName = graph_name,
+  method      = "classic"
+)
+
+interactions_df <- as.data.frame(interactions)
+write.csv(interactions_df, interactions_out_path, row.names = FALSE)
+cat("Saved interaction results to:", interactions_out_path, "\n")
+
+head(interactions_df)
+```
+
+# 7. Visualize Interaction Results
+
+```{r interaction-heatmap, fig.width=12, fig.height=10}
+ggplot(interactions_df, aes(x = from_label, y = to_label, fill = strength)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "steelblue", mid = "white", high = "firebrick",
+                       midpoint = 0, name = "Interaction\nstrength") +
+  theme_minimal(base_size = 9) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 6),
+        axis.text.y = element_text(size = 6)) +
+  labs(x = NULL, y = NULL,
+       title = "Cell-Cell Interaction Enrichment/Depletion",
+       subtitle = "Red = enriched (more neighbors than expected), Blue = depleted")
+```
+
+```{r interaction-significant, fig.width=12, fig.height=8}
+# Focus on statistically significant interactions only, if a p-value/FDR
+# column is present in the output (column name may vary by imcRtools version)
+if ("p.value" %in% colnames(interactions_df)) {
+  sig_interactions <- interactions_df |>
+    filter(p.value < 0.05) |>
+    arrange(p.value)
+
+  cat("Number of significant interactions (p < 0.05):", nrow(sig_interactions), "\n")
+
+  sig_interactions |>
+    head(30) |>
+    knitr::kable(digits = 3, caption = "Top 30 significant cell-cell interactions")
+} else {
+  cat("No p-value column found -- check colnames(interactions_df) for the actual column name.\n")
+  colnames(interactions_df)
+}
+```
+
+# 8. Save Final Spatial Graph + Interaction Object
+
+```{r save-final}
+saveRDS(spe, spatial_graph_out_path)
+cat("Spatial graph object saved to:", spatial_graph_out_path, "\n")
+cat("Interaction results saved to:", interactions_out_path, "\n")
+```
+
+# Notes
+
+- **Re-run against the finalized `spe_final_celltype.rds`** once the open
+  label questions (HLADRB-high naming, CD138/CD39 broad non-specificity,
+  T Cell/DC Admixture CD11c mismatch, etc.) are resolved -- everything in
+  this notebook is built directly on top of `final_celltype`, so any label
+  changes propagate here too.
+- `threshold = 20` used for `buildSpatialGraph()` per current team decision;
+  flag to Campbell if this should be reconciled with the `threshold = 50`
+  discrepancy noted between the reference manuscript text and its code.
+- `testInteractions(method = "classic")` was used here as a standard
+  permutation-based approach. This differs methodologically from the
+  reference pipeline's custom `countInteractionsPerCell()` function (which
+  computes neighbor composition ratios rather than enrichment/depletion
+  significance) -- confirm with Campbell/Yusuke which approach the team
+  wants for consistency with the published methodology, especially if this
+  analysis is meant to be directly compared to the preprint's Figure 4G/H.

@@ -1,0 +1,360 @@
+---
+title: "B Cell/Plasma Cell Subclustering — Run5 Extraction - w/o Cluster 15"
+author: "Tazein Shah"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+set.seed(42)
+```
+
+## Overview
+
+Extract B cell/plasma cell clusters (3, 10, 16) from the
+annotated run5 SPE (`h5_cluster_annot.rds`) and recluster on the
+existing Harmony embedding (Louvain, k = 20). This run has no
+Unknown/Low Quality or Treg/T Cell admixture subclusters, so the
+pipeline goes straight from subclustering to annotation to save.
+
+---
+
+## 1. Load Libraries
+
+```{r libraries}
+library(imcRtools)
+library(scran)
+library(bluster)
+library(BiocParallel)
+library(tidyverse)
+library(dittoSeq)
+library(viridis)
+library(scater)
+library(patchwork)
+library(RColorBrewer)
+```
+
+---
+
+## 2. Paths
+
+```{r paths}
+analysis_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis"
+
+spe_path <- file.path(analysis_path, "final_cell_annotation", "h5_cluster_annot.rds")
+
+bcell_clustering_path <- file.path(analysis_path, "final_cell_annotation", "subclustering","bcells")
+
+out_path <- file.path(bcell_clustering_path, "bcell_subclustering_wo15.rds")
+```
+
+---
+
+## 3. Load Annotated SPE
+
+```{r load-data}
+spe <- readRDS(spe_path)
+
+print(table(spe$broad_clusters))
+```
+
+---
+
+## 4. Extract B Cell/Plasma Clusters
+
+```{r subset}
+bcell_clusters <- c("3", "10", "16")
+
+spe_bcell <- spe[, as.character(spe$broad_clusters) %in% bcell_clusters]
+
+cat("Cells in bcell subset:", ncol(spe_bcell), "\n")
+cat("From cluster 3 (B Cell CD38+):", sum(spe_bcell$broad_clusters == "3"), "\n")
+cat("From cluster 10 (Memory T/Plasma Cell):", sum(spe_bcell$broad_clusters == "10"), "\n")
+cat("From cluster 16 (Plasma Cell CD19+):", sum(spe_bcell$broad_clusters == "16"), "\n")
+```
+
+---
+
+## 5. Recluster: Louvain on Existing Harmony Embedding (k = 20)
+
+```{r recluster}
+snn_graph <- buildSNNGraph(spe_bcell, use.dimred = "Harmony", k = 20,
+                            BPPARAM = SerialParam())
+
+clusters <- igraph::cluster_louvain(snn_graph)$membership
+
+spe_bcell$bcell_subclusters <- factor(clusters)
+
+cat("Number of subclusters:", nlevels(spe_bcell$bcell_subclusters), "\n")
+print(table(spe_bcell$bcell_subclusters))
+```
+
+---
+
+## 6. UMAP on the Subset
+
+```{r umap-sub}
+set.seed(220225)
+spe_bcell <- runUMAP(spe_bcell, dimred = "Harmony", name = "UMAP_sub")
+```
+
+```{r plot-umap-sub-original, fig.width=10, fig.height=7}
+p_sub_original <- dittoDimPlot(spe_bcell, var = "broad_celltype",
+                               reduction.use = "UMAP_sub",
+                               size = 0.4) +
+  ggtitle("B Cell/Plasma Subset: UMAP colored by Original Broad Label") +
+  theme(legend.position = "right")
+print(p_sub_original)
+```
+
+```{r plot-patient-composition, fig.width=10, fig.height=5}
+patient_counts <- as.data.frame(table(patient_id = spe_bcell$patient_id))
+
+p_patient_comp <- ggplot(patient_counts, aes(x = patient_id, y = Freq, fill = patient_id)) +
+  geom_col() +
+  labs(title = "B Cell/Plasma Subset: Cell Count by Patient",
+       x = "Patient", y = "Cell Count") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+print(p_patient_comp)
+
+cat("B cell/plasma subset composition by patient:\n")
+print(patient_counts[order(-patient_counts$Freq), ])
+```
+
+---
+
+## 7. Marker Sets for B Cell/Plasma Subtyping
+
+```{r markers}
+# core B cell/plasma lineage markers
+lineage_markers <- c("CD19", "CD38", "CD138")
+
+# activation / functional state markers
+state_markers <- c("CD45RO", "MKI67", "PD1", "PDL1", "TIM3", "HLADRB")
+
+# admixture / spillover flags (not B-lineage markers, but useful for
+# catching doublets or spatial bleed from other lineages)
+admixture_markers <- c("FoxP3", "CD1c", "CD15")
+
+bcell_markers <- c(lineage_markers, state_markers, admixture_markers)
+bcell_markers <- bcell_markers[bcell_markers %in% rownames(spe_bcell)]
+
+cat("Markers found:", paste(bcell_markers, collapse = ", "), "\n")
+```
+
+---
+
+## 8. Violin Plots per Subcluster
+
+```{r make-violinplot}
+make_violinplot <- function(spe, assay_name, cluster_col, marker_set, title, ncol = 3) {
+  expr_mat   <- assay(spe, assay_name)[marker_set, , drop = FALSE]
+  cluster_id <- spe[[cluster_col]]
+
+  mean_expr <- sapply(levels(cluster_id), function(cl) {
+    idx <- which(cluster_id == cl)
+    rowMeans(expr_mat[, idx, drop = FALSE])
+  })
+
+  if (is.matrix(mean_expr) && nrow(mean_expr) > 1) {
+    marker_order <- rownames(mean_expr)[hclust(dist(mean_expr))$order]
+  } else {
+    marker_order <- marker_set
+  }
+
+  plot_df <- as.data.frame(t(expr_mat)) |>
+    mutate(cluster = cluster_id) |>
+    pivot_longer(-cluster, names_to = "marker", values_to = "expr")
+
+  plot_df$marker  <- factor(plot_df$marker, levels = marker_order)
+  plot_df$cluster <- factor(plot_df$cluster, levels = levels(cluster_id))
+
+  ggplot(plot_df, aes(x = cluster, y = expr, fill = cluster)) +
+    geom_violin(scale = "width", trim = TRUE, linewidth = 0.2) +
+    stat_summary(fun = median, geom = "point", size = 0.6, color = "black") +
+    facet_wrap(~ marker, scales = "free_y", ncol = ncol) +
+    labs(title = title, x = "Subcluster", y = "Z-score expression") +
+    theme_bw(base_size = 11) +
+    theme(
+      axis.text.x      = element_text(angle = 0, hjust = 0.5, size = 9),
+      strip.text        = element_text(face = "bold"),
+      panel.grid.major.x = element_blank(),
+      legend.position   = "none"
+    )
+}
+```
+
+```{r violin-bcell-global-lineage, fig.width=10, fig.height=5}
+p_violin_lineage_global <- make_violinplot(spe_bcell, "scaled_0100", "bcell_subclusters",
+                                           lineage_markers,
+                                           "B Cell/Plasma Subset: Lineage Markers per Subcluster (Global Z-score)",
+                                           ncol = 3)
+print(p_violin_lineage_global)
+```
+
+```{r violin-bcell-global-state, fig.width=12, fig.height=8}
+p_violin_state_global <- make_violinplot(spe_bcell, "scaled_0100", "bcell_subclusters",
+                                         state_markers,
+                                         "B Cell/Plasma Subset: State Markers per Subcluster (Global Z-score)",
+                                         ncol = 3)
+print(p_violin_state_global)
+```
+
+```{r violin-bcell-global-admixture, fig.width=10, fig.height=5}
+p_violin_admixture_global <- make_violinplot(spe_bcell, "scaled_0100", "bcell_subclusters",
+                                             admixture_markers,
+                                             "B Cell/Plasma Subset: Admixture Markers per Subcluster (Global Z-score)",
+                                             ncol = 3)
+print(p_violin_admixture_global)
+```
+
+Subset-relative renormalization: since `scaled_0100` was capped and Z-scored
+over the full run5 dataset, this recomputes the same cap+Z-score recipe
+from raw counts using only this B cell/plasma subset's own distribution --
+one normalization layer, just a different denominator.
+
+```{r renorm-subset}
+cap_99 <- function(mat) {
+  t(apply(mat, 1, function(x) {
+    q99 <- quantile(x, 0.99)
+    pmin(x, q99)
+  }))
+}
+
+zscore_rows <- function(mat) {
+  t(scale(t(mat)))
+}
+
+mat_sub_0100 <- counts(spe_bcell) |> cap_99() |> zscore_rows()
+assay(spe_bcell, "scaled_0100_sub") <- mat_sub_0100
+```
+
+```{r violin-bcell-subset-lineage, fig.width=10, fig.height=5}
+p_violin_lineage_sub <- make_violinplot(spe_bcell, "scaled_0100_sub", "bcell_subclusters",
+                                        lineage_markers,
+                                        "B Cell/Plasma Subset: Lineage Markers per Subcluster (Subset-Renormalized Z-score)",
+                                        ncol = 3)
+print(p_violin_lineage_sub)
+```
+
+```{r violin-bcell-subset-state, fig.width=12, fig.height=8}
+p_violin_state_sub <- make_violinplot(spe_bcell, "scaled_0100_sub", "bcell_subclusters",
+                                      state_markers,
+                                      "B Cell/Plasma Subset: State Markers per Subcluster (Subset-Renormalized Z-score)",
+                                      ncol = 3)
+print(p_violin_state_sub)
+```
+
+```{r violin-bcell-subset-admixture, fig.width=10, fig.height=5}
+p_violin_admixture_sub <- make_violinplot(spe_bcell, "scaled_0100_sub", "bcell_subclusters",
+                                          admixture_markers,
+                                          "B Cell/Plasma Subset: Admixture Markers per Subcluster (Subset-Renormalized Z-score)",
+                                          ncol = 3)
+print(p_violin_admixture_sub)
+```
+
+---
+
+## 9. Manual Subcluster Annotation
+
+No Unknown/Low Quality or Treg/T Cell admixture subclusters showed up
+in this run's lineage/state markers, so there's no removal or
+reclustering step -- this annotation is applied directly to `spe_bcell`
+and carried through to the save step.
+
+```{r annotate-sub, echo=TRUE}
+bcell_subannotation <- c(
+  "1" = "Plasmablast/Activated B Cell (CD38+)",  # CD38 ~2.0 sole standout, everything else negative
+  "2" = "Plasma Cell, Memory-like (Weak) (CD45RO+)",  # only CD45RO positive (~0.55), rest flat -- dim echo
+  "3" = "Plasmablast, Strongly Activated (CD38++)",  # CD38 ~4.0, a distinctly separate high-compressed distribution from cluster 1's ~2.0
+  "4" = "Plasma Cell, TIM3+ (CD138+TIM3+CD45RO-)",  # CD138 ~0.95, TIM3 ~0.5 co-elevated, but CD45RO (-0.45) and PD1 (-0.4) both negative -- atypical, doesn't match the earlier CD45RO+PD1+ exhausted/effector pattern; worth checking against admixture markers
+  "5" = "Transitional B Cell/Plasmablast (CD19+CD138+HLADRB+)",  # CD19 ~1.4, CD138 ~1.3, HLADRB ~0.35, CD45RO ~0.55 co-elevated
+  "6" = "B Cell, Weak (CD19+)",  # CD19 ~0.5 modestly positive, everything else near baseline
+  "7" = "B Cell/Plasma Cell, HLADRB-high (CD19+CD138+HLADRB+)",  # CD19 ~2.3, CD138 ~1.6, HLADRB ~0.85 (highest of any cluster) -- stronger version of cluster 5's co-expression pattern; could reflect transitional biology or APC-lineage admixture riding on HLADRB, needs the admixture panel to confirm
+  "8" = "B Cell (CD19+)"  # CD19 ~2.85, sole standout, CD138 near baseline -- cleanest B cell signature
+)
+
+if (length(bcell_subannotation) > 0) {
+  spe_bcell$sub_celltype <- bcell_subannotation[as.character(spe_bcell$bcell_subclusters)]
+  cat("Subcluster annotation applied.\n")
+  print(table(spe_bcell$sub_celltype, useNA = "ifany"))
+} else {
+  cat("No subcluster annotation yet. Fill in bcell_subannotation above.\n")
+}
+```
+
+---
+
+## 10. UMAP Colored by Subcluster Cell Type
+
+```{r umap-sub-celltype, fig.width=10, fig.height=5}
+if ("sub_celltype" %in% colnames(colData(spe_bcell))) {
+
+  spe_bcell$sub_celltype <- factor(spe_bcell$sub_celltype, levels = bcell_subannotation)
+
+  p_sub_celltype <- dittoDimPlot(spe_bcell, var = "sub_celltype",
+                                 reduction.use = "UMAP_sub",
+                                 size = 0.4) +
+    ggtitle("B Cell/Plasma Subset: UMAP colored by Subcluster Cell Type") +
+    theme(legend.position = "right")
+  print(p_sub_celltype)
+
+} else {
+  cat("Run the annotate-sub chunk first to apply annotations.\n")
+}
+```
+
+---
+
+## 11. Cell Type Composition by Patient
+
+```{r celltype-patient-composition, fig.width=14, fig.height=16}
+celltype_patient_counts <- as.data.frame(
+  table(patient_id = spe_bcell$patient_id,
+        cell_type  = spe_bcell$sub_celltype)
+)
+
+p_celltype_patient <- ggplot(celltype_patient_counts, aes(x = patient_id, y = Freq, fill = patient_id)) +
+  geom_col() +
+  facet_wrap(~ cell_type, scales = "free", ncol = 2,
+             labeller = labeller(cell_type = label_wrap_gen(width = 35))) +
+  labs(title = "B Cell/Plasma Subset: Cell Type Composition by Patient",
+       x = "Patient", y = "Cell Count") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+        strip.text = element_text(face = "bold", size = 8),
+        legend.position = "none")
+
+print(p_celltype_patient)
+
+# RStudio's Plots pane doesn't respect fig.width/fig.height when running
+# chunks interactively (those only apply to a knitted document) -- save to
+# file with fixed dimensions so the full plot is viewable without cutoff
+celltype_patient_plot_path <- file.path(bcell_clustering_path, "celltype_composition_by_patient.png")
+ggsave(celltype_patient_plot_path, p_celltype_patient, width = 14, height = 16, dpi = 300)
+cat("Saved full-size plot to:", celltype_patient_plot_path, "\n")
+
+#cat("Cell type composition by patient:\n")
+#celltype_patient_nonzero <- celltype_patient_counts[celltype_patient_counts$Freq > 0, ]
+#print(celltype_patient_nonzero[order(celltype_patient_nonzero$cell_type, -celltype_patient_nonzero$Freq), ])
+```
+
+---
+
+## 12. Save Subclustered/Annotated Object
+
+```{r save}
+dir.create(dirname(out_path), recursive = TRUE, showWarnings = FALSE)
+saveRDS(spe_bcell, out_path)
+cat("Saved B cell subcluster object (annotated) to:", out_path, "\n")
+```

@@ -1,0 +1,488 @@
+---
+title: "Final Cell Type Annotation — Remaining Diagnostic Checks"
+author: "Tazein Shah"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## 0. Setup
+
+```{r libraries}
+library(SpatialExperiment)
+library(SummarizedExperiment)
+library(scran)
+library(bluster)
+library(tidyverse)
+library(ggplot2)
+```
+
+```{r paths}
+analysis_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/final_cell_annotation"
+spe_path      <- file.path(analysis_path, "spe_final_celltype.rds")
+```
+
+```{r load-data}
+spe <- readRDS(spe_path)
+
+if (!"exprs" %in% assayNames(spe)) {
+  assay(spe, "exprs") <- asinh(assay(spe, "counts") / 1)
+}
+
+spe$patient_id <- as.character(as.vector(spe$patient_id))
+spe$sample_id  <- as.character(as.vector(spe$sample_id))
+
+print(table(spe$final_celltype, useNA = "ifany"))
+```
+
+```{r celltype-category}
+celltype_category <- c(
+  "B Cell (CD19+)"                                       = "B Cell/Plasma Cell",
+  "B Cell, Weak (CD19+)"                                 = "B Cell/Plasma Cell",
+  "B Cell/Plasma Cell, HLADRB-high (CD19+CD138+HLADRB+)" = "B Cell/Plasma Cell",
+  "Plasma Cell, Memory-like (Weak) (CD45RO+)"            = "B Cell/Plasma Cell",
+  "Plasma Cell, TIM3+ (CD138+TIM3+CD45RO-)"              = "B Cell/Plasma Cell",
+  "Plasmablast, Strongly Activated (CD38++)"             = "B Cell/Plasma Cell",
+  "Plasmablast/Activated B Cell (CD38+)"                 = "B Cell/Plasma Cell",
+  "Transitional B Cell/Plasmablast (CD19+CD138+HLADRB+)" = "B Cell/Plasma Cell",
+
+  "CD4+ T Cell"                                          = "T Cell",
+  "CD8+ T Cell"                                          = "T Cell",
+  "Memory T Cell"                                        = "T Cell",
+  "Memory T Cell (CD45RO+)"                              = "T Cell",
+  "Memory/Activated T Cell (CD4++)"                      = "T Cell",
+  "T Cell (TIM3+)"                                       = "T Cell",
+  "T Cell, Exhaustion-leaning (PD1++)"                   = "T Cell",
+  "Treg"                                                 = "T Cell",
+  "Treg (FoxP3+)"                                        = "T Cell",
+  "T Cell/DC Admixture (CD11c+)"                         = "T Cell",
+
+  "Macrophage (CD68+)"                                   = "Myeloid",
+  "Macrophage, Antigen-Presenting (HLADRB+)"             = "Myeloid",
+  "Macrophage, M2-like (CD163+)"                         = "Myeloid",
+  "Macrophage, Mixed Signal (PDL1+)"                     = "Myeloid",
+  "Macrophage, Proliferating (HLADRB+)"                  = "Myeloid",
+  "Macrophage, Proliferating (MKI67+)"                   = "Myeloid",
+  "Monocyte (Generic)"                                   = "Myeloid",
+  "Monocyte (PD1+)"                                      = "Myeloid",
+  "Monocyte-Macrophage Transitional (CD14+)"             = "Myeloid",
+  "Monocyte-Macrophage, Unresolved"                      = "Myeloid",
+  "Monocyte, Unresolved"                                 = "Myeloid",
+  "cDC1"                                                 = "Myeloid",
+  "DC/mregDC"                                            = "Myeloid",
+  "Dendritic Cell (CD11c+)"                              = "Myeloid",
+  "PMN-MDSC"                                             = "Myeloid",
+
+  "Epithelial (EpCAM+)"                                  = "Epithelial/Stroma",
+  "Fibroblast/Stroma"                                    = "Epithelial/Stroma",
+  "Tumor Epithelial (Neuroendocrine)"                    = "Epithelial/Stroma",
+  "Tumor Epithelial (TTF1++)"                            = "Epithelial/Stroma",
+
+  "Mast Cell"                                            = "Other",
+  "Proliferating Cells"                                  = "Other"
+)
+
+spe$celltype_category <- celltype_category[as.character(spe$final_celltype)]
+
+unmapped <- setdiff(unique(as.character(spe$final_celltype)), names(celltype_category))
+if (length(unmapped) > 0) {
+  cat("Unmapped final_celltype labels -- add these to celltype_category:\n")
+  print(unmapped)
+} else {
+  cat("All final_celltype labels mapped to a category.\n")
+}
+
+print(table(spe$celltype_category, useNA = "ifany"))
+```
+
+---
+
+## 1. B Cell, Strongly Activated — Resubclustering
+
+Attempt to split the clean CD38++ core from the CD68+/CD14+
+macrophage-admixed subset via Louvain reclustering restricted to this
+cluster's cells, run on the existing Harmony embedding (same approach
+as the B cell subclustering notebook).
+
+```{r sa-subset}
+sa_label <- "Plasmablast, Strongly Activated (CD38++)"
+
+idx_sa <- which(spe$final_celltype == sa_label)
+cat("Number of cells in", sa_label, ":", length(idx_sa), "\n")
+
+spe_sa <- spe[, idx_sa]
+```
+
+```{r sa-recluster}
+harmony_sa <- reducedDim(spe_sa, "Harmony")
+
+set.seed(1)
+sa_clusters <- clusterRows(
+  harmony_sa,
+  BLUSPARAM = NNGraphParam(k = 20, cluster.fun = "louvain")
+)
+
+spe_sa$sa_subcluster <- factor(sa_clusters)
+
+cat("Subcluster sizes:\n")
+print(table(spe_sa$sa_subcluster))
+```
+
+```{r sa-marker-check}
+sa_markers <- c("CD38", "CD68", "CD14")
+
+sa_marker_means <- sapply(sa_markers, function(m) {
+  tapply(assay(spe_sa, "exprs")[m, ], spe_sa$sa_subcluster, mean)
+})
+
+cat("Mean expression per subcluster (CD38, CD68, CD14):\n")
+print(sa_marker_means)
+```
+
+A subcluster with high CD38 mean and low CD68/CD14 mean, alongside a
+separate subcluster with elevated CD68/CD14, would confirm the
+macrophage-admixed subset is separable and should be split out or
+flagged on its own. Uniform CD68/CD14 elevation across all subclusters
+would instead argue the admixture is cluster-wide and not resolvable
+by subclustering.
+
+```{r sa-subcluster-sizes}
+cat("Subcluster sizes (n cells):\n")
+print(table(spe_sa$sa_subcluster))
+```
+
+```{r sa-density-plots, fig.width=8, fig.height=5}
+sa_density_df <- data.frame(
+  subcluster = spe_sa$sa_subcluster,
+  CD68 = assay(spe_sa, "exprs")["CD68", ],
+  CD14 = assay(spe_sa, "exprs")["CD14", ]
+) %>%
+  pivot_longer(cols = c(CD68, CD14), names_to = "marker", values_to = "expression")
+
+p_sa_density <- ggplot(sa_density_df, aes(x = expression, fill = subcluster)) +
+  geom_density(alpha = 0.4) +
+  facet_grid(marker ~ subcluster) +
+  labs(title = "CD68/CD14 density per subcluster",
+       x = "asinh expression", y = "density") +
+  theme_bw() +
+  theme(legend.position = "none")
+
+print(p_sa_density)
+```
+
+A subcluster showing a distinct bimodal shape (a second right-hand
+peak) in CD68 and/or CD14, even if its mean isn't dramatically higher
+than the others, would still support splitting that subcluster out as
+the macrophage-admixed subset -- means alone can mask a small but
+genuinely separable minority population. A single unimodal peak
+shifting gradually across subclusters, with no distinct second peak
+anywhere, confirms the graded/cluster-wide interpretation and argues
+against further splitting.
+
+```{r sa-patient-check}
+cat("Subcluster composition by patient:\n")
+print(table(spe_sa$sa_subcluster, spe_sa$patient_id))
+```
+
+**Conclusion:** Cannot subcluster the Plasmablast group further -->
+rename it to `Plasmablast, Strongly Activated (CD38++,
+Macrophage-Admixed)`.
+
+---
+
+## 2. B Cell, TIM3+ — Patient/ROI Origin Check
+
+Same diagnostic used for the Myeloid, Proliferating cluster: total
+counts, cell area, and patient/ROI distribution.
+
+```{r tim3-subset}
+tim3_label <- "Plasma Cell, TIM3+ (CD138+TIM3+CD45RO-)"
+
+spe_bcell_group <- spe[, spe$celltype_category == "B Cell/Plasma Cell"]
+spe_bcell_group$final_celltype <- droplevels(factor(spe_bcell_group$final_celltype))
+
+idx_tim3 <- which(spe_bcell_group$final_celltype == tim3_label)
+cat("Number of cells in", tim3_label, ":", length(idx_tim3), "\n")
+```
+
+```{r tim3-counts-area}
+total_counts_all  <- colSums(assay(spe_bcell_group, "counts"))
+total_counts_tim3  <- total_counts_all[idx_tim3]
+total_counts_other <- total_counts_all[-idx_tim3]
+
+cat("Total counts -- TIM3+ cluster:\n")
+print(summary(total_counts_tim3))
+cat("\nTotal counts -- all other B Cell/Plasma Cell:\n")
+print(summary(total_counts_other))
+
+if ("area" %in% colnames(colData(spe_bcell_group))) {
+  cell_area_all   <- spe_bcell_group$area
+  cell_area_tim3  <- cell_area_all[idx_tim3]
+  cell_area_other <- cell_area_all[-idx_tim3]
+
+  cat("\nCell area -- TIM3+ cluster:\n")
+  print(summary(cell_area_tim3))
+  cat("\nCell area -- all other B Cell/Plasma Cell:\n")
+  print(summary(cell_area_other))
+}
+```
+
+```{r tim3-patient-roi}
+tim3_summary <- data.frame(
+  cell_id    = colnames(spe_bcell_group),
+  patient_id = spe_bcell_group$patient_id,
+  sample_id  = spe_bcell_group$sample_id,
+  is_tim3    = seq_len(ncol(spe_bcell_group)) %in% idx_tim3
+) %>%
+  group_by(patient_id, sample_id) %>%
+  summarise(
+    total_cells      = n(),
+    tim3_cells       = sum(is_tim3),
+    proportion_tim3  = round(tim3_cells / total_cells, 3),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(proportion_tim3))
+
+print(tim3_summary, n = Inf)
+
+tim3_summary_wide <- tim3_summary %>%
+  select(patient_id, sample_id, proportion_tim3) %>%
+  pivot_wider(names_from = sample_id, values_from = proportion_tim3)
+
+print(tim3_summary_wide)
+```
+
+```{r tim3-composition}
+cat("Patient composition of TIM3+ cluster:\n")
+print(sort(table(spe_bcell_group$patient_id[idx_tim3]), decreasing = TRUE))
+```
+
+A cluster concentrated in one or two patients/ROIs points to a
+patient-driven or local technical effect (exclude for `sccomp_glm`);
+a broad, roughly proportional spread across most patients/ROIs argues
+for a real, if admixed, cross-cohort population (flag rather than
+exclude).
+
+**Conclusion:** Rename to `Plasma Cell/NK Admixture
+(CD138+TIM3+TBet+CD56+)` as already proposed, and note the Patient10
+enrichment as a caveat for `sccomp_glm`.
+
+---
+
+## 3. Myeloid, Proliferating — Patient10 Batch Metadata Check
+
+```{r prolif-subset}
+prolif_label <- "Macrophage, Proliferating (MKI67+)"
+
+spe_myeloid_group <- spe[, spe$celltype_category == "Myeloid"]
+spe_myeloid_group$final_celltype <- droplevels(factor(spe_myeloid_group$final_celltype))
+
+idx_prolif <- which(spe_myeloid_group$final_celltype == prolif_label)
+cat("Number of cells in", prolif_label, ":", length(idx_prolif), "\n")
+
+p10_share <- mean(spe_myeloid_group$patient_id[idx_prolif] == "Patient10")
+cat("Proportion of cluster from Patient10:", round(p10_share, 3), "\n")
+```
+
+```{r prolif-batch-metadata}
+batch_cols <- grep("batch|acquisition|run|date|panel_lot|slide",
+                    colnames(colData(spe_myeloid_group)),
+                    ignore.case = TRUE, value = TRUE)
+
+if (length(batch_cols) > 0) {
+  cat("Batch-related colData columns found:", paste(batch_cols, collapse = ", "), "\n\n")
+
+  for (col in batch_cols) {
+    cat("---", col, "---\n")
+    print(table(spe_myeloid_group[[col]], spe_myeloid_group$patient_id == "Patient10"))
+    cat("\n")
+  }
+} else {
+  cat("No batch/acquisition metadata columns found in colData.\n")
+  cat("Fall back: compare Patient10's sample_id/acquisition naming pattern against\n")
+  cat("the tumor patients, and cross-check against the raw acquisition metadata\n")
+  cat("(.mcd files / panel.csv run info) under the steinbock output directory.\n\n")
+
+  cat("Sample IDs for Patient10:\n")
+  print(unique(spe_myeloid_group$sample_id[spe_myeloid_group$patient_id == "Patient10"]))
+}
+```
+
+```{r prolif-sccomp-decision}
+n_patients_total   <- length(unique(spe_myeloid_group$patient_id))
+n_patients_prolif  <- length(unique(spe_myeloid_group$patient_id[idx_prolif]))
+
+cat("Patients contributing to", prolif_label, ":", n_patients_prolif,
+    "of", n_patients_total, "total\n")
+cat("Patient10 share of cluster:", round(p10_share, 3), "\n\n")
+
+if (p10_share > 0.3) {
+  cat("Decision guidance: Patient10 share exceeds 30% of the cluster and\n")
+  cat("Patient10 is the sole benign control (excluded from stage comparisons\n")
+  cat("regardless). Recommend excluding this cluster's cells from `sccomp_glm`\n")
+  cat("rather than stratifying, since the artifact traces to a sample that is\n")
+  cat("not part of the stage comparison to begin with.\n")
+} else {
+  cat("Decision guidance: Patient10 share is below 30% -- re-examine whether\n")
+  cat("stratification (rather than exclusion) is sufficient before running\n")
+  cat("`sccomp_glm`.\n")
+}
+```
+
+**Conclusion:** Exclude this cluster's Patient10 cells from
+`sccomp_glm` (or exclude Patient10 entirely from that model, which
+you'd likely already be doing given it has no stage).
+
+---
+
+## 4. Myeloid, DC/mregDC — Patient/ROI Origin Check
+
+Same diagnostic as Section 2, applied to DC/mregDC to resolve the
+EpCAM/CD117 admixture question.
+
+```{r dc-subset}
+dc_label <- "DC/mregDC"
+
+idx_dc <- which(spe_myeloid_group$final_celltype == dc_label)
+cat("Number of cells in", dc_label, ":", length(idx_dc), "\n")
+```
+
+```{r dc-counts-area}
+total_counts_all_m <- colSums(assay(spe_myeloid_group, "counts"))
+total_counts_dc    <- total_counts_all_m[idx_dc]
+total_counts_other_m <- total_counts_all_m[-idx_dc]
+
+cat("Total counts -- DC/mregDC cluster:\n")
+print(summary(total_counts_dc))
+cat("\nTotal counts -- all other Myeloid:\n")
+print(summary(total_counts_other_m))
+
+if ("area" %in% colnames(colData(spe_myeloid_group))) {
+  cell_area_all_m   <- spe_myeloid_group$area
+  cell_area_dc      <- cell_area_all_m[idx_dc]
+  cell_area_other_m <- cell_area_all_m[-idx_dc]
+
+  cat("\nCell area -- DC/mregDC cluster:\n")
+  print(summary(cell_area_dc))
+  cat("\nCell area -- all other Myeloid:\n")
+  print(summary(cell_area_other_m))
+}
+```
+
+```{r dc-patient-roi}
+dc_summary <- data.frame(
+  cell_id    = colnames(spe_myeloid_group),
+  patient_id = spe_myeloid_group$patient_id,
+  sample_id  = spe_myeloid_group$sample_id,
+  is_dc      = seq_len(ncol(spe_myeloid_group)) %in% idx_dc
+) %>%
+  group_by(patient_id, sample_id) %>%
+  summarise(
+    total_cells    = n(),
+    dc_cells       = sum(is_dc),
+    proportion_dc  = round(dc_cells / total_cells, 3),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(proportion_dc))
+
+print(dc_summary, n = Inf)
+
+dc_summary_wide <- dc_summary %>%
+  select(patient_id, sample_id, proportion_dc) %>%
+  pivot_wider(names_from = sample_id, values_from = proportion_dc)
+
+print(dc_summary_wide)
+```
+
+```{r dc-composition}
+cat("Patient composition of DC/mregDC cluster:\n")
+print(sort(table(spe_myeloid_group$patient_id[idx_dc]), decreasing = TRUE))
+```
+
+```{r dc-epithelial-markers}
+epi_markers <- intersect(c("EpCAM", "CD117", "TTF1orCD16"), rownames(spe_myeloid_group))
+
+dc_epi_means <- sapply(epi_markers, function(m) {
+  c(
+    dc_mean    = mean(assay(spe_myeloid_group, "exprs")[m, idx_dc]),
+    other_mean = mean(assay(spe_myeloid_group, "exprs")[m, -idx_dc])
+  )
+})
+
+cat("EpCAM/CD117/TTF1orCD16 mean expression, DC/mregDC vs. other Myeloid:\n")
+print(dc_epi_means)
+```
+
+A cluster concentrated in patients/ROIs adjacent to high tumor
+epithelial content, paired with confirmed EpCAM/CD117 elevation above
+the rest of the Myeloid category, would support a spatial spillover
+explanation (flag as admixed). A broad, patient-proportional spread
+would argue against a simple spatial-adjacency artifact and toward a
+real DC/mregDC-epithelial interaction signature worth noting rather
+than excluding.
+
+**Conclusion:** Broad, non-patient-driven distribution, normal
+counts/area, and a consistent multi-marker epithelial signal (EpCAM,
+CD117, TTF1orCD16 all elevated together) point to genuine spatial
+admixture rather than a technical artifact. Flag, don't exclude --
+rename to `DC/mregDC, Epithelial-Adjacent (EpCAM+/CD117+)`.
+
+---
+
+## 5. Implement Renames
+
+Based on the four checks above: none of the flagged clusters turned
+out to be technical artifacts warranting exclusion outright (Myeloid
+Proliferating aside, which is handled via Patient10 exclusion in
+`sccomp_glm` rather than a cluster-wide rename). Renaming in place to
+carry the finding forward in `final_celltype` itself.
+
+```{r implement-renames}
+celltype_renames <- c(
+  "Plasmablast, Strongly Activated (CD38++)" =
+    "Plasmablast, Strongly Activated (CD38++, Macrophage-Admixed)",
+  "Plasma Cell, TIM3+ (CD138+TIM3+CD45RO-)" =
+    "Plasma Cell/NK Admixture (CD138+TIM3+TBet+CD56+)",
+  "Macrophage, Proliferating (MKI67+)" =
+    "Macrophage, Proliferating (MKI67+, Patient10-Driven Artifact)",
+  "DC/mregDC" =
+    "DC/mregDC, Epithelial-Adjacent (EpCAM+/CD117+)"
+)
+
+final_celltype_chr <- as.character(spe$final_celltype)
+
+renamed <- final_celltype_chr %in% names(celltype_renames)
+final_celltype_chr[renamed] <- celltype_renames[final_celltype_chr[renamed]]
+
+spe$final_celltype <- factor(final_celltype_chr)
+
+cat("Cells renamed:\n")
+print(table(names(celltype_renames)[match(final_celltype_chr[renamed], celltype_renames)]))
+```
+
+```{r save-renamed}
+saveRDS(spe, file.path(analysis_path, "final_cell_annotation_post_inspect.rds"))
+cat("Saved updated spe to",
+    file.path(analysis_path, "final_cell_annotation_post_inspect.rds"), "\n")
+```
+
+---
+
+## 6. Re-validation
+
+Re-run the counts check on the updated object to confirm the renames
+applied cleanly and introduced no unexpected changes elsewhere.
+
+```{r revalidate}
+print(table(spe$final_celltype, useNA = "ifany"))
+
+cat("\nConfirm old labels no longer present:\n")
+print(intersect(names(celltype_renames), as.character(spe$final_celltype)))
+
+cat("\nConfirm new labels present with expected counts:\n")
+print(table(spe$final_celltype)[celltype_renames])
+```

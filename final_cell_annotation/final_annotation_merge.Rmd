@@ -1,0 +1,367 @@
+---
+title: "Final Cell Type Annotation Merge"
+author: "Vaidehi Gupta"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+Final merge of all subclustering results (myeloid, cluster 15, B cell/plasma)
+into a single annotated `spe` object. Strips tracking-number prefixes from
+labels, excludes confirmed low-quality/artifact clusters, and validates the
+final annotation with a heatmap and violin plots before saving.
+
+This does NOT re-derive any of the subclustering QC itself (myeloid,
+cluster 15, B cell/plasma) — those were already done separately and are
+documented in their own notebooks. This notebook only combines the finalized
+outputs.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+```
+
+# 1. Load Libraries
+
+```{r libraries}
+.libPaths(c("/restricted/projectnb/camplab/home/vgupta7/R_libs", .libPaths()))
+
+library(tidyverse)
+library(SingleCellExperiment)
+library(SpatialExperiment)
+library(scater)
+```
+
+# 2. Paths
+
+```{r paths}
+analysis_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis"
+
+spe_path <- file.path(analysis_path, "final_cell_annotation", "h5_cluster_annot.rds")
+
+subclustering_path <- file.path(analysis_path, "final_cell_annotation", "subclustering")
+
+myeloid_path <- file.path(subclustering_path, "myeloid_cells", "myeloid_subcluster.rds")
+
+cluster15_path <- file.path(subclustering_path, "cluster15", "cluster15_subcluster_clean.rds")
+bcell_path     <- file.path(subclustering_path, "bcells", "bcell_subclustering_wo15.rds")
+
+final_out_path <- file.path(analysis_path, "final_cell_annotation", "spe_final_celltype.rds")
+```
+
+# 3. Load Broad-Annotated SPE and Subclustering Results
+
+```{r load-intermediates}
+spe <- readRDS(spe_path)
+
+myeloid_obj   <- readRDS(myeloid_path)
+cluster15_obj <- readRDS(cluster15_path)
+bcell_obj     <- readRDS(bcell_path)
+
+cat("Broad-annotated cells:", ncol(spe), "\n")
+cat("Myeloid subset cells:", ncol(myeloid_obj), "\n")
+cat("Cluster 15 (clean) subset cells:", ncol(cluster15_obj), "\n")
+cat("B cell/plasma (w/o cluster 15) subset cells:", ncol(bcell_obj), "\n")
+```
+
+# 4. Final Merge
+
+Cluster 15 was already excluded from the B cell/plasma subclustering input
+(rerun without cluster 15, confirmed stable without needing removal/
+reclustering), and cluster 15's own low-quality/artifact subclusters were
+separately removed and reclustered — so there is no overlap between these
+three subclustering results, and no origin-based filtering is needed at
+merge time (unlike the earlier version of this pipeline).
+
+```{r final-merge}
+spe$final_celltype <- as.character(spe$broad_celltype)
+
+# Myeloid subcluster labels
+spe$final_celltype[match(colnames(myeloid_obj), colnames(spe))] <- as.character(myeloid_obj$sub_celltype)
+
+# Cluster 15 (post-removal, annotated) subcluster labels
+spe$final_celltype[match(colnames(cluster15_obj), colnames(spe))] <- as.character(cluster15_obj$sub_celltype_clean)
+
+# Cells from broad cluster 15 that were excluded during cluster 15 subclustering
+# (subclusters 2, 4, 7 -- low quality / Patient20 artifact) never got a
+# sub_celltype_clean label, since they aren't in cluster15_obj at all.
+# Flag them explicitly so they get caught by the exclusion step below,
+# rather than silently keeping their stale pre-subclustering broad label.
+cluster15_removed_cells <- setdiff(
+  colnames(spe)[spe$broad_clusters == "15"],
+  colnames(cluster15_obj)
+)
+spe$final_celltype[colnames(spe) %in% cluster15_removed_cells] <- "Unresolved/Low Quality"
+
+# B cell/plasma (rerun without cluster 15) subcluster labels
+spe$final_celltype[match(colnames(bcell_obj), colnames(spe))] <- as.character(bcell_obj$sub_celltype)
+
+spe$final_celltype <- factor(spe$final_celltype)
+
+cat("Cell types after merge:", nlevels(spe$final_celltype), "\n")
+cat("NAs:", sum(is.na(spe$final_celltype)), "\n")
+```
+
+
+# 5. Strip Tracking-Number Prefixes from Labels
+
+The leading numbers (e.g. `"10. Memory T/Plasma Cell (CD45RO+)"`) were only
+ever meant as an internal bookkeeping aid during annotation, but they
+interfere with downstream niche annotation, so they're removed here at the
+source before saving the final object.
+
+```{r strip-label-numbers}
+spe$final_celltype <- factor(gsub("^\\d+\\.\\s*", "", as.character(spe$final_celltype)))
+
+# Sanity check: confirm no numbers remain, no unintended matches
+levels(spe$final_celltype)
+```
+
+```{r}
+compare_markers <- c("FoxP3", "CD4", "CD25", "CD45RO", "TIM3", "PD1", "CD138")  # adjust to your panel
+compare_markers <- compare_markers[compare_markers %in% rownames(spe)]
+
+mean_expr_compare <- sapply(c("Treg", "Treg (FoxP3+)"), function(ct) {
+  idx <- which(spe$final_celltype == ct)
+  rowMeans(assay(spe, "scaled_0100")[compare_markers, idx, drop = FALSE])
+})
+
+round(mean_expr_compare, 2)
+```
+Note: Treg and Treg (FoxP3+) are distinct populations, not duplicates — confirmed via marker comparison (CD4/CD45RO/TIM3/PD1/CD138 all elevated in the latter, flat in the former).
+
+```{r}
+compare_markers_memory <- c("CD45RO", "CD4", "TIM3", "PD1", "CD138", "FoxP3")
+compare_markers_memory <- compare_markers_memory[compare_markers_memory %in% rownames(spe)]
+
+mean_expr_memory_compare <- sapply(c("Memory T Cell", "Memory T Cell (CD45RO+)"), function(ct) {
+  idx <- which(spe$final_celltype == ct)
+  rowMeans(assay(spe, "scaled_0100")[compare_markers_memory, idx, drop = FALSE])
+})
+
+round(mean_expr_memory_compare, 2)
+```
+
+Same story with Memory T Cell and Memory T Cell (CD45RO+).
+
+# 6. Exclude Confirmed Low-Quality/Artifact Clusters
+
+- **Broad cluster 17**: confirmed low quality at the broad level.
+- **"Unresolved/Technical Artifact (Patient20)"**: confirmed technical
+  artifact from the cluster 15 rerun — CD19+ signal concentrated in
+  Patient20_425/519 (51% of cells, ~4x higher CD19 than other patients),
+  not explained by generalized intensity. Bleeds into some
+  originally-labeled Memory T Cell (CD45RO+) cells as well; excluded here
+  rather than treated as a real cell type.
+- **"Unresolved/Low Quality"**: generic low-signal category from earlier
+  subclustering rounds (flat/negative across every marker).
+
+Any tiny (< 3 cell) leftover categories from prior merge-boundary conflicts
+should no longer occur, since cluster 15 was excluded from the B cell/plasma
+subclustering input from the start this time — but the table in chunk 7
+below is worth a visual scan to confirm nothing unexpectedly small slipped
+through regardless.
+
+```{r exclude-low-quality}
+n_before <- ncol(spe)
+
+spe <- spe[, spe$broad_clusters != "17"]
+
+low_quality_labels <- c(
+  "Unresolved/Low Quality",
+  "Unresolved/Technical Artifact (Patient20)"
+)
+spe <- spe[, !(spe$final_celltype %in% low_quality_labels)]
+
+n_after <- ncol(spe)
+
+cat("Cells before exclusion:", n_before, "\n")
+cat("Cells after excluding low-quality/artifact clusters:", n_after, "\n")
+cat("Cells removed:", n_before - n_after,
+    sprintf("(%.1f%% of dataset)\n", 100 * (n_before - n_after) / n_before))
+
+spe$final_celltype <- droplevels(spe$final_celltype)
+```
+
+# 7. Final Cell Type Counts
+
+```{r final-celltype-table}
+spe$final_celltype |>
+  table(useNA = "ifany") |>
+  as.data.frame() |>
+  setNames(c("CellType", "Count")) |>
+  arrange(desc(Count)) |>
+  knitr::kable(caption = "Final cell type counts after merge and QC exclusion")
+```
+
+# 8. Validation: Heatmap of Marker Expression by Final Cell Type
+
+Confirm each final cell type's name-implied marker(s) are actually elevated
+in that group relative to others, before treating this object as the shared
+source of truth.
+
+```{r validate-heatmap, fig.width=14, fig.height=10}
+all_markers <- rownames(spe)
+
+celltype_levels <- levels(spe$final_celltype)
+
+mean_expr <- sapply(celltype_levels, function(ct) {
+  idx <- which(spe$final_celltype == ct)
+  rowMeans(assay(spe, "scaled_0100")[all_markers, idx, drop = FALSE])
+})
+
+marker_order <- all_markers[hclust(dist(mean_expr))$order]
+
+celltype_sizes <- table(spe$final_celltype)
+celltype_labels <- paste0(celltype_levels, "\n(n=", celltype_sizes[celltype_levels], ")")
+names(celltype_labels) <- celltype_levels
+
+heatmap_df <- as.data.frame(mean_expr) |>
+  rownames_to_column("marker") |>
+  pivot_longer(-marker, names_to = "celltype", values_to = "mean_expr")
+
+heatmap_df$marker   <- factor(heatmap_df$marker, levels = marker_order)
+heatmap_df$celltype <- factor(heatmap_df$celltype, levels = celltype_levels)
+
+ggplot(heatmap_df, aes(x = celltype, y = marker, fill = mean_expr)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "steelblue", mid = "white", high = "firebrick",
+                       midpoint = 0, name = "Mean\nZ-score") +
+  scale_x_discrete(labels = celltype_labels) +
+  theme_bw(base_size = 9) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+        panel.grid = element_blank()) +
+  labs(x = "Final Cell Type (n)", y = "Marker",
+       title = "Final Annotation Validation: Mean Marker Expression by Cell Type")
+```
+### Check EpCAM
+```{r}
+mean_expr["EpCAM", c("Epithelial (EpCAM+)", "Tumor Epithelial (TTF1++)", "Tumor Epithelial (Neuroendocrine)")]
+```
+
+### Check Plasma Cell, HLADRB-high
+```{r}
+mean_expr[c("HLADRB", "CD19", "CD138"), "B Cell/Plasma Cell, HLADRB-high (CD19+CD138+HLADRB+)"]
+```
+
+CD19 and CD138 are more elevated than HLADRB, which is not consistent with this cell type label. Might be worth renaming to Transitional B Cell/Plasmablast, HLADRB+ (CD19+CD138+)
+
+```{r auto-flag-label-mismatches}
+# For each cell type, find its top 3 markers by mean expression, and check
+# whether the marker(s) named in the label actually show up among them
+top_markers_per_celltype <- apply(mean_expr, 2, function(col) {
+  names(sort(col, decreasing = TRUE))[1:3]
+})
+
+top_markers_df <- as.data.frame(t(top_markers_per_celltype)) |>
+  rownames_to_column("CellType") |>
+  setNames(c("CellType", "Top1", "Top2", "Top3"))
+
+knitr::kable(top_markers_df, caption = "Top 3 markers per final cell type (by mean Z-score)")
+```
+
+# 9. Validation: Violin Plots (Targeted Marker Check)
+
+Focused check on a few key markers, worth adjusting to whichever cell
+types/markers the heatmap above flags as ambiguous.
+
+```{r validate-violin-1, fig.width=12, fig.height=8}
+library(RColorBrewer)
+
+markers_check_1 <- c("FoxP3", "CD19", "CD138", "EpCAM", "CD117", "SMA")
+markers_check_1 <- markers_check_1[markers_check_1 %in% rownames(spe)]
+
+plot_df_1 <- as.data.frame(t(assay(spe, "scaled_0100")[markers_check_1, ])) |>
+  mutate(CellType = spe$final_celltype) |>
+  pivot_longer(-CellType, names_to = "marker", values_to = "expression")
+
+n_celltypes <- length(unique(plot_df_1$CellType))
+celltype_colors <- colorRampPalette(brewer.pal(12, "Paired"))(n_celltypes)
+
+ggplot(plot_df_1, aes(x = CellType, y = expression, fill = CellType)) +
+  geom_violin(scale = "width", trim = TRUE) +
+  scale_fill_manual(values = celltype_colors) +
+  facet_wrap(~ marker, scales = "free_y", ncol = 2) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 6),
+        legend.position = "none") +
+  labs(x = NULL, y = "Z-score expression",
+       title = "Marker Expression Validation (1 of 2)")
+```
+
+```{r validate-violin-2, fig.width=12, fig.height=9}
+markers_check_2 <- c("HLADRB", "CD38", "CD8a", "CD11c", "CD45RA", "CD39", "TIM3")
+markers_check_2 <- markers_check_2[markers_check_2 %in% rownames(spe)]
+
+plot_df_2 <- as.data.frame(t(assay(spe, "scaled_0100")[markers_check_2, ])) |>
+  mutate(CellType = spe$final_celltype) |>
+  pivot_longer(-CellType, names_to = "marker", values_to = "expression")
+
+ggplot(plot_df_2, aes(x = CellType, y = expression, fill = CellType)) +
+  geom_violin(scale = "width", trim = TRUE) +
+  scale_fill_manual(values = celltype_colors) +
+  facet_wrap(~ marker, scales = "free_y", ncol = 2) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 6),
+        legend.position = "none") +
+  labs(x = NULL, y = "Z-score expression",
+       title = "Marker Expression Validation (2 of 2)")
+```
+
+# 10. Validation: Final UMAP
+
+```{r final-umap, fig.width=12, fig.height=8}
+library(dittoSeq)
+library(RColorBrewer)
+
+# Reuse existing UMAP if already computed; only recompute if missing
+if (!("UMAP" %in% reducedDimNames(spe))) {
+  set.seed(220225)
+  spe <- runUMAP(spe, dimred = "Harmony", name = "UMAP")}
+
+n_celltypes <- nlevels(spe$final_celltype)
+celltype_colors <- colorRampPalette(brewer.pal(12, "Paired"))(n_celltypes)
+
+p_final_umap <- dittoDimPlot(spe, var = "final_celltype",
+                              reduction.use = "UMAP",
+                              size = 0.3) +
+  scale_color_manual(values = celltype_colors) +
+  ggtitle("Final Cell Type Annotation: UMAP") +
+  theme(legend.position = "right",
+        legend.text = element_text(size = 7),
+        legend.key.size = unit(0.4, "cm"))
+
+print(p_final_umap)
+
+# Save full-size to file
+umap_out_path <- file.path(analysis_path, "final_cell_annotation", "final_celltype_umap.png")
+ggsave(umap_out_path, p_final_umap, width = 14, height = 10, dpi = 300)
+cat("Saved full-size UMAP to:", umap_out_path, "\n")
+```
+
+# 11. Save Finalized Object
+
+```{r save-final}
+saveRDS(spe, final_out_path)
+cat("Saved final annotated object to:", final_out_path, "\n")
+```
+
+# Handoff Notes
+
+- `spe_final_celltype.rds` has unnumbered cell type labels — any downstream
+  code (sccomp exclusion lists, spatial graph exclusion lists, niche
+  annotation) that references old numbered label strings needs to be
+  updated to the new unnumbered versions.
+- Excluded from this object: broad cluster 17, "Unresolved/Low Quality",
+  and "Unresolved/Technical Artifact (Patient20)". No small leftover
+  categories are expected this time, since cluster 15 no longer overlaps
+  with the B cell/plasma subclustering input — confirmed by the table in
+  chunk 7.
+- Flag for Campbell: Patient20_425/519 showed a recurring
+  patient-specific CD19 technical artifact across both the cluster 15 and
+  B cell/plasma subclustering pipelines — worth a dedicated sample-level QC
+  pass on those two patients specifically.

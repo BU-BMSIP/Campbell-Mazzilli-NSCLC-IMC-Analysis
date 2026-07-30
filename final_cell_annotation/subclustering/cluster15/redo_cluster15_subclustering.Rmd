@@ -1,0 +1,556 @@
+---
+title: 'Subclustering: Cluster 15 (T Cell/Plasma Cell, Mixed) — Removal + Recluster'
+author: "Vaidehi Gupta"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+Rerun of cluster 15 subclustering, extending the original analysis: after
+identifying subclusters 2, 4 (low quality/low signal) and 7 (patient-driven
+technical artifact, ~69% from Patient20_425/519) in the first pass, this
+notebook removes them and reclusters, mirroring the same
+remove-then-recluster-then-validate approach used for the B cell/plasma
+subclustering (which, notably, held stable without needing to recluster once
+cluster 15 itself was excluded from its input — reinforcing that cluster 15's
+own internal noise was the source of the instability).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+```
+
+# 1. Load Libraries
+
+```{r libraries}
+.libPaths(c("/restricted/projectnb/camplab/home/vgupta7/R_libs", .libPaths()))
+
+library(imcRtools)
+library(tidyverse)
+library(dittoSeq)
+library(viridis)
+library(scater)
+library(scran)
+library(bluster)
+library(patchwork)
+library(RColorBrewer)
+library(ComplexHeatmap)
+library(circlize)
+```
+
+# 2. Paths
+
+```{r paths}
+analysis_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis"
+
+spe_path <- file.path(analysis_path, "final_cell_annotation", "h5_cluster_annot.rds")
+
+out_path_original <- file.path(analysis_path, "final_cell_annotation", "subclustering", "cluster15",
+                                "cluster15_subcluster.rds")
+out_path_clean <- file.path(analysis_path, "final_cell_annotation", "subclustering", "cluster15",
+                             "cluster15_subcluster_clean.rds")
+findmarkers_path_clean <- file.path(analysis_path, "final_cell_annotation", "subclustering", "cluster15", "cluster15_subcluster_clean_findmarkers.csv")
+```
+
+# 3. Load Original Subclustered Object
+
+Reuse the original subclustering (subclusters 1-9, already annotated) rather
+than redoing the extraction + Louvain clustering from scratch.
+
+```{r load-original}
+spe_15 <- readRDS(out_path_original)
+
+cat("Cells in cluster 15 subset:", ncol(spe_15), "\n")
+cat("Original subclusters:", nlevels(spe_15$sub_clusters), "\n")
+print(table(spe_15$sub_clusters))
+```
+
+# 4. Remove Low-Quality / Artifact Subclusters
+
+- **Subclusters 2, 4**: no marker clears logFC 1.0 threshold; ~38% lower
+  total counts than the rest of cluster 15 with no difference in cell area
+  (ruling out a segmentation-size explanation) — consistent with poorly
+  stained cells, not a real cell state.
+- **Subcluster 7**: no marker clears threshold either, and is ~69% driven
+  by two patients (Patient20_425 + Patient20_519) — a patient-specific
+  technical artifact, not a generalizable population. Also sits as an
+  isolated island on the UMAP.
+
+```{r remove-low-quality}
+low_quality_clusters <- c("2", "4", "7")
+
+n_before <- ncol(spe_15)
+spe_15_clean <- spe_15[, !(spe_15$sub_clusters %in% low_quality_clusters)]
+n_after <- ncol(spe_15_clean)
+
+cat("Cells before removal:", n_before, "\n")
+cat("Cells after removing low-quality/artifact subclusters:", n_after, "\n")
+cat("Cells removed:", n_before - n_after,
+    sprintf("(%.1f%% of cluster 15 subset)\n", 100 * (n_before - n_after) / n_before))
+```
+
+# 5. Recluster After Removal
+
+Recluster on the existing Harmony embedding (same k = 10 as the original
+subclustering) to check whether the remaining CD4 T cell/Treg populations
+hold together cleanly once the low-quality/artifact cells are gone.
+
+```{r recluster-after-removal}
+if ("sub_clusters_clean" %in% colnames(colData(spe_15_clean))) {
+  cat("sub_clusters_clean already exists, skipping recomputation.\n")
+} else {
+  harmony_sub_clean <- reducedDim(spe_15_clean, "Harmony")
+
+  set.seed(220225)
+  g_sub_clean <- buildSNNGraph(t(harmony_sub_clean), k = 10, type = "rank")
+  clust_sub_clean <- igraph::cluster_louvain(g_sub_clean)
+  spe_15_clean$sub_clusters_clean <- factor(clust_sub_clean$membership)
+}
+
+cat("Number of subclusters after removal:", nlevels(spe_15_clean$sub_clusters_clean), "\n")
+print(table(spe_15_clean$sub_clusters_clean))
+```
+
+# 6. UMAP on Post-Removal Subset
+
+```{r umap-clean, fig.width=10, fig.height=7}
+if ("UMAP_sub_clean" %in% reducedDimNames(spe_15_clean)) {
+  cat("UMAP_sub_clean already exists, skipping recomputation.\n")
+} else {
+  set.seed(220225)
+  spe_15_clean <- runUMAP(spe_15_clean, dimred = "Harmony", name = "UMAP_sub_clean")
+}
+
+p_sub_clean <- dittoDimPlot(spe_15_clean, var = "sub_clusters_clean",
+                             reduction.use = "UMAP_sub_clean",
+                             size = 0.4, do.label = TRUE, labels.size = 4) +
+  ggtitle("Cluster 15 (Low-Quality/Artifact-Removed): UMAP colored by Subcluster") +
+  theme(legend.position = "right")
+print(p_sub_clean)
+```
+
+# 7. Marker Sets
+
+Same disambiguation marker set as the original analysis.
+
+```{r markers}
+disambiguation_markers <- c(
+  "CD4", "CD8a", "CD45RO", "FoxP3", "TIM3", "PD1",
+  "CD138", "CD38", "CD19",
+  "CD14", "CD15", "CD117", "CD11c"
+)
+disambiguation_markers <- disambiguation_markers[disambiguation_markers %in% rownames(spe_15_clean)]
+cat("Markers found:", paste(disambiguation_markers, collapse = ", "), "\n")
+```
+
+# 8. Violin Plots per Post-Removal Subcluster
+
+```{r violin-fn, fig.width=16, fig.height=12}
+make_violinplot <- function(spe, assay_name, cluster_col, marker_set, title, ncol = 3) {
+  expr_mat  <- assay(spe, assay_name)[marker_set, , drop = FALSE]
+  cluster_id <- spe[[cluster_col]]
+
+  mean_expr <- sapply(levels(cluster_id), function(cl) {
+    idx <- which(cluster_id == cl)
+    rowMeans(expr_mat[, idx, drop = FALSE])
+  })
+
+  if (is.matrix(mean_expr) && nrow(mean_expr) > 1) {
+    marker_order <- rownames(mean_expr)[hclust(dist(mean_expr))$order]
+  } else {
+    marker_order <- marker_set
+  }
+
+  plot_df <- as.data.frame(t(expr_mat)) |>
+    mutate(cluster = cluster_id) |>
+    pivot_longer(-cluster, names_to = "marker", values_to = "expr")
+
+  plot_df$marker  <- factor(plot_df$marker, levels = marker_order)
+  plot_df$cluster <- factor(plot_df$cluster, levels = levels(cluster_id))
+
+  ggplot(plot_df, aes(x = cluster, y = expr, fill = cluster)) +
+    geom_violin(scale = "width", trim = TRUE, linewidth = 0.2) +
+    stat_summary(fun = median, geom = "point", size = 0.6, color = "black") +
+    facet_wrap(~ marker, scales = "free_y", ncol = ncol) +
+    labs(title = title, x = "Subcluster", y = "Z-score expression") +
+    theme_bw(base_size = 11) +
+    theme(
+      axis.text.x = element_text(angle = 0, hjust = 0.5, size = 9),
+      strip.text = element_text(face = "bold"),
+      panel.grid.major.x = element_blank(),
+      legend.position = "none"
+    )
+}
+
+p_violin_clean <- make_violinplot(spe_15_clean, "scaled_0100", "sub_clusters_clean",
+                                   disambiguation_markers,
+                                   "Cluster 15 (Removed-Reclustered): Marker Expression per Subcluster",
+                                   ncol = 3)
+print(p_violin_clean)
+```
+
+# 9. Heatmap: All Post-Removal Subclusters
+
+Mean Z-score expression across the full marker panel for all post-removal
+subclusters side by side — catches modest signals spread across several
+markers that a single-marker violin panel can miss.
+
+```{r heatmap-clean, fig.width=10, fig.height=8}
+clean_clusters <- levels(spe_15_clean$sub_clusters_clean)
+
+mean_expr_clean <- sapply(clean_clusters, function(cl) {
+  idx <- which(spe_15_clean$sub_clusters_clean == cl)
+  rowMeans(assay(spe_15_clean, "scaled_0100")[disambiguation_markers, idx, drop = FALSE])
+})
+
+marker_order_clean <- disambiguation_markers[hclust(dist(mean_expr_clean))$order]
+
+cluster_sizes_clean <- table(spe_15_clean$sub_clusters_clean)
+cluster_labels_clean <- paste0(clean_clusters, "\n(n=", cluster_sizes_clean[clean_clusters], ")")
+names(cluster_labels_clean) <- clean_clusters
+
+heatmap_clean_df <- as.data.frame(mean_expr_clean) |>
+  rownames_to_column("marker") |>
+  pivot_longer(-marker, names_to = "subcluster", values_to = "mean_expr")
+
+heatmap_clean_df$marker     <- factor(heatmap_clean_df$marker, levels = marker_order_clean)
+heatmap_clean_df$subcluster <- factor(heatmap_clean_df$subcluster, levels = clean_clusters)
+
+p_heatmap_clean <- ggplot(heatmap_clean_df, aes(x = subcluster, y = marker, fill = mean_expr)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(mean_expr, 2)), size = 3) +
+  scale_fill_gradient2(low = "steelblue", mid = "white", high = "firebrick",
+                       midpoint = 0, name = "Mean\nZ-score") +
+  scale_x_discrete(labels = cluster_labels_clean) +
+  labs(title = "Mean Marker Expression: All Post-Removal Subclusters",
+       x = "Subcluster (cell count)", y = "Marker") +
+  theme_bw(base_size = 11) +
+  theme(panel.grid = element_blank())
+print(p_heatmap_clean)
+```
+
+# 10. Statistical Marker Discovery (findMarkers) on Post-Removal Subclusters
+
+```{r findmarkers-clean}
+markers_de_clean <- findMarkers(spe_15_clean,
+                                 groups = spe_15_clean$sub_clusters_clean,
+                                 assay.type = "scaled_0100",
+                                 subset.row = disambiguation_markers)
+
+all_markers_clean <- lapply(levels(spe_15_clean$sub_clusters_clean), function(cl) {
+  df <- as.data.frame(markers_de_clean[[cl]])
+  data.frame(
+    subcluster = cl,
+    marker     = rownames(df),
+    Top        = df$Top,
+    FDR        = df$FDR,
+    logFC      = df$summary.logFC
+  )
+})
+
+all_markers_clean_df <- do.call(rbind, all_markers_clean)
+dir.create(dirname(findmarkers_path_clean), recursive = TRUE, showWarnings = FALSE)
+write.csv(all_markers_clean_df, findmarkers_path_clean, row.names = FALSE)
+
+top1_summary_clean <- do.call(rbind, lapply(levels(spe_15_clean$sub_clusters_clean), function(cl) {
+  sub <- all_markers_clean_df[all_markers_clean_df$subcluster == cl & all_markers_clean_df$logFC > 1.0, ]
+  sub <- sub[order(sub$Top, -sub$logFC), ]
+  if (nrow(sub) == 0) {
+    data.frame(subcluster = cl, top_markers = "none above logFC 1.0")
+  } else {
+    data.frame(subcluster = cl, top_markers = paste(head(sub$marker, 5), collapse = ", "))
+  }
+}))
+
+cat("Top positive markers (logFC > 1.0) per post-removal subcluster:\n")
+knitr::kable(top1_summary_clean, col.names = c("Subcluster", "Top Positive Markers"))
+```
+
+```{r findmarkers-per-subcluster-tables-clean}
+cat("Detailed tables (post-removal):\n\n")
+for (cl in levels(spe_15_clean$sub_clusters_clean)) {
+  sub <- all_markers_clean_df[all_markers_clean_df$subcluster == cl & all_markers_clean_df$Top <= 5, ]
+  sub <- sub[order(sub$Top, -sub$logFC), ]
+  if (nrow(sub) == 0) {
+    cat("Subcluster", cl, ": no markers in top 5\n\n")
+  } else {
+    print(knitr::kable(sub[, c("marker", "Top", "FDR", "logFC")],
+                   caption = paste("Subcluster", cl),
+                   digits  = 3,
+                   row.names = FALSE))
+  }
+}
+```
+
+Need to investigate why CD11c is appearing in subcluster 2. Could be dendritic cell spillover?
+
+# 11. Intensity-Confound Checks (Re-verify on Clean Subset)
+
+Re-run the same CD138/TIM3/PD1 intensity-confound checks from the original
+analysis, to confirm the same generalized-intensity-effect conclusion still
+holds after removing the low-quality/artifact subclusters (rather than
+assuming it still applies unchanged).
+
+```{r total-counts}
+spe_15_clean$total_counts <- colSums(assay(spe_15_clean, "counts"))
+```
+
+```{r cd138-spillover-check}
+check_markers <- c("CD138", "EpCAM", "CD4", "CD45RO", "CD19", "CD38")
+check_markers <- check_markers[check_markers %in% rownames(spe_15_clean)]
+
+expr_df <- as.data.frame(t(assay(spe_15_clean, "counts")[check_markers, ]))
+cor_matrix <- cor(expr_df, method = "spearman")
+
+cat("Correlation of CD138 with panel markers, within cleaned cluster 15:\n")
+print(round(sort(cor_matrix["CD138", ], decreasing = TRUE), 3))
+```
+
+```{r cd138-intensity-check}
+cat("CD138 vs. total counts (Spearman):\n")
+print(cor(assay(spe_15_clean, "counts")["CD138", ], spe_15_clean$total_counts, method = "spearman"))
+```
+
+```{r checkpoint-intensity-check}
+checkpoint_markers <- c("TIM3", "PD1", "LAG3", "CTLA4", "CD138")
+checkpoint_markers <- checkpoint_markers[checkpoint_markers %in% rownames(spe_15_clean)]
+
+expr_df <- as.data.frame(t(assay(spe_15_clean, "counts")[checkpoint_markers, ]))
+expr_df$total_counts <- spe_15_clean$total_counts
+
+cat("Checkpoint marker correlations, including total_counts:\n")
+print(cor(expr_df, method = "spearman")["TIM3", ])
+```
+
+CD138 and TIM3 both still meaningfully track with total_counts, and PD1 still doesn't, which matches my original conclusion from my first clustering that CD138/TIM3 are intensity artifacts.
+
+### Subcluster 8: Does subcluster 8 correlate with total_counts the same way CD138/TIM3 do?
+
+```{r}
+sub8_mask <- spe_15_clean$sub_clusters_clean == "8"
+cor(assay(spe_15_clean, "counts")["CD19", sub8_mask],
+    spe_15_clean$total_counts[sub8_mask], method = "spearman")
+```
+Negative correlation of -0.34, which means that within subcluster 8, cells with higher total signal tend to have lower CD19. This argues against the generalized intenisty effect for subcluster 8's CD19 signal.
+
+### Subcluster 2: Does CD11c track with generalized signal intensity (artifact) or not (real biology)?
+
+```{r}
+cor(assay(spe_15_clean, "counts")["CD11c", ], spe_15_clean$total_counts, method = "spearman")
+
+# Is it a coherent myeloid signature (real DC) or an isolated single-marker blip (likely artifact)?
+myeloid_check <- c("CD11c", "CD14", "HLADRB", "CD1c")
+myeloid_check <- myeloid_check[myeloid_check %in% rownames(spe_15_clean)]
+cor(t(as.matrix(assay(spe_15_clean, "counts")[myeloid_check, ])), method = "spearman")
+
+# Is it patient-driven, like subclusters 7 and 8 turned out to be?
+sub2_mask <- spe_15_clean$sub_clusters_clean == "2"
+table(spe_15_clean$patient_id[sub2_mask]) |> prop.table() |> round(2)
+```
+Patient composition of subcluster 2 is well-distributed, not patient driven. CD11c correlates with CD14 (0.45) and HLADRB (0.54) at a meaningful strength and seems to be genuinely co-expressed rather than random noise. The intensity correlation is present but weaker than earlier confirmed artifacts (0.32 vs. CD138's 0.40 and TIM3's 0.43).
+
+Subcluster 2 looks like a genuine, if small, population with dendritic-cell-like character (CD11c/CD14/HLADRB co-expression) sitting within what's otherwise a CD4 T cell/Treg-dominated cluster.
+
+# 12. Composition Check: Patient Composition of Post-Removal Subclusters
+
+Re-check patient composition on the *new* post-removal subclusters —
+important because subcluster 7 (the patient-driven artifact) is gone, and
+its ~410 cells redistributed elsewhere; worth confirming none of the
+remaining subclusters quietly became patient-driven as a result.
+
+```{r patient-composition-clean, fig.width=10, fig.height=6}
+comp_patient_clean <- table(subcluster = spe_15_clean$sub_clusters_clean,
+                             patient    = spe_15_clean$patient_id)
+comp_patient_props_clean <- prop.table(comp_patient_clean, margin = 1)
+
+col_fun_patient <- colorRamp2(c(0, 0.5, 1), rev(brewer.pal(3, "RdBu")))
+
+ht_patient_clean <- Heatmap(
+  comp_patient_props_clean,
+  name = "Proportion",
+  col = col_fun_patient,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  column_title = "Patient",
+  column_title_side = "bottom",
+  row_title = "Subcluster",
+  column_names_rot = 45,
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    val <- comp_patient_props_clean[i, j]
+    text_col <- if (val < 0.2 || val > 0.8) "white" else "black"
+    grid.text(sprintf("%.2f", val), x, y, gp = gpar(col = text_col, fontsize = 7))
+  }
+)
+draw(ht_patient_clean, column_title = "Post-Removal Subcluster Composition by Patient (row-normalized %)")
+```
+Subcluster 8 seems to be driven by patient 20 (Patient20_425 (14%) + Patient20_519 (37%) = 51% of this subcluster). Maybe these two samples had a batch/staining artifact specific to CD19?
+
+### Check whether CD19 is elevated in subcluster 8 cells that aren't from Patient 20
+
+```{r}
+sub8_mask <- spe_15_clean$sub_clusters_clean == "8"
+patient20_mask <- spe_15_clean$patient_id %in% c("Patient20_425", "Patient20_519")
+
+cd19_vals <- assay(spe_15_clean, "scaled_0100")["CD19", sub8_mask]
+patient_group <- ifelse(patient20_mask[sub8_mask], "Patient20", "Other patients")
+
+tapply(cd19_vals, patient_group, mean)
+```
+
+CD19 in subcluster 8 is roughly 4x higher in Patient 20 cells than in every other patient combined. This is strong evidence that subcluster 8 is another Patient20-specific technical artifact, not a real B-cell population.
+
+Worth noting that subcluster 8 is only 838 cells, so it's not really worth re-clustering again. Better to just label it as an artifact and exclude it later downstream.
+
+
+# 13. Manual Annotation of Post-Removal Subclusters
+
+Fill in based on the violin plots, heatmap, and findMarkers output above.
+
+```{r annotate-clean}
+cluster15_subannotation_clean <- c(
+  "1" = "Memory/Activated T Cell (CD4++)",  # CD45RO, CD4, TIM3, CD138, PD1 all co-elevated
+  "2" = "T Cell/DC Admixture (CD11c+)",  # Myeloid spillover (CD11c+), CD11c/CD14/HLADRB co-expressed, evenly spread across patients
+  "3" = "T Cell (TIM3+)",  # TIM3 is the sole positive top marker (1.101), everything else negative
+  "4" = "Treg (FoxP3+)",  # FoxP3 dominates at 2.158, almost everything else negative
+  "5" = "T Cell, Exhaustion-leaning (PD1++)",  # PD1 dominates clearly (2.66)
+  "6" = "CD4+ T Cell",  # CD4 only positive marker, clean signature
+  "7" = "Memory T Cell (CD45RO+)", # CD45RO is the sole positive top marker (1.19)
+  "8" = "Unresolved/Technical Artifact (Patient20)" # CD19+, 51% from Patient20_425/519, confirmed patient-driven
+)
+
+if (!any(cluster15_subannotation_clean == "PLACEHOLDER")) {
+  spe_15_clean$sub_celltype_clean <- cluster15_subannotation_clean[as.character(spe_15_clean$sub_clusters_clean)]
+  spe_15_clean$sub_celltype_clean <- factor(spe_15_clean$sub_celltype_clean,
+                                             levels = unique(cluster15_subannotation_clean))
+  cat("Post-removal subcluster annotation applied.\n")
+  print(table(spe_15_clean$sub_celltype_clean, useNA = "ifany"))
+} else {
+  cat("Fill in cluster15_subannotation_clean above before proceeding.\n")
+}
+```
+
+# 14. UMAP Colored by Post-Removal Subcluster Cell Type
+
+```{r umap-celltype-clean, fig.width=10, fig.height=7}
+if ("sub_celltype_clean" %in% colnames(colData(spe_15_clean))) {
+  p_sub_celltype_clean <- dittoDimPlot(spe_15_clean, var = "sub_celltype_clean",
+                                        reduction.use = "UMAP_sub_clean",
+                                        size = 0.4, do.label = TRUE, labels.size = 3.5) +
+    ggtitle("Cluster 15 (Removed-Reclustered): UMAP colored by Subcluster Cell Type") +
+    theme(legend.position = "right")
+  print(p_sub_celltype_clean)
+} else {
+  cat("Run chunk 13 (Manual Annotation) first.\n")
+}
+```
+
+# 15. Compare Original Annotation to Post-Removal Annotation
+
+Cross-tab the original manual annotation (all 9 subclusters, including the
+now-removed 2/4/7) against the new post-removal annotation, restricted to
+cells that survived the removal. If each original label maps cleanly onto
+one (or a small merge of) new labels, the original calls still hold; if a
+label splits across several new labels, the removal changed the underlying
+structure enough to revisit that call.
+
+```{r compare-annotation, fig.width=10, fig.height=7}
+if (!("sub_celltype_clean" %in% colnames(colData(spe_15_clean)))) {
+  cat("sub_celltype_clean is missing -- run chunk 13 (Manual Annotation) first.\n")
+} else {
+  # Match original annotation onto the surviving cells only
+  spe_15_clean$sub_celltype_original <- spe_15$sub_celltype[match(colnames(spe_15_clean), colnames(spe_15))]
+
+  comp_annotation <- table(original     = spe_15_clean$sub_celltype_original,
+                            post_removal = spe_15_clean$sub_celltype_clean)
+  comp_annotation_props <- prop.table(comp_annotation, margin = 1)
+
+  comp_df <- as.data.frame(comp_annotation_props)
+
+  p_annotation_compare <- ggplot(comp_df, aes(x = post_removal, y = original, fill = Freq)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = paste0(round(Freq * 100, 0), "%")), size = 3.5) +
+    scale_fill_gradient(low = "white", high = "firebrick", name = "Row %") +
+    scale_x_discrete(labels = function(x) str_wrap(x, width = 18)) +
+    scale_y_discrete(labels = function(x) str_wrap(x, width = 25)) +
+    labs(title = "Original Annotation vs. Post-Removal Annotation",
+         subtitle = "Row-normalized: each row (original label) sums to 100%",
+         x = "Post-Removal Annotation", y = "Original Annotation") +
+    theme_bw(base_size = 11) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, color = "darkorange3"),
+          axis.text.y = element_text(color = "steelblue4"),
+          axis.title.x = element_text(color = "darkorange3", face = "bold"),
+          axis.title.y = element_text(color = "steelblue4", face = "bold"),
+          panel.grid = element_blank())
+  print(p_annotation_compare)
+}
+```
+Original "CD4+ T Cell" splits 33% to Memory/Activated CD4++ and 62% to T Cell/DC Admixture (CD11c+). This means that removing the noise let the clustering cleanly separate out that CD11c-driven admixture population that was previously with the CD4+ T Cell label. 
+
+Memory T Cell (CD45RO+) only maps 65% onto its own new label (the lowest of all the real categories), with 16% landing in "Unresolved/Technical Artifact (Patient20).
+
+### Quick check for Memory T Cell (CD45RO+)
+
+```{r}
+# Which patients make up the cells that were "Memory T Cell (CD45RO+)" originally, but landed in the Patient20 artifact bucket after reclustering?
+
+mask <- spe_15_clean$sub_celltype_original == "Memory T Cell (CD45RO+)" &
+        spe_15_clean$sub_celltype_clean == "Unresolved/Technical Artifact (Patient20)"
+
+table(spe_15_clean$patient_id[mask])
+```
+Total = 749 cells. Patient20_425 (104) + Patient20_519 (278) = 382, which is 51%,  still the largest chunk, and notably close to the same 51% concentration found in subcluster 8 itself.
+
+### Check the CD19 marker itself
+```{r}
+mask <- spe_15_clean$sub_celltype_original == "Memory T Cell (CD45RO+)" &
+        spe_15_clean$sub_celltype_clean == "Unresolved/Technical Artifact (Patient20)"
+
+# Does CD19 look like the artifact signature, or like normal background?
+summary(assay(spe_15_clean, "scaled_0100")["CD19", mask])
+
+# Compare to CD45RO -- do they still look like real memory T cells?
+summary(assay(spe_15_clean, "scaled_0100")["CD45RO", mask])
+```
+CD19 is genuinely elevated in these 749 cells (median 1.44, mean 1.40, closely matching subcluster 8's overall CD19 signature (mean z-score 1.45)). This means that these aren't misplaced normal Memory T cells that got pulled across a cluster boundary by chance. They're cells that genuinely carry the same technical CD19 artifact as the rest of subcluster 8.
+
+In summary, I was able to make a cleaner Memory T Cell population than before by removing around 750 contaminated cells, leaving the remaining ~65% (which show a clean CD45RO-only profile) as the ones still bearing the label. 
+
+# 16. Save Post-Removal Subclustered/Annotated Object
+
+```{r save-clean}
+dir.create(dirname(out_path_clean), recursive = TRUE, showWarnings = FALSE)
+saveRDS(spe_15_clean, out_path_clean)
+cat("Saved cluster 15 subcluster object (post-removal, annotated) to:", out_path_clean, "\n")
+```
+
+# Notes
+
+- Original subclusters 2, 4 (low quality) and 7 (patient-driven artifact)
+  were removed prior to reclustering — see chunk 4 for the quantitative
+  justification carried over from the original analysis.
+- Removing this noise did not change the core biological findings. 6 of the original 8
+  real categories reproduce cleanly post-removal with matching marker signatures
+  (Memory/Activated T Cell CD4++, Treg, TIM3+ T Cell, PD1++ Exhaustion-leaning T Cell,
+  CD4+ T Cell, Memory T Cell). The intensity-confound conclusions (CD138/TIM3 track
+  with total_counts, PD1 does not) also replicated, though correlations were somewhat
+  weaker after removing the noisiest cells.
+- This object (`cluster15_subcluster_clean.rds`) supersedes the original
+  `cluster15_subcluster.rds` for downstream merge purposes.
+- In the spatial_setup.Rmd, remember to add "Unresolved/Technical Artifact (Patient20)"
+  to the low_quality_labels exclusion list alongside any existing entries.
+
+### New Findings
+
+1. Subcluster 6 is a cleaner, CD4-only split that separated out of the original CD4+ T cell/Memory-Activated grouping once noise was removed — a finer, not contradictory, distinction.
+
+2. Subcluster 2 ("T Cell/DC Admixture, CD11c+") is likely real, not artifact. CD11c correlates with other myeloid markers (CD14 r=0.45, HLADRB r=0.54) and is evenly distributed across patients (no patient >17%) — consistent with a genuine small DC-like population or T cell/DC doublets swept into broad cluster 15, rather than noise. This reproduces and resolves an "open flag" from the original analysis (subcluster 3's unexplained CD11c signal). Worth a second look from Yusuke given the possible doublet/segmentation angle.
+
+3. Subcluster 8 ("Unresolved/Technical Artifact, Patient20") is a confirmed technical artifact, not a real B cell population. CD19+ (previously flat across all of cluster 15), 51% of cells from Patient20_425/519, and CD19 is ~4x higher in Patient20 cells (2.27) vs. all other patients combined (0.58) within this subcluster. Does not track with generalized intensity (total_counts correlation is negative, -0.34) — this is a patient/batch-specific issue, not the same intensity-confound mechanism seen elsewhere in this cluster.
+
+4. This Patient20 CD19 artifact bleeds beyond subcluster 8. 749 cells originally labeled "Memory T Cell (CD45RO+)" were reassigned to the artifact bucket on reclustering; checked directly, these cells show elevated CD19 (median 1.44, matching subcluster 8's signature) alongside genuine CD45RO signal (median 1.21) — real memory T cells contaminated by the same artifact, not clustering boundary noise. This means the Patient20 issue affects more than one isolated subcluster.
+
+
