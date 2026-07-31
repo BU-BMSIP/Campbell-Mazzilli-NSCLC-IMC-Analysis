@@ -1,0 +1,498 @@
+---
+title: "Final Annotation Violin Plots by Cell Type Category (Post-Inspection)"
+author: "Tazein Shah"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## 1. Load Libraries
+
+```{r libraries}
+library(SpatialExperiment)
+library(tidyverse)
+```
+
+## 2. Paths
+
+```{r paths}
+analysis_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis"
+
+spe_path <- file.path(analysis_path, "final_cell_annotation", "final_cell_annot_post_inspect.rds")
+
+cat("Using spe_path:", spe_path, "\n")
+```
+
+## 3. Load Final Annotated SPE
+
+```{r load-data}
+spe <- readRDS(spe_path)
+
+print(table(spe$final_celltype))
+```
+
+```{r data-source, results='asis', echo=FALSE}
+cat("**Data source:**", basename(spe_path), "\n\n")
+cat("**Loaded:**", format(Sys.time()), "\n")
+```
+
+## 3b. Check Assay Scales
+
+`scaled_0100` is z-scored despite the name (confirmed: range -2.23 to
+6.08, mean ~0.097, negative values present) -- see assay inspection
+below.
+
+```{r check-assays}
+print(assayNames(spe))
+
+for (a in assayNames(spe)) {
+  vals <- assay(spe, a)
+  cat("\nAssay:", a, "\n")
+  cat("  range:", paste(round(range(vals), 2), collapse = " to "), "\n")
+  cat("  mean:", round(mean(vals), 3), "\n")
+  cat("  has negative values:", any(vals < 0), "\n")
+}
+```
+
+## 4. Group Final Cell Types into Broad Categories
+
+```{r categories}
+celltype_category <- c(
+  "B Cell (CD19+)"                                       = "B Cell/Plasma Cell",
+  "B Cell, Weak (CD19+)"                                 = "B Cell/Plasma Cell",
+  "B Cell/Plasma Cell, HLADRB-high (CD19+CD138+HLADRB+)" = "B Cell/Plasma Cell",
+  "Plasma Cell, Memory-like (Weak) (CD45RO+)"            = "B Cell/Plasma Cell",
+  "Plasma Cell/NK Admixture (CD138+TIM3+TBet+CD56+)"     = "B Cell/Plasma Cell",
+  "Plasmablast, Strongly Activated (CD38++, Macrophage-Admixed)" = "B Cell/Plasma Cell",
+  "Plasmablast/Activated B Cell (CD38+)"                 = "B Cell/Plasma Cell",
+  "Transitional B Cell/Plasmablast (CD19+CD138+HLADRB+)" = "B Cell/Plasma Cell",
+
+  "CD4+ T Cell"                                          = "T Cell",
+  "CD8+ T Cell"                                          = "T Cell",
+  "Memory T Cell"                                        = "T Cell",
+  "Memory T Cell (CD45RO+)"                              = "T Cell",
+  "Memory/Activated T Cell (CD4++)"                      = "T Cell",
+  "T Cell (TIM3+)"                                       = "T Cell",
+  "T Cell, Exhaustion-leaning (PD1++)"                   = "T Cell",
+  "Treg"                                                 = "T Cell",
+  "Treg (FoxP3+)"                                        = "T Cell",
+  "T Cell/DC Admixture (CD11c+)"                         = "T Cell",
+
+  "Macrophage (CD68+)"                                   = "Myeloid",
+  "Macrophage, Antigen-Presenting (HLADRB+)"             = "Myeloid",
+  "Macrophage, M2-like (CD163+)"                         = "Myeloid",
+  "Macrophage, Mixed Signal (PDL1+)"                     = "Myeloid",
+  "Macrophage, Proliferating (HLADRB+)"                  = "Myeloid",
+  "Macrophage, Proliferating (MKI67+, Patient10-Driven Artifact)" = "Myeloid",
+  "Monocyte (Generic)"                                   = "Myeloid",
+  "Monocyte (PD1+)"                                      = "Myeloid",
+  "Monocyte-Macrophage Transitional (CD14+)"             = "Myeloid",
+  "Monocyte-Macrophage, Unresolved"                      = "Myeloid",
+  "Monocyte, Unresolved"                                 = "Myeloid",
+  "cDC1"                                                 = "Myeloid",
+  "DC/mregDC, Epithelial-Adjacent (EpCAM+/CD117+)"       = "Myeloid",
+  "Dendritic Cell (CD11c+)"                              = "Myeloid",
+  "PMN-MDSC"                                             = "Myeloid",
+
+  "Epithelial (EpCAM+)"                                  = "Epithelial/Stroma",
+  "Fibroblast/Stroma"                                    = "Epithelial/Stroma",
+  "Tumor Epithelial (Neuroendocrine)"                    = "Epithelial/Stroma",
+  "Tumor Epithelial (TTF1++)"                            = "Epithelial/Stroma",
+
+  "Mast Cell"                                            = "Other",
+  "Proliferating Cells"                                  = "Other"
+)
+
+spe$celltype_category <- celltype_category[as.character(spe$final_celltype)]
+```
+
+Flag anything that didn't map:
+
+```{r check-unmapped}
+unmapped <- setdiff(unique(as.character(spe$final_celltype)), names(celltype_category))
+if (length(unmapped) > 0) {
+  cat("Unmapped final_celltype labels -- add these to celltype_category:\n")
+  print(unmapped)
+} else {
+  cat("All final_celltype labels mapped to a category.\n")
+}
+```
+
+## 5. Cell Counts by Category and Final Cell Type
+
+```{r counts-category}
+cat("Cell count by broad category:\n")
+print(table(spe$celltype_category, useNA = "ifany"))
+```
+
+## 6. Panel Markers (Excluding DNA/Membrane)
+
+```{r markers}
+exclude_channels <- c("DNA191", "DNA193", "Membrane")
+panel_markers <- setdiff(rownames(spe), exclude_channels)
+
+cat("Markers used for violin plots:", paste(panel_markers, collapse = ", "), "\n")
+```
+
+## 7. Violin Plot Function (One Plot Per Marker)
+
+```{r make-violinplot}
+make_violinplot_single_marker <- function(spe, assay_name, cluster_col, marker, title) {
+  expr_vec   <- assay(spe, assay_name)[marker, ]
+  cluster_id <- factor(spe[[cluster_col]])
+
+  plot_df <- data.frame(cluster = cluster_id, expr = expr_vec)
+
+  ggplot(plot_df, aes(x = cluster, y = expr, fill = cluster)) +
+    geom_violin(scale = "width", trim = TRUE, linewidth = 0.2) +
+    stat_summary(fun = median, geom = "point", size = 0.8, color = "black") +
+    labs(title = title, x = "Cell Type", y = "Z-score expression") +
+    theme_bw(base_size = 11) +
+    theme(
+      axis.text.x       = element_text(angle = 45, hjust = 1, size = 9),
+      panel.grid.major.x = element_blank(),
+      legend.position    = "none"
+    )
+}
+```
+
+## 8. Violin Plots per Category (One Plot per Marker)
+
+### B Cell/Plasma Cell
+
+```{r violin-bcell, fig.width=10, fig.height=5, results='asis'}
+spe_bcell_group <- spe[, spe$celltype_category == "B Cell/Plasma Cell"]
+spe_bcell_group$final_celltype <- droplevels(factor(spe_bcell_group$final_celltype))
+
+for (m in panel_markers) {
+  p <- make_violinplot_single_marker(spe_bcell_group, "scaled_0100", "final_celltype", m,
+                                     paste("B Cell/Plasma Cell:", m))
+  print(p)
+}
+```
+
+### B Cell/Plasma Cell: Admixture Signal Shape Check
+
+```{r make-density-plot}
+make_density_plot <- function(spe, assay_name, cluster_col, cluster_label, marker, title) {
+  expr_vec   <- assay(spe, assay_name)[marker, ]
+  cluster_id <- spe[[cluster_col]]
+
+  idx <- which(cluster_id == cluster_label)
+  plot_df <- data.frame(expr = expr_vec[idx])
+
+  ggplot(plot_df, aes(x = expr)) +
+    geom_histogram(aes(y = after_stat(density)), bins = 60, fill = "steelblue", alpha = 0.6) +
+    geom_density(color = "firebrick", linewidth = 0.8) +
+    labs(title = title, x = "Z-score expression", y = "Density") +
+    theme_bw(base_size = 11)
+}
+```
+
+```{r density-tim3-cluster, fig.width=7, fig.height=4}
+tim3_label <- "Plasma Cell/NK Admixture (CD138+TIM3+TBet+CD56+)"
+
+p_tbet_density <- make_density_plot(spe_bcell_group, "scaled_0100", "final_celltype",
+                                    tim3_label, "TBet",
+                                    "TIM3+ Cluster: TBet Density")
+print(p_tbet_density)
+
+p_cd56_density <- make_density_plot(spe_bcell_group, "scaled_0100", "final_celltype",
+                                    tim3_label, "CD56",
+                                    "TIM3+ Cluster: CD56 Density")
+print(p_cd56_density)
+
+p_cd45ra_density <- make_density_plot(spe_bcell_group, "scaled_0100", "final_celltype",
+                                      tim3_label, "CD45RA",
+                                      "TIM3+ Cluster: CD45RA Density")
+print(p_cd45ra_density)
+```
+
+```{r density-activated-cluster, fig.width=7, fig.height=4}
+activated_label <- "Plasmablast, Strongly Activated (CD38++, Macrophage-Admixed)"
+
+p_cd68_density <- make_density_plot(spe_bcell_group, "scaled_0100", "final_celltype",
+                                    activated_label, "CD68",
+                                    "Strongly Activated Cluster: CD68 Density")
+print(p_cd68_density)
+
+p_cd14_density <- make_density_plot(spe_bcell_group, "scaled_0100", "final_celltype",
+                                    activated_label, "CD14",
+                                    "Strongly Activated Cluster: CD14 Density")
+print(p_cd14_density)
+```
+
+### T Cell
+
+```{r violin-tcell, fig.width=10, fig.height=5, results='asis'}
+spe_tcell_group <- spe[, spe$celltype_category == "T Cell"]
+spe_tcell_group$final_celltype <- droplevels(factor(spe_tcell_group$final_celltype))
+
+for (m in panel_markers) {
+  p <- make_violinplot_single_marker(spe_tcell_group, "scaled_0100", "final_celltype", m,
+                                     paste("T Cell:", m))
+  print(p)
+}
+```
+
+### T Cell: Memory T Cell Comparison and CD138 Cross-Category Check
+
+```{r heatmap-memory-tcell-comparison, fig.width=6, fig.height=8}
+memory_labels <- c("Memory T Cell", "Memory T Cell (CD45RO+)")
+
+spe_memory_compare <- spe_tcell_group[, spe_tcell_group$final_celltype %in% memory_labels]
+spe_memory_compare$final_celltype <- droplevels(factor(spe_memory_compare$final_celltype))
+
+mean_expr_memory <- sapply(levels(spe_memory_compare$final_celltype), function(cl) {
+  idx <- which(spe_memory_compare$final_celltype == cl)
+  rowMeans(assay(spe_memory_compare, "scaled_0100")[panel_markers, idx, drop = FALSE])
+})
+
+marker_order_memory <- panel_markers[hclust(dist(mean_expr_memory))$order]
+
+heatmap_memory_df <- as.data.frame(mean_expr_memory) |>
+  rownames_to_column("marker") |>
+  pivot_longer(-marker, names_to = "cell_type", values_to = "mean_expr")
+
+heatmap_memory_df$marker <- factor(heatmap_memory_df$marker, levels = marker_order_memory)
+
+p_heatmap_memory <- ggplot(heatmap_memory_df, aes(x = cell_type, y = marker, fill = mean_expr)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(mean_expr, 2)), size = 3) +
+  scale_fill_gradient2(low = "steelblue", mid = "white", high = "firebrick",
+                       midpoint = 0, name = "Mean\nZ-score") +
+  labs(title = "Memory T Cell vs. Memory T Cell (CD45RO+): Full Panel Comparison",
+       x = "Cell Type", y = "Marker") +
+  theme_bw(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+print(p_heatmap_memory)
+```
+
+```{r cd138-cross-category-check, fig.width=10, fig.height=5}
+cd138_by_category <- data.frame(
+  category = spe$celltype_category,
+  cd138    = assay(spe, "scaled_0100")["CD138", ]
+)
+
+p_cd138_category <- ggplot(cd138_by_category, aes(x = category, y = cd138, fill = category)) +
+  geom_violin(scale = "width", trim = TRUE, linewidth = 0.2) +
+  stat_summary(fun = median, geom = "point", size = 0.8, color = "black") +
+  labs(title = "CD138 by Broad Category (Cross-Category Spillover Check)",
+       x = "Category", y = "Z-score expression") +
+  theme_bw(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid.major.x = element_blank(),
+        legend.position = "none")
+print(p_cd138_category)
+```
+
+### Myeloid
+
+```{r violin-myeloid, fig.width=10, fig.height=5, results='asis'}
+spe_myeloid_group <- spe[, spe$celltype_category == "Myeloid"]
+spe_myeloid_group$final_celltype <- droplevels(factor(spe_myeloid_group$final_celltype))
+
+for (m in panel_markers) {
+  p <- make_violinplot_single_marker(spe_myeloid_group, "scaled_0100", "final_celltype", m,
+                                     paste("Myeloid:", m))
+  print(p)
+}
+```
+
+### Myeloid: Macrophage, Proliferating (MKI67+) Diagnostic
+
+Same diagnostic used previously for the k150 "Unknown" cluster artifact
+-- total counts, cell area, and patient/ROI origin -- applied here to
+check whether the broad off-lineage marker elevation in this cluster
+reflects a technical artifact, spatial spillover, or real biology
+layered with background noise.
+
+```{r prolif-setup}
+prolif_label <- "Macrophage, Proliferating (MKI67+, Patient10-Driven Artifact)"
+
+idx_prolif <- which(spe_myeloid_group$final_celltype == prolif_label)
+
+cat("Number of cells in", prolif_label, ":", length(idx_prolif), "\n")
+```
+
+```{r prolif-total-counts, fig.width=7, fig.height=5}
+total_counts_all     <- colSums(assay(spe_myeloid_group, "counts"))
+total_counts_prolif  <- total_counts_all[idx_prolif]
+total_counts_other   <- total_counts_all[-idx_prolif]
+
+cat("Total counts -- Proliferating cluster:\n")
+print(summary(total_counts_prolif))
+
+cat("\nTotal counts -- all other myeloid cells:\n")
+print(summary(total_counts_other))
+
+count_compare_df <- data.frame(
+  total_counts = c(total_counts_prolif, total_counts_other),
+  group = c(rep("Proliferating (MKI67+)", length(total_counts_prolif)),
+            rep("Other Myeloid", length(total_counts_other)))
+)
+
+p_counts_compare <- ggplot(count_compare_df, aes(x = group, y = total_counts, fill = group)) +
+  geom_violin(scale = "width", trim = TRUE) +
+  stat_summary(fun = median, geom = "point", size = 1, color = "black") +
+  labs(title = "Total Counts: Proliferating Cluster vs. Other Myeloid",
+       x = "", y = "Total Counts per Cell") +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "none")
+print(p_counts_compare)
+```
+
+```{r prolif-check-coldata-columns}
+# Check available colData columns to confirm the correct area/ROI column names below
+print(colnames(colData(spe_myeloid_group)))
+```
+
+```{r prolif-cell-area, fig.width=7, fig.height=5}
+area_col <- "area"  # <-- update if colData uses a different column name
+
+if (area_col %in% colnames(colData(spe_myeloid_group))) {
+  cell_area_all    <- colData(spe_myeloid_group)[[area_col]]
+  cell_area_prolif <- cell_area_all[idx_prolif]
+  cell_area_other  <- cell_area_all[-idx_prolif]
+
+  cat("Cell area -- Proliferating cluster:\n")
+  print(summary(cell_area_prolif))
+
+  cat("\nCell area -- all other myeloid cells:\n")
+  print(summary(cell_area_other))
+
+  area_compare_df <- data.frame(
+    area  = c(cell_area_prolif, cell_area_other),
+    group = c(rep("Proliferating (MKI67+)", length(cell_area_prolif)),
+              rep("Other Myeloid", length(cell_area_other)))
+  )
+
+  p_area_compare <- ggplot(area_compare_df, aes(x = group, y = area, fill = group)) +
+    geom_violin(scale = "width", trim = TRUE) +
+    stat_summary(fun = median, geom = "point", size = 1, color = "black") +
+    labs(title = "Cell Area: Proliferating Cluster vs. Other Myeloid",
+         x = "", y = "Cell Area") +
+    theme_bw(base_size = 11) +
+    theme(legend.position = "none")
+  print(p_area_compare)
+} else {
+  cat("Column '", area_col, "' not found in colData -- check colnames(colData(spe)) output above and update area_col.\n")
+}
+```
+
+```{r prolif-patient-origin}
+patient_counts_prolif <- table(spe_myeloid_group$patient_id[idx_prolif])
+patient_totals        <- table(spe_myeloid_group$patient_id)
+
+prolif_origin <- data.frame(
+  patient              = names(patient_counts_prolif),
+  prolif_cell_count    = as.integer(patient_counts_prolif),
+  pct_of_prolif_cluster = round(100 * as.integer(patient_counts_prolif) / sum(patient_counts_prolif), 1),
+  pct_of_patient_total  = round(100 * as.integer(patient_counts_prolif) /
+                                 as.integer(patient_totals[names(patient_counts_prolif)]), 1)
+)
+prolif_origin <- prolif_origin[order(-prolif_origin$pct_of_prolif_cluster), ]
+
+cat("Patient origin of Macrophage, Proliferating (MKI67+) cluster:\n")
+print(prolif_origin)
+```
+
+```{r prolif-roi-origin}
+roi_col <- "sample_id"
+
+if (roi_col %in% colnames(colData(spe_myeloid_group))) {
+  roi_counts_prolif <- table(colData(spe_myeloid_group)[[roi_col]][idx_prolif])
+  roi_totals        <- table(colData(spe_myeloid_group)[[roi_col]])
+
+  prolif_roi_origin <- data.frame(
+    roi                  = names(roi_counts_prolif),
+    prolif_cell_count    = as.integer(roi_counts_prolif),
+    pct_of_prolif_cluster = round(100 * as.integer(roi_counts_prolif) / sum(roi_counts_prolif), 1),
+    pct_of_roi_total     = round(100 * as.integer(roi_counts_prolif) /
+                                  as.integer(roi_totals[names(roi_counts_prolif)]), 1)
+  )
+  prolif_roi_origin <- prolif_roi_origin[order(-prolif_roi_origin$pct_of_prolif_cluster), ]
+
+  cat("ROI origin of Macrophage, Proliferating (MKI67+) cluster:\n")
+  print(prolif_roi_origin)
+} else {
+  cat("Column '", roi_col, "' not found in colData -- check colnames(colData(spe)) output above and update roi_col.\n")
+}
+```
+
+```{r prolif-density-check, fig.width=7, fig.height=4}
+p_rorgt_density <- make_density_plot(spe_myeloid_group, "scaled_0100", "final_celltype",
+                                     prolif_label, "RORgT",
+                                     "Proliferating Cluster: RORgT Density")
+print(p_rorgt_density)
+
+p_ccr7_density <- make_density_plot(spe_myeloid_group, "scaled_0100", "final_celltype",
+                                    prolif_label, "CCR7",
+                                    "Proliferating Cluster: CCR7 Density")
+print(p_ccr7_density)
+
+p_cd127_density <- make_density_plot(spe_myeloid_group, "scaled_0100", "final_celltype",
+                                     prolif_label, "CD127",
+                                     "Proliferating Cluster: CD127 Density")
+print(p_cd127_density)
+```
+
+### Epithelial/Stroma
+
+```{r violin-epi-stroma, fig.width=10, fig.height=5, results='asis'}
+spe_epi_group <- spe[, spe$celltype_category == "Epithelial/Stroma"]
+spe_epi_group$final_celltype <- droplevels(factor(spe_epi_group$final_celltype))
+
+for (m in panel_markers) {
+  p <- make_violinplot_single_marker(spe_epi_group, "scaled_0100", "final_celltype", m,
+                                     paste("Epithelial/Stroma:", m))
+  print(p)
+}
+```
+
+```{r}
+## Optional Check: Tumor Epithelial (TTF1++) Patient/ROI Distribution
+
+tumor_ttf1_label <- "Tumor Epithelial (TTF1++)"
+
+idx_tumor_ttf1 <- which(spe_epi_group$final_celltype == tumor_ttf1_label)
+
+patient_counts_ttf1 <- table(spe_epi_group$patient_id[idx_tumor_ttf1])
+patient_totals_epi  <- table(spe_epi_group$patient_id)
+
+ttf1_origin <- data.frame(
+  patient               = names(patient_counts_ttf1),
+  ttf1_cell_count       = as.integer(patient_counts_ttf1),
+  pct_of_ttf1_cluster   = round(100 * as.integer(patient_counts_ttf1) / sum(patient_counts_ttf1), 1),
+  pct_of_patient_total  = round(100 * as.integer(patient_counts_ttf1) /
+                                 as.integer(patient_totals_epi[names(patient_counts_ttf1)]), 1)
+)
+ttf1_origin <- ttf1_origin[order(-ttf1_origin$pct_of_ttf1_cluster), ]
+
+cat("Patient origin of Tumor Epithelial (TTF1++) cluster:\n")
+print(ttf1_origin)
+```
+
+### Other
+
+```{r violin-other, fig.width=10, fig.height=5, results='asis'}
+spe_other_group <- spe[, spe$celltype_category == "Other"]
+spe_other_group$final_celltype <- droplevels(factor(spe_other_group$final_celltype))
+
+for (m in panel_markers) {
+  p <- make_violinplot_single_marker(spe_other_group, "scaled_0100", "final_celltype", m,
+                                     paste("Other:", m))
+  print(p)
+}
+```

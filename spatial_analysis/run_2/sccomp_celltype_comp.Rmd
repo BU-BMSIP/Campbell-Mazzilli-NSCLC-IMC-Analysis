@@ -1,0 +1,243 @@
+---
+title: "Cell Type Composition Association with Disease State (sccomp)"
+author: "Vaidehi Gupta"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+Runs `sccomp` on the finalized cell type annotation to test whether cell
+type proportions are associated with disease stage, producing two
+comparisons:
+
+1. Lower & Higher vs. Benign (Benign as reference)
+2. Higher vs. Lower directly (Lower as reference)
+
+Both are shown as ranked forest plots (effect size + credible interval),
+skipping the volcano plot this round since the forest plots proved more
+directly interpretable last time.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+```
+
+# 1. Load Libraries
+
+```{r libraries}
+.libPaths(c("/restricted/projectnb/camplab/home/vgupta7/R_libs", .libPaths()))
+
+library(imcRtools)
+library(tidyverse)
+library(SingleCellExperiment)
+library(SpatialExperiment)
+library(scater)
+library(cmdstanr)
+library(sccomp)
+library(tidytext)
+library(kableExtra)
+```
+
+# 2. Paths
+
+```{r paths}
+analysis_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis"
+
+# Update to whichever is the current, Campbell-approved final annotation file
+final_celltype_path <- file.path(analysis_path, "final_cell_annotation",
+                                  "final_cell_annotation_post_inspect.rds")
+
+sccomp_out_dir <- file.path(analysis_path, "spatial_analysis")
+dir.create(sccomp_out_dir, recursive = TRUE, showWarnings = FALSE)
+
+sccomp_vs_benign_path   <- file.path(sccomp_out_dir, "sccomp_celltype_vs_benign.rds")
+sccomp_higher_v_lower_path <- file.path(sccomp_out_dir, "sccomp_celltype_higher_v_lower.rds")
+```
+
+# 3. Load Finalized Annotated Object
+
+```{r load-spe}
+spe <- readRDS(final_celltype_path)
+
+cat("Cells:", ncol(spe), "\n")
+cat("Cell types:", nlevels(spe$final_celltype), "\n")
+```
+
+# 4. Build sccomp Input Object (Benign as Reference)
+
+```{r sccomp-prep}
+sceIMC <- SingleCellExperiment(list(counts = assay(spe, "counts")))
+sceIMC$Patient      <- factor(spe$patient_id)
+sceIMC$Sample       <- factor(spe$sample_id)
+sceIMC$DiseaseState <- factor(spe$disease_state, levels = c("Benign", "Lower", "Higher"))
+sceIMC$CellType     <- factor(spe$final_celltype)
+
+cat("Patients:", n_distinct(sceIMC$Patient), "\n")
+cat("Disease states:", paste(levels(sceIMC$DiseaseState), collapse = ", "), "\n")
+cat("Cell types:", n_distinct(sceIMC$CellType), "\n")
+```
+
+# 5. Run sccomp: Lower & Higher vs. Benign
+
+Loads from disk if already run, to avoid re-fitting unnecessarily.
+
+```{r sccomp-run-vs-benign}
+if (file.exists(sccomp_vs_benign_path)) {
+  sccomp_vs_benign_res <- readRDS(sccomp_vs_benign_path)
+} else {
+  sccomp_vs_benign_res <- sceIMC |>
+    sccomp_estimate(
+      formula_composition = ~ DiseaseState + (1 | Patient),
+      .sample     = Sample,
+      .cell_group = CellType,
+      verbose = FALSE
+    ) |>
+    sccomp_test()
+
+  saveRDS(sccomp_vs_benign_res, sccomp_vs_benign_path)
+}
+
+unique(sccomp_vs_benign_res$parameter)
+```
+
+# 6. Run sccomp: Higher vs. Lower (Direct Contrast)
+
+```{r sccomp-run-higher-v-lower}
+if (file.exists(sccomp_higher_v_lower_path)) {
+  sccomp_higher_v_lower_res <- readRDS(sccomp_higher_v_lower_path)
+} else {
+  sceIMC_hvl <- sceIMC
+  sceIMC_hvl$DiseaseState <- factor(spe$disease_state, levels = c("Lower", "Higher", "Benign"))
+
+  sccomp_higher_v_lower_res <- sceIMC_hvl |>
+    sccomp_estimate(
+      formula_composition = ~ DiseaseState + (1 | Patient),
+      .sample     = Sample,
+      .cell_group = CellType,
+      verbose = FALSE
+    ) |>
+    sccomp_test()
+
+  saveRDS(sccomp_higher_v_lower_res, sccomp_higher_v_lower_path)
+}
+
+unique(sccomp_higher_v_lower_res$parameter)
+```
+
+# 7. Forest Plot: Lower & Higher vs. Benign
+
+Faceted by contrast, sorted by effect size within each facet. FDR<0.05
+only; CI-crosses-zero cases are excluded rather than just flagged, given
+the earlier finding that FDR alone can pass while the credible interval
+still spans zero.
+
+```{r forest-vs-benign, fig.width=16, fig.height=12}
+effect_df_benign <- sccomp_vs_benign_res |>
+  as.data.frame() |>
+  filter(parameter %in% c("DiseaseStateLower", "DiseaseStateHigher")) |>
+  filter(c_FDR < 0.05) |>
+  filter(!(c_lower < 0 & c_upper > 0)) |>   # drop cases where CI still crosses zero
+  mutate(CellType_ordered = reorder_within(CellType, c_effect, parameter))
+
+ggplot(effect_df_benign, aes(x = c_effect, y = CellType_ordered)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_errorbarh(aes(xmin = c_lower, xmax = c_upper), height = 0, color = "grey40") +
+  geom_point(aes(color = c_effect > 0), size = 2, show.legend = FALSE) +
+  scale_color_manual(values = c("TRUE" = "firebrick", "FALSE" = "steelblue")) +
+  scale_y_reordered() +
+  facet_wrap(~ parameter, scales = "free_y") +
+  theme_classic() +
+  theme(axis.text.y = element_text(size = 11)) +
+  labs(
+    x = "Effect size (logit fold-change)",
+    y = NULL,
+    title = "Cell type composition: Lower & Higher vs. Benign",
+    subtitle = "FDR < 0.05, CI excludes zero; red = increases, blue = decreases"
+  )
+```
+
+```{r save-forest-vs-benign}
+ggsave(file.path(analysis_path, "figures", "celltype_comp_vs_benign.png"),
+       width = 10, height = 12, dpi = 300)
+```
+
+# 8. Forest Plot: Higher vs. Lower (Direct Contrast)
+
+```{r forest-higher-v-lower, fig.width=8, fig.height=12}
+effect_df_hvl <- sccomp_higher_v_lower_res |>
+  as.data.frame() |>
+  filter(parameter == "DiseaseStateHigher") |>   # Higher vs. Lower, since Lower is the reference
+  filter(c_FDR < 0.05) |>
+  filter(!(c_lower < 0 & c_upper > 0)) |>
+  mutate(CellType = factor(CellType, levels = CellType[order(c_effect)]))
+
+ggplot(effect_df_hvl, aes(x = c_effect, y = CellType)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_errorbarh(aes(xmin = c_lower, xmax = c_upper), height = 0, color = "grey40") +
+  geom_point(aes(color = c_effect > 0), size = 2, show.legend = FALSE) +
+  scale_color_manual(values = c("TRUE" = "firebrick", "FALSE" = "steelblue")) +
+  theme_classic() +
+  theme(axis.text.y = element_text(size = 11)) +
+  labs(
+    x = "Effect size (logit fold-change)",
+    y = NULL,
+    title = "Cell type composition: Higher vs. Lower disease stage",
+    subtitle = "FDR < 0.05, CI excludes zero; red = increases, blue = decreases"
+  )
+```
+
+```{r save-forest-higher-v-lower}
+ggsave(file.path(analysis_path, "figures", "celltype_comp_higher_vs_lower.png"),
+       width = 8, height = 12, dpi = 300)
+```
+
+# 9. Results Table
+
+```{r sccomp-results-table}
+sccomp_results_df <- sccomp_vs_benign_res |>
+  arrange(c_FDR) |>
+  as.data.frame() |>
+  select(CellType, parameter, c_effect, c_lower, c_upper, c_FDR)
+
+write.csv(sccomp_results_df,
+          file.path(sccomp_out_dir, "sccomp_celltype_results_vs_benign.csv"),
+          row.names = FALSE)
+
+sccomp_higher_v_lower_df <- sccomp_higher_v_lower_res |>
+  arrange(c_FDR) |>
+  as.data.frame() |>
+  select(CellType, parameter, c_effect, c_lower, c_upper, c_FDR)
+
+write.csv(sccomp_higher_v_lower_df,
+          file.path(sccomp_out_dir, "sccomp_celltype_results_higher_v_lower.csv"),
+          row.names = FALSE)
+
+sccomp_results_df |>
+  knitr::kable(digits = 3, caption = "Cell type composition: Lower & Higher vs. Benign",
+               format = "latex", booktabs = TRUE, longtable = TRUE) |>
+  kable_styling(latex_options = c("striped", "repeat_header", "hold_position"),
+                font_size = 8)
+```
+
+# Notes
+
+- Loaded from `final_cell_annotation_post_inspect.rds` -- update
+  `final_celltype_path` once Campbell's feedback produces a further-updated
+  file, and re-run both sccomp calls fresh (delete the cached `.rds` outputs
+  in `spatial_analysis/` first, since the load-from-cache logic will
+  otherwise silently reuse stale results).
+- Both forest plots now exclude cases where `c_FDR < 0.05` but the credible
+  interval still crosses zero (the cDC1/Lower issue found earlier) --
+  double check this doesn't unexpectedly drop a cell type you expected to
+  see, given the updated annotation labels from today's inspection.
+- Volcano plot intentionally omitted this round -- code available in the
+  original `spatial_setup_celltype.Rmd` (`eval=FALSE`'d there) if needed
+  again for a specific request.

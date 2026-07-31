@@ -11,8 +11,7 @@ output:
 
 Builds the spatial graph from the finalized annotated dataset, visualizes
 cell centroids + graph edges per ROI, and runs formal cell-cell interaction
-testing -- addressing the to-do item "visualize the cells' centroids and
-cell-cell interactions as spatial graphs."
+testing.
 
 **IMPORTANT:** this loads `spe_final_celltype.rds`. As of writing, the final
 annotation is still being finalized (a few label naming/marker-mismatch
@@ -27,7 +26,7 @@ knitr::opts_chunk$set(message = FALSE, warning = FALSE)
 # 1. Load Libraries
 
 ```{r libraries}
-.libPaths(c("/restricted/projectnb/camplab/home/vgupta7/R_libs", .libPaths()))
+#.libPaths(c("/restricted/projectnb/camplab/home/vgupta7/R_libs", .libPaths()))
 
 library(imcRtools)
 library(tidyverse)
@@ -45,7 +44,6 @@ analysis_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/Tumo
 final_celltype_path <- file.path(analysis_path, "final_cell_annotation", "spe_final_celltype.rds")
 
 spatial_analysis_path <- file.path(analysis_path, "spatial_analysis")
-dir.create(spatial_analysis_path, recursive = TRUE, showWarnings = FALSE)
 
 spatial_graph_out_path <- file.path(spatial_analysis_path, "spe_spatial_graph.rds")
 interactions_out_path  <- file.path(spatial_analysis_path, "cell_interactions.csv")
@@ -61,6 +59,10 @@ cat("Cell types:", nlevels(spe$final_celltype), "\n")
 cat("Samples/ROIs:", length(unique(spe$sample_id)), "\n")
 ```
 
+```{r}
+levels(spe$final_celltype)
+```
+
 # 4. Build Spatial Graph
 
 Using `type = "expansion"` and `threshold = 20`, matching the reference
@@ -69,23 +71,35 @@ current working decision -- pending confirmation from Campbell given the
 20 vs. 50 discrepancy between the manuscript text and code).
 
 ```{r build-spatial-graph}
+t0 <- Sys.time()
+
 spe <- buildSpatialGraph(
   spe,
   img_id    = "sample_id",
   type      = "expansion",
-  threshold = 20
+  threshold = 20,
+  name      = "expansion_interaction_graph"
 )
 
+t1 <- Sys.time()
+cat("Spatial graph built on full dataset in",
+    round(as.numeric(t1 - t0, units = "mins"), 2), "minutes\n")
+
 colPairNames(spe)
+graph_name <- "expansion_interaction_graph"
 ```
 
 ```{r graph-diagnostics}
-graph_name <- colPairNames(spe)[1]
+graph_obj <- colPair(spe, graph_name)
+cat("Total edges in graph:", length(graph_obj), "\n")
+cat("Mean neighbors per cell:", round(length(graph_obj) / ncol(spe), 2), "\n")
 
-neighbor_counts <- imcRtools::countNeighbors(spe, colPairName = graph_name)
-cat("Mean neighbors per cell:", mean(neighbor_counts, na.rm = TRUE), "\n")
-cat("Median neighbors per cell:", median(neighbor_counts, na.rm = TRUE), "\n")
+# Per-cell neighbor counts, for median/distribution
+neighbor_counts <- table(factor(from(graph_obj), levels = seq_len(ncol(spe))))
+cat("Median neighbors per cell:", median(neighbor_counts), "\n")
 ```
+
+On average, each cell has about 8.36 neighbors within the 20 um radius (roughly 8 cells physically close enough to be considered its spatial neighborhood).
 
 ```{r save-spatial-graph}
 saveRDS(spe, spatial_graph_out_path)
@@ -112,31 +126,114 @@ plotSpatial(
   img_id        = "sample_id",
   draw_edges    = TRUE,
   colPairName   = graph_name,
-  node_size_fix = 0.5
+  node_size_fix = 0.8,
+  edge_width_fix = 0.1,
+  edge_color_fix = "grey70"
 ) +
   scale_color_manual(values = celltype_colors) +
-  labs(title = paste("Spatial graph:", one_sample_id)) +
+  labs(title = paste("Cell centroids:", one_sample_id)) +
   theme(legend.text = element_text(size = 6),
         legend.key.size = unit(0.3, "cm"))
 ```
 
+
 ```{r plot-spatial-multiple, fig.width=16, fig.height=12}
-# Spot-check a few more ROIs across different patients/disease states
-sample_ids_to_check <- unique(spe$sample_id)[1:min(4, length(unique(spe$sample_id)))]
+# One ROI each from a Benign, Lower, and Higher disease-state patient
+sample_ids_to_check <- c(
+  "Patient_10T_ROI_001_1",  # Patient10 -- Benign
+  "Patient_14T_ROI_001_1",  # Patient14 -- Lower
+  "Patient_12T_ROI_001_1"   # Patient12 -- Higher
+)
 
 for (sid in sample_ids_to_check) {
   one_sample <- spe[, spe$sample_id == sid]
+  disease_state <- unique(one_sample$disease_state)
+
   p <- plotSpatial(
     one_sample,
     node_color_by = "final_celltype",
     img_id        = "sample_id",
     draw_edges    = TRUE,
     colPairName   = graph_name,
-    node_size_fix = 0.5
+    node_size_fix = 0.8,
+    edge_width_fix = 0.1,
+    edge_color_fix = "grey70"
   ) +
     scale_color_manual(values = celltype_colors) +
-    labs(title = paste("Spatial graph:", sid)) +
+    labs(title = paste0("Spatial graph: ", sid, " (", disease_state, ")")) +
     theme(legend.position = "none")
+  print(p)
+}
+```
+
+Patient 12 (higher disease state) and Patient 14 (lower disease state) ROIs look denser than Patient 10 (benign). 
+
+Could be because they have genuinely higher cell density (makes sense as they are tumor tissues) --> more cells per unit area mean than more pairs fall within 20 um of each other, making more edges. Could also be because these two ROIs simply contain more total cells than the benign one.
+
+```{r}
+#Checking cell counts for these ROIs
+table(spe$sample_id)[c("Patient_10T_ROI_001_1", "Patient_14T_ROI_001_1", "Patient_12T_ROI_001_1")]
+
+#Per ROI density (comparing cells, edges and mean neighbors)
+per_roi_density <- sapply(c("Patient_10T_ROI_001_1", "Patient_14T_ROI_001_1", "Patient_12T_ROI_001_1"), function(sid) {
+  n_cells <- sum(spe$sample_id == sid)
+  n_edges <- length(colPair(spe[, spe$sample_id == sid], graph_name))
+  c(n_cells = n_cells, n_edges = n_edges, mean_neighbors = n_edges / n_cells)
+})
+t(per_roi_density)
+```
+Mean neighbors roughly double from benign (4.4) -> lower (6.7) -> higher (8.3)
+
+```{r plot-spatial-bt-only, fig.width=16, fig.height=12}
+b_colors <- c(
+  "B Cell (CD19+)"                                          = "#0000FF",  # sky blue
+  "B Cell, Weak (CD19+)"                                    = "#7FB3D5",  # medium blue
+  "B Cell/Plasma Cell, HLADRB-high (CD19+CD138+HLADRB+)"    = "#000080",  # navy
+  "Plasmablast/Activated B Cell (CD38+)"                    = "#89CFEF",  # dark navy
+  "Transitional B Cell/Plasmablast (CD19+CD138+HLADRB+)"    = "#6693F5"   # pale steel blue
+)
+
+t_colors <- c(
+  "CD4+ T Cell"                                = "#01ff01",  # bright green
+  "CD8+ T Cell"                                = "#008080",
+  "Memory T Cell"                               = "#bfdd50",  # forest green
+  "Memory/Activated T Cell (CD4++)"             = "#9bc022",  # mint
+  "T Cell (TIM3+)"                              = "#07DD05",  # deep teal-green
+  "T Cell, Exhaustion-leaning (PD1++)"          = "#9cff94",  # sea green
+  "Treg"                                        = "#0e5913"  # dark forest
+)
+
+bt_colors <- c(b_colors, t_colors, "Other" = "grey90")
+spe$celltype_bt_highlight <- ifelse(
+  spe$final_celltype %in% c(b_labels, t_labels),
+  as.character(spe$final_celltype),
+  "Other"
+)
+spe$celltype_bt_highlight <- factor(spe$celltype_bt_highlight, levels = c(b_labels, t_labels, "Other"))
+
+bt_colors <- c(b_colors, t_colors, "Other" = "grey90")
+
+for (sid in sample_ids_to_check) {
+  one_sample <- spe[, spe$sample_id == sid]
+  disease_state <- unique(one_sample$disease_state)
+
+  p <- plotSpatial(
+    one_sample,
+    node_color_by = "celltype_bt_highlight",
+    img_id        = "sample_id",
+    draw_edges    = TRUE,
+    colPairName   = graph_name,
+    node_size_fix = 2,
+    edge_width_fix = 0.15,
+    edge_color_fix = "grey70",
+    nodes_first = FALSE   # draw edges first, so colored nodes sit on top, not buried under them
+  ) +
+    scale_color_manual(values = bt_colors, name = "Cell Type") +
+    labs(title = paste0("B/T Cells: ", sid, " (", disease_state, ")")) +
+    theme(legend.text = element_text(size = 10),
+        legend.title = element_text(size = 12),
+        legend.key.size = unit(0.6, "cm")) +
+  guides(color = guide_legend(override.aes = list(size = 4)))
   print(p)
 }
 ```
@@ -166,6 +263,9 @@ write.csv(interactions_df, interactions_out_path, row.names = FALSE)
 cat("Saved interaction results to:", interactions_out_path, "\n")
 
 head(interactions_df)
+```
+```{r}
+cat("Interaction testing completed in", round(as.numeric(t1 - t0, units = "mins"), 2), "minutes\n")
 ```
 
 # 7. Visualize Interaction Results

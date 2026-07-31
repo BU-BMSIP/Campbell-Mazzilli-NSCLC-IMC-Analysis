@@ -110,27 +110,80 @@ print(sort(as.numeric(as.character(sig_niches))))
 
 ---
 
-## 3b. Significant niches: effect size and FDR
+## 3a. Significant niches: effect size and FDR
 
-Combined table of every niche x contrast pair that cleared FDR < 0.05
-in either model, for reference alongside the composition/annotation
-work below.
+Table of every niche x contrast pair that cleared FDR < 0.05 in either
+model, showing which factor (N-status vs. Stage) each significant
+niche was found under, sorted by FDR, with MCMC convergence
+diagnostics (`c_rhat`, `c_ess_bulk`, `c_ess_tail`) and `c_pH0`
+included for reference.
 
 ```{r significant-niches-table}
 sig_nstatus_table <- sccomp_niche_nstatus |>
   filter(factor == "N_status", c_FDR < 0.05) |>
-  select(Niche, factor, parameter, c_effect, c_FDR)
+  select(Niche, factor, parameter, c_effect, c_FDR, c_pH0, c_rhat, c_ess_bulk, c_ess_tail)
 
 sig_stage_table <- sccomp_niche_stage |>
   filter(factor == "Stage", c_FDR < 0.05) |>
-  select(Niche, factor, parameter, c_effect, c_FDR)
+  select(Niche, factor, parameter, c_effect, c_FDR, c_pH0, c_rhat, c_ess_bulk, c_ess_tail)
 
 sig_niches_table <- bind_rows(sig_nstatus_table, sig_stage_table) |>
-  arrange(Niche, c_FDR)
+  arrange(c_FDR)
 
 sig_niches_table |>
   as.data.frame() |>
   knitr::kable(digits = 3, caption = "Significant niches: effect size and FDR (N-status and Stage models)")
+```
+
+---
+
+## 3b. Patient10 / Myeloid Proliferating artifact check
+
+Same diagnostic added to the niche generation notebook: Patient10 (the
+sole benign control) accounts for 44.7% of the "Macrophage,
+Proliferating (MKI67+, Patient10-Driven Artifact)" cluster cohort-wide.
+Since that cluster feeds directly into niche composition, this reports,
+per niche, what fraction of that cluster's cells come from Patient10 --
+joined onto the significant-niches table below (3c) so it's visible
+alongside FDR/effect size when writing annotation comments.
+
+```{r patient10-myeloid-prolif-check}
+prolif_label <- "Macrophage, Proliferating (MKI67+, Patient10-Driven Artifact)"
+
+prolif_idx <- which(spe$final_celltype == prolif_label)
+
+niche_prolif_patient10 <- data.frame(
+  Niche = spe$Niche[prolif_idx],
+  Patient = spe$patient_id[prolif_idx]
+) |>
+  group_by(Niche) |>
+  summarise(
+    n_prolif_cells = n(),
+    pct_patient10 = mean(Patient == "Patient10") * 100,
+    .groups = "drop"
+  ) |>
+  arrange(desc(pct_patient10))
+```
+
+---
+
+## 3c. Significant niches with Patient10 diagnostic
+
+```{r significant-niches-table-with-patient10}
+sig_niches_table_p10 <- sig_niches_table |>
+  mutate(Niche = as.character(Niche)) |>
+  left_join(
+    niche_prolif_patient10 |> mutate(Niche = as.character(Niche)),
+    by = "Niche"
+  ) |>
+  mutate(
+    n_prolif_cells = replace_na(n_prolif_cells, 0),
+    pct_patient10 = replace_na(pct_patient10, 0)
+  )
+
+sig_niches_table_p10 |>
+  as.data.frame() |>
+  knitr::kable(digits = 3, caption = "Significant niches: effect size and FDR, with Patient10 share of the Myeloid Proliferating artifact cluster")
 ```
 
 ---
@@ -140,10 +193,6 @@ sig_niches_table |>
 All 50 niches, saved for reference.
 
 ```{r composition}
-# Confirmed via the diagnostic chunk above: spe$aggregatedNeighbors' column
-# names and levels(spe$final_celltype) are already clean (no mangling at the
-# source). check.names = FALSE just guards against as.data.frame() re-
-# mangling them at this conversion step.
 neighbor_mat <- as.data.frame(spe$aggregatedNeighbors, check.names = FALSE)
 neighbor_mat$Niche <- spe$Niche
 
@@ -151,14 +200,12 @@ niche_composition <- neighbor_mat |>
   group_by(Niche) |>
   summarise(across(everything(), mean), .groups = "drop")
 
+# Write out for reference only -- downstream chunks (4b, 5, 6) keep using
+# this in-memory tibble directly rather than re-reading the CSV, since
+# check.names = FALSE above already guarantees clean names and the CSV
+# round-trip was the more likely source of mangling, not a fix for it.
 write_csv(niche_composition, composition_out_path)
 cat("Saved full niche composition table to:", composition_out_path, "\n")
-
-# Re-read the CSV rather than continuing to use the in-memory object.
-# read_csv() takes the header row literally (no make.names-style checking,
-# unlike as.data.frame()/column_to_rownames()), so every chunk below now
-# works from a guaranteed-clean, disk-verified copy of the names.
-niche_composition <- read_csv(composition_out_path, show_col_types = FALSE)
 ```
 
 ---
@@ -203,7 +250,7 @@ ggplot(niche_long, aes(x = Niche, y = cell_type, size = mean_fraction, color = m
 
 ## 5. Heatmap (significant niches only)
 
-```{r heatmap}
+```{r heatmap, fig.width=14, fig.height=12}
 suppressPackageStartupMessages({
   library(RColorBrewer)
 })
@@ -243,16 +290,23 @@ max_abs <- max(abs(niche_mat_scaled), na.rm = TRUE)
 breaks <- seq(-max_abs, max_abs, length.out = 101)
 heat_colors <- colorRampPalette(rev(brewer.pal(11, "RdBu")))(100)
 
-pdf(heatmap_out_path, width = 14, height = 10)
+# fig.width/fig.height above match the pdf() device size below (14x12),
+# and labels_col passes full column names through explicitly so long,
+# 45-degree-rotated cell type names aren't clipped either inline or in
+# the saved PDF.
+pdf(heatmap_out_path, width = 14, height = 12)
 pheatmap(niche_mat_scaled,
          scale = "none",
          color = heat_colors,
          breaks = breaks,
          fontsize_row = 9,
          fontsize_col = 9,
+         labels_col = colnames(niche_mat_scaled),
          border_color = NA,
          angle_col = 45,
          main = "Average neighborhood composition: significant niches only")
+grid::grid.text("Z-score", x = 0.965, y = 0.5, rot = 270,
+                 gp = grid::gpar(fontsize = 10))
 dev.off()
 cat("Saved heatmap to:", heatmap_out_path, "\n")
 
@@ -262,9 +316,12 @@ pheatmap(niche_mat_scaled,
          breaks = breaks,
          fontsize_row = 9,
          fontsize_col = 9,
+         labels_col = colnames(niche_mat_scaled),
          border_color = NA,
          angle_col = 45,
          main = "Average neighborhood composition: significant niches only")
+grid::grid.text("Z-score", x = 0.965, y = 0.5, rot = 270,
+                 gp = grid::gpar(fontsize = 10))
 ```
 
 ---
@@ -272,7 +329,11 @@ pheatmap(niche_mat_scaled,
 ## 6. Top dominant cell types per significant niche
 
 For writing the usual `#Niche N: cell_type1, cell_type2: reasoning`
-annotation comments.
+annotation comments. Long-format table (`niche_top_celltypes`) is still
+saved to CSV for reference, but the table below collapses each niche
+to a single row with its top cell types formatted as `Name (XX%)`,
+comma-separated -- closer to what you'd actually paste into an
+annotation comment.
 
 ```{r top-celltypes}
 top_n <- 5
@@ -286,7 +347,13 @@ niche_top_celltypes <- niche_composition_sig |>
 write_csv(niche_top_celltypes, top_celltypes_out_path)
 cat("Saved top-", top_n, " cell types per significant niche to:", top_celltypes_out_path, "\n")
 
-niche_top_celltypes |>
+niche_top_celltypes_wide <- niche_top_celltypes |>
+  mutate(label = sprintf("%s (%.0f%%)", cell_type, mean_fraction * 100)) |>
+  group_by(Niche) |>
+  summarise(top_celltypes = paste(label, collapse = ", "), .groups = "drop") |>
+  arrange(as.numeric(as.character(Niche)))
+
+niche_top_celltypes_wide |>
   as.data.frame() |>
-  knitr::kable(digits = 3, caption = "Top dominant cell types per significant niche")
+  knitr::kable(caption = "Top dominant cell types per significant niche (collapsed for annotation)")
 ```

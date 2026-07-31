@@ -38,23 +38,26 @@ annotated, spatial-graph-equipped dataset, and tests niche composition
 for association with N-status and AJCC stage. Structure follows the
 preprint's original niche generation script as closely as possible.
 
-Two deliberate deviations from that script are noted inline below
-(both flagged where they occur, and summarized in the Notes section
+Three deliberate deviations from that script are noted inline below
+(all flagged where they occur, and summarized in the Notes section
 at the end):
 
-1. **Spatial graph threshold.** This notebook reuses an existing
-   `expansion_interaction_graph` built upstream at `threshold = 20`.
-   The original preprint script used `threshold = 50`. This
-   discrepancy between the manuscript text/figure legend (20) and the
-   actual code (50) has not yet been resolved, so this notebook
-   proceeds with the already-built 20-threshold graph rather than
-   rebuilding at 50.
-2. Everything else -- `aggregateNeighbors`, `kmeans`, and the
-   table/volcano/boxplot outputs -- follows the original script's
-   structure directly. The differential abundance step itself uses
-   `sccomp_estimate() |> sccomp_test()` rather than the original
-   script's `sccomp_glm()`, since that function does not exist in the
-   installed package version (see Notes).
+1. **Spatial graph threshold.** Reuses an existing
+   `expansion_interaction_graph` built at `threshold = 20`. The
+   original preprint script used `threshold = 50`; this text-vs-code
+   discrepancy is unresolved upstream, so the notebook proceeds with
+   the already-built 20-threshold graph.
+2. `aggregateNeighbors`, `kmeans`, and the table/volcano/boxplot
+   outputs follow the original script's structure directly, except
+   `sccomp_estimate() |> sccomp_test()` is used in place of
+   `sccomp_glm()`, which doesn't exist in the installed package version
+   (see Notes).
+3. **Patient10 / Myeloid Proliferating caveat.** Patient10 (the sole
+   benign control) accounts for 44.7% of the "Macrophage, Proliferating
+   (MKI67+, Patient10-Driven Artifact)" cluster -- already flagged as
+   an artifact in its label from the annotation review. Niches leaning
+   heavily on this cell type should be read with that in mind -- see
+   Section 5b and Notes.
 
 ---
 
@@ -63,7 +66,11 @@ at the end):
 ```{r paths}
 analysis_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis"
 
-spatial_graph_path <- file.path(analysis_path, "spatial_analysis", "spe_spatial_graph.rds")
+# Spatial graph object. final_celltype merge (post-inspection renames
+# + Patient10 flag) is saved to a new file rather than overwriting the
+# original -- see Section 1b.
+spatial_graph_path <- file.path(analysis_path, "spatial_analysis", "spe_spatial_graph_post_inspect.rds")
+spatial_graph_path_orig <- file.path(analysis_path, "spatial_analysis", "spe_spatial_graph.rds")
 
 niche_path <- file.path(analysis_path, "spatial_analysis", "niche_k50_thresh20")
 dir.create(niche_path, recursive = TRUE, showWarnings = FALSE)
@@ -75,12 +82,51 @@ sccomp_stage_out_path   <- file.path(niche_path, "sccomp_stage.rds")
 
 ---
 
+## 1b. Merge updated annotations into spatial graph object (one-time)
+
+The spatial graph (`expansion_interaction_graph`) is purely geometric
+-- built from cell coordinates/segmentation, not from `final_celltype`
+-- so correcting annotations doesn't require rebuilding it. This chunk
+instead merges the corrected `final_celltype` (post-inspection renames
++ Patient10 flag) into the existing graph-equipped object, matching on
+cell ID rather than assuming row order, and saves the result to a new
+file -- the original `spe_spatial_graph.rds` is left untouched. Only
+needs to be run once; safe to skip on subsequent runs once
+`spe_spatial_graph_post_inspect.rds` exists.
+
+```{r merge-updated-annotations, eval=FALSE}
+post_inspect_path <- file.path(analysis_path, "final_cell_annotation", "final_cell_annot_post_inspect.rds")
+
+spe_graph <- readRDS(spatial_graph_path_orig)
+spe_post_inspect <- readRDS(post_inspect_path)
+
+# Match on cell IDs (colnames), not row order, in case the two objects
+# aren't in the same cell order.
+stopifnot(all(colnames(spe_graph) %in% colnames(spe_post_inspect)))
+
+match_idx <- match(colnames(spe_graph), colnames(spe_post_inspect))
+
+cat("Cells in spatial graph object:", ncol(spe_graph), "\n")
+cat("Cells matched in post-inspect object:", sum(!is.na(match_idx)), "\n")
+
+# Overwrite with corrected annotations
+spe_graph$final_celltype <- spe_post_inspect$final_celltype[match_idx]
+
+cat("Updated cell type levels:\n")
+print(table(spe_graph$final_celltype))
+
+saveRDS(spe_graph, spatial_graph_path)
+cat("Saved (original left untouched):", spatial_graph_path, "\n")
+```
+
+---
+
 ## 2. Load spatial graph object
 
 Loads the object that already has `final_celltype` populated (merged
 broad annotations + all subclustering results, low-quality clusters
-excluded) and the `expansion_interaction_graph` colPair already built
-at `threshold = 20`.
+excluded, and the post-inspection renames applied) and the
+`expansion_interaction_graph` colPair already built at `threshold = 20`.
 
 ```{r load}
 spe <- readRDS(spatial_graph_path)
@@ -154,6 +200,40 @@ spe$N_status <- factor(ifelse(spe$stage_group == "IIB", "N1", "N0"),
 table(spe$patient_id, spe$N_status)
 table(spe$patient_id, spe$stage_group)
 table(spe$patient_id, spe$disease_state)
+```
+
+### 5b. Caveat check: Patient10 contribution to Myeloid Proliferating cluster, per niche
+
+Patient10 is the sole benign control and was found (in the annotation
+review session) to account for 44.7% of the "Macrophage, Proliferating
+(MKI67+, Patient10-Driven Artifact)" cluster cohort-wide -- the label
+itself was updated during that review to flag it as a technical
+artifact rather than real biology. Since that cluster feeds directly
+into niche composition here, this chunk reports, per niche, what
+fraction of that cluster's cells within the niche come from Patient10
+-- any niche with a high value here should be read as a possible
+Patient10/technical-artifact effect rather than a genuine stage or
+N-status association.
+
+```{r patient10-myeloid-prolif-check}
+prolif_label <- "Macrophage, Proliferating (MKI67+, Patient10-Driven Artifact)"
+
+prolif_idx <- which(spe$final_celltype == prolif_label)
+
+niche_prolif_patient10 <- data.frame(
+  Niche = spe$Niche[prolif_idx],
+  Patient = spe$patient_id[prolif_idx]
+) |>
+  group_by(Niche) |>
+  summarise(
+    n_prolif_cells = n(),
+    pct_patient10 = mean(Patient == "Patient10") * 100,
+    .groups = "drop"
+  ) |>
+  arrange(desc(pct_patient10))
+
+niche_prolif_patient10 |>
+  knitr::kable(digits = 1, caption = "Per-niche Patient10 share of Myeloid Proliferating cells")
 ```
 
 ```{r save-niche-spe}
@@ -235,12 +315,29 @@ if (file.exists(sccomp_stage_out_path)) {
 sccomp_niche_nstatus <- readRDS(sccomp_nstatus_out_path)
 sccomp_niche_nstatus_sub <- sccomp_niche_nstatus[which(sccomp_niche_nstatus$factor == "N_status"), ]
 
+# Join Patient10 share of the Myeloid Proliferating (artifact) cluster
+# per niche, so any niche at risk of that confound is visible directly
+# on the results table rather than requiring a manual cross-check
+# against Section 5b. Niches with no proliferating cells at all (not
+# present in niche_prolif_patient10) get 0 -- there's no Patient10 risk
+# for this cluster if the cluster isn't present in that niche.
+sccomp_niche_nstatus_sub <- sccomp_niche_nstatus_sub |>
+  as.data.frame() |>
+  mutate(Niche = as.character(Niche)) |>
+  left_join(
+    niche_prolif_patient10 |> mutate(Niche = as.character(Niche)),
+    by = "Niche"
+  ) |>
+  mutate(
+    n_prolif_cells = replace_na(n_prolif_cells, 0),
+    pct_patient10 = replace_na(pct_patient10, 0)
+  )
+
 sccomp_niche_nstatus_sub |>
   filter(c_FDR < 0.1) |>
   arrange(c_FDR) |>
-  as.data.frame() |>
-  select(-starts_with("v_")) |>
-  knitr::kable(digits = 3, caption = "Niche composition association with N-status (FDR < 0.1)")
+  select(Niche, parameter, c_effect, c_FDR, n_prolif_cells, pct_patient10) |>
+  knitr::kable(digits = 3, caption = "Niche composition association with N-status (FDR < 0.1), with Patient10 share of the Myeloid Proliferating artifact cluster")
 ```
 
 ---
@@ -280,12 +377,24 @@ ggplot(plot_df, aes(x = c_effect, y = LogFDR, color = Significant)) +
 sccomp_niche_stage <- readRDS(sccomp_stage_out_path)
 sccomp_niche_stage_sub <- sccomp_niche_stage[which(sccomp_niche_stage$factor == "Stage"), ]
 
+# Same Patient10-share join as the N-status table (Section 7).
+sccomp_niche_stage_sub <- sccomp_niche_stage_sub |>
+  as.data.frame() |>
+  mutate(Niche = as.character(Niche)) |>
+  left_join(
+    niche_prolif_patient10 |> mutate(Niche = as.character(Niche)),
+    by = "Niche"
+  ) |>
+  mutate(
+    n_prolif_cells = replace_na(n_prolif_cells, 0),
+    pct_patient10 = replace_na(pct_patient10, 0)
+  )
+
 sccomp_niche_stage_sub |>
   filter(c_FDR < 0.1) |>
   arrange(c_FDR) |>
-  as.data.frame() |>
-  select(-starts_with("v_")) |>
-  knitr::kable(digits = 3, caption = "Niche composition association with Stage (vs. Benign, FDR < 0.1)")
+  select(Niche, parameter, c_effect, c_FDR, n_prolif_cells, pct_patient10) |>
+  knitr::kable(digits = 3, caption = "Niche composition association with Stage (vs. Benign, FDR < 0.1), with Patient10 share of the Myeloid Proliferating artifact cluster")
 ```
 
 ---
@@ -325,22 +434,25 @@ for (contrast in unique(plot_df_stage$parameter)) {
 ## 11. Boxplots per niche {.tabset}
 
 ```{r boxplots, results = "asis", fig.width = 5, fig.height = 5.5}
-# Only plot niches significant (FDR < 0.1) in either the N-status or
-# Stage model, rather than all 50.
+# Only plot niches significant at FDR < 0.05 in either the N-status or
+# Stage model -- matching the "FDR < 0.05" red points on the volcano
+# plots (Sections 8 and 10), rather than the wider FDR < 0.1 threshold
+# used just to populate the results tables.
 sig_niches_nstatus <- sccomp_niche_nstatus_sub |>
-  filter(c_FDR < 0.1) |>
+  filter(c_FDR < 0.05) |>
   pull(Niche) |>
   as.character()
 
 sig_niches_stage <- sccomp_niche_stage_sub |>
-  filter(c_FDR < 0.1) |>
+  filter(c_FDR < 0.05) |>
   pull(Niche) |>
   as.character()
 
 sig_niches <- union(sig_niches_nstatus, sig_niches_stage)
+sig_niches <- as.character(sort(as.numeric(sig_niches)))
 
-cat("Niches significant (FDR < 0.1) in N-status model:", length(sig_niches_nstatus), "\n")
-cat("Niches significant (FDR < 0.1) in Stage model:", length(sig_niches_stage), "\n")
+cat("Niches significant (FDR < 0.05) in N-status model:", length(sig_niches_nstatus), "\n")
+cat("Niches significant (FDR < 0.05) in Stage model:", length(sig_niches_stage), "\n")
 cat("Total unique niches plotted below:", length(sig_niches), "\n")
 
 niche_prop <- table(spe$sample_id, spe$Niche) |>
@@ -401,3 +513,26 @@ for (n in sig_niches) {
 - `.sample = Patient` chosen because N-status and stage are constant
   within patient (not within ROI); confirmed via the
   `table(spe$patient_id, spe$N_status)` cross-tab above.
+- **Patient10 / Myeloid Proliferating cluster:** the annotation review
+  session found Patient10 (the sole Benign-stage patient) accounts for
+  44.7% of the "Macrophage, Proliferating (MKI67+, Patient10-Driven
+  Artifact)" cluster cohort-wide, with broad off-lineage marker
+  elevation in that cluster. That renamed label reflects the review
+  session's conclusion that this cluster is a technical artifact
+  rather than a real population, not just a caveat. Since Patient10 is
+  also the only Benign-stage sample, any niche whose composition is
+  dominated by this cell type risks conflating a Patient10-specific
+  technical effect with a genuine Benign-vs-cancer stage effect.
+  Section 5b's per-niche breakdown flags which niches carry that risk;
+  any significant niche flagged there in Sections 7-11 should be
+  footnoted accordingly in a writeup rather than reported at face
+  value. Whether to exclude Patient10 (or this cell type entirely) from
+  the `sccomp` models is still an open decision from the annotation
+  review session and has not been implemented here. Sections 7 and 9
+  now join `pct_patient10` directly onto the results tables so this is
+  visible without cross-checking Section 5b by eye; niches with no
+  proliferating cells present get `pct_patient10 = 0`. Section 11's
+  boxplots were also tightened to FDR < 0.05 (matching the volcano
+  plots' red "Significant" points) rather than the wider FDR < 0.1 used
+  for table inclusion, so borderline/non-significant niches aren't
+  plotted alongside genuinely significant ones.

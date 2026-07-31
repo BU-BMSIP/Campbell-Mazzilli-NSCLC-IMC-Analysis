@@ -312,6 +312,37 @@ if (length(batch_cols) > 0) {
 }
 ```
 
+```{r prolif-patient-composition, fig.width=8, fig.height=5}
+prolif_summary <- data.frame(
+  cell_id    = colnames(spe_myeloid_group),
+  patient_id = spe_myeloid_group$patient_id,
+  sample_id  = spe_myeloid_group$sample_id,
+  is_prolif  = seq_len(ncol(spe_myeloid_group)) %in% idx_prolif
+) %>%
+  group_by(patient_id) %>%
+  summarise(
+    total_cells       = n(),
+    prolif_cells      = sum(is_prolif),
+    proportion_prolif = round(prolif_cells / total_cells, 3),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(proportion_prolif))
+
+print(prolif_summary, n = Inf)
+
+p_prolif_composition <- ggplot(prolif_summary, aes(x = reorder(patient_id, -proportion_prolif),
+                                                     y = proportion_prolif,
+                                                     fill = patient_id == "Patient10")) +
+  geom_col() +
+  scale_fill_manual(values = c("TRUE" = "firebrick", "FALSE" = "grey70"), guide = "none") +
+  labs(title = "Proportion of Myeloid, Proliferating (MKI67+) cluster by patient",
+       x = "Patient", y = "Proportion of patient's Myeloid cells") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p_prolif_composition)
+```
+
 ```{r prolif-sccomp-decision}
 n_patients_total   <- length(unique(spe_myeloid_group$patient_id))
 n_patients_prolif  <- length(unique(spe_myeloid_group$patient_id[idx_prolif]))
@@ -467,7 +498,7 @@ print(table(names(celltype_renames)[match(final_celltype_chr[renamed], celltype_
 ```{r save-renamed}
 saveRDS(spe, file.path(analysis_path, "final_cell_annotation_post_inspect.rds"))
 cat("Saved updated spe to",
-    file.path(analysis_path, "final_cell_annotation_post_inspect.rds"), "\n")
+    file.path(analysis_path, "final_cell_annot_post_inspect.rds"), "\n")
 ```
 
 ---
