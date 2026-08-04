@@ -1,0 +1,340 @@
+---
+title: "Tumor IMC - Cytomapper Cell Type Overlays"
+author: "Vaidehi Gupta"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: cosmo
+    code_folding: show
+    toc: true
+    toc_float: true
+  pdf_document:
+    toc: true
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+Generates cytomapper overlays for one ROI each from Patient10 (Benign),
+Patient12 (Higher stage, mixed LCNEC+Adenocarcinoma histology),adapted from 
+the lymph node overlay code (Yusuke's approach) for the tumor project's current annotation.
+
+For each ROI: an "All cells" plot colored by the full cell type label,
+plus one highlight plot per individual cell type (`CellType` vs.
+`NotCellType`, gold vs. gray). Each is rendered two ways -- true
+segmentation-mask boundaries (`cytomapper::plotCells()`, what the
+previous student used for the LN figures) and cell centroids as points
+(`imcRtools::plotSpatial()`), since mask boundaries can get visually
+dense across ~40 cell types.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+```
+
+# 1. Load Libraries
+
+```{r libraries}
+#.libPaths(c("/restricted/projectnb/camplab/home/vgupta7/R_libs", .libPaths()))
+
+library(imcRtools)
+library(cytomapper)
+library(SpatialExperiment)
+library(tidyverse)
+library(RColorBrewer)
+library(scales)
+library(knitr)
+
+set.seed(12345)
+```
+
+# 2. Paths
+
+```{r paths}
+analysis_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis"
+steinbock_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/steinbock"
+
+final_celltype_path <- file.path(analysis_path, "final_cell_annotation", "r2_annotation", "spe_final_celltype_r2.rds")
+
+# Each patient's steinbock output lives in its own pXX_results folder, e.g.
+# steinbock/p12_results/img, steinbock/p12_results/masks_deepcell
+patient_result_dir <- function(patient) {
+  patient_num <- gsub("[^0-9]", "", patient)
+  file.path(steinbock_path, paste0("p", patient_num, "_results"))
+}
+
+overlay_out_dir <- file.path(analysis_path, "visualizations", "cytomapper_overlays")
+dir.create(overlay_out_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+# 3. Load Finalized Annotated Object
+
+```{r load-spe}
+spe <- readRDS(final_celltype_path)
+
+cat("Cells:", ncol(spe), "\n")
+cat("Cell types:", nlevels(factor(spe$final_celltype)), "\n")
+
+spe$CellTypeLabel <- as.character(spe$final_celltype)
+```
+
+## 3a. Sanity Check on Annotation
+
+Same check as the sccomp script -- confirm no leftover numbered
+prefixes or stray low-quality labels before generating overlays.
+
+```{r sanity-check-annotation}
+sort(unique(spe$CellTypeLabel))
+
+cat("\nAny bare-number labels remaining:",
+    any(grepl("^[0-9]+$", unique(spe$CellTypeLabel))), "\n")
+```
+
+# 4. Select ROIs of Interest
+
+```{r select-rois}
+patients_of_interest <- c(
+  Patient10 = "Patient_10T_ROI_001_1",
+  Patient12 = "Patient_12T_ROI_001_1"
+)
+
+data.frame(Patient = names(patients_of_interest),
+           sample_id = unname(patients_of_interest))
+
+img_ids <- unname(patients_of_interest)
+```
+
+```{r}
+celltype_counts_by_roi <- table(spe$sample_id[spe$sample_id %in% img_ids],
+                                 spe$CellTypeLabel[spe$sample_id %in% img_ids]) |>
+  as.data.frame() |>
+  setNames(c("sample_id", "CellType", "Count")) |>
+  filter(Count > 0)
+
+celltype_counts_wide <- celltype_counts_by_roi |>
+  tidyr::pivot_wider(names_from = sample_id, values_from = Count, values_fill = 0) |>
+  arrange(desc(Patient_12T_ROI_001_1))
+
+print(celltype_counts_wide, n = Inf)
+
+```
+
+# 5. Load Images and Masks
+
+Each patient's steinbock output lives in its own pXX_results folder (img/ and masks_deepcell/ subfolders) rather than a shared directory, so the exact TIFF path is built per-ROI using patient_result_dir() from Chunk 2.
+
+```{r load-images}
+img_paths <- file.path(patient_result_dir(names(patients_of_interest)), "img",
+                        paste0(unname(patients_of_interest), ".tiff"))
+mask_paths <- file.path(patient_result_dir(names(patients_of_interest)), "masks_deepcell",
+                         paste0(unname(patients_of_interest), ".tiff"))
+
+names(img_paths)  <- img_ids
+names(mask_paths) <- img_ids
+
+stopifnot(all(file.exists(img_paths)))
+stopifnot(all(file.exists(mask_paths)))
+
+images <- loadImages(img_paths)
+masks  <- loadImages(mask_paths, as.is = TRUE)
+
+names(images) <- img_ids
+names(masks)  <- img_ids
+
+mcols(images)$sample_id <- names(images)
+mcols(masks)$sample_id  <- names(masks)
+
+# Only valid if channel order matches the steinbock panel order -- verify against panel.csv
+channelNames(images) <- rownames(spe)
+```
+
+# 6. Color Vector for Cell Types
+
+Reuses the existing color scheme in `metadata(spe)$color_vectors` if
+one is already stored, filling in any missing cell types with an
+auto-generated palette; otherwise generates one from scratch.
+
+```{r color-vector}
+allCellTypes <- sort(unique(spe$CellTypeLabel))
+
+if (!is.null(metadata(spe)$color_vectors$CellTypeLabel)) {
+  CellTypeLabelCol <- metadata(spe)$color_vectors$CellTypeLabel
+  missing_types <- setdiff(allCellTypes, names(CellTypeLabelCol))
+  if (length(missing_types) > 0) {
+    extra_cols <- hue_pal()(length(missing_types))
+    names(extra_cols) <- missing_types
+    CellTypeLabelCol <- c(CellTypeLabelCol, extra_cols)
+  }
+} else {
+  CellTypeLabelCol <- setNames(hue_pal()(length(allCellTypes)), allCellTypes)
+}
+
+metadata(spe)$color_vectors$CellTypeLabel <- CellTypeLabelCol
+```
+
+# 7. Normalize Images
+
+```{r normalize-images}
+cur_images <- images[img_ids]
+cur_images <- cytomapper::normalize(cur_images, separateImages = TRUE)
+cur_images <- cytomapper::normalize(cur_images, inputRange = c(0, 0.5))
+
+cur_masks <- masks[img_ids]
+```
+
+
+```{r selected-celltypes}
+selected_types <- c(
+  "Epithelial"          = "Epithelial (EpCAM+)",
+  "Tumor Epithelial"     = "Tumor Epithelial (TTF1++)",
+  "Proliferating Cells"  = "Proliferating Cells",
+  "CD8+ T Cell"          = "CD8+ T Cell, Activated",
+  "CD4+ T Cell"          = "CD4+ T Cell, Exhaustion-leaning",
+  "Treg"                 = "Treg, Resting",
+  "Dendritic Cell"       = "cDC1",
+  "Macrophage"           = "Macrophage, M2-like (CD163+)",
+  "Monocyte"             = "Monocyte-Macrophage Transitional (CD14+)",
+  "B Cell/Plasmablast"   = "Transitional B Cell/Plasmablast (CD19+CD138+HLADRB+)",
+  "Fibroblast"           = "Fibroblast/Stroma",
+  "Mast Cell"            = "Mast Cell"
+)
+```
+
+# 8. Mask Overlays (Segmentation Boundaries) {.tabset}
+
+True cell-shape overlays via `cytomapper::plotCells()`, matching the
+previous student's LN figures.
+
+```{r}
+# Build a display-only column: selected lineages get their friendly name,
+# everything else collapses to "Other"
+spe$CellTypeLabel_display <- "Other"
+for (i in seq_along(selected_types)) {
+  spe$CellTypeLabel_display[spe$CellTypeLabel == selected_types[i]] <- names(selected_types)[i]
+}
+
+display_levels <- c(names(selected_types), "Other")
+spe$CellTypeLabel_display <- factor(spe$CellTypeLabel_display, levels = display_levels)
+
+display_cols <- c(
+  "Epithelial"          = "red",
+  "Tumor Epithelial"     = "darkorange",
+  "Proliferating Cells"  = "yellow",
+  "CD8+ T Cell"          = "forestgreen",
+  "CD4+ T Cell"          = "yellowgreen",
+  "Treg"                 = "purple",
+  "Dendritic Cell"       = "lightblue",
+  "Macrophage"           = "dodgerblue",
+  "Monocyte"             = "navy",
+  "B Cell/Plasmablast"   = "pink",
+  "Fibroblast"           = "violet",
+  "Mast Cell"            = "deeppink",
+  "Other"                = "gray85"
+)
+```
+
+## 8a. All Cells, Colored by Full Cell Type Label {.tabset}
+
+```{r mask-all-cells, results="asis", fig.width=16, fig.height=8}
+for (roi in img_ids) {
+  cat("### ", roi, " {-}\n\n")
+
+  plotCells(
+    mask = cur_masks[roi],
+    object = spe,
+    cell_id = "ObjectNumber",
+    img_id = "sample_id",
+    colour_by = "CellTypeLabel_display",
+    outline_by = NULL,
+    exprs_values = "counts",
+    colour = list(CellTypeLabel_display = display_cols),
+    image_title = NULL,
+    legend = list(
+      colour_by.title.cex = 1,
+      colour_by.labels.cex = 1,
+      colour_by.legend.cex = 1.2
+    )
+  )
+  cat("\n\n")
+}
+```
+
+## 8b. Per Cell Type {.tabset}
+
+Skips any ROI/cell-type combination with zero cells present, since
+looping across ~40 cell types will hit several empty combinations per
+ROI.
+
+```{r mask-per-celltype, results="asis", fig.width=14, fig.height=8}
+for (roi in img_ids) {
+  cat("### ", roi, " {.tabset .unnumbered}\n\n")
+
+  for (i in seq_along(selected_types)) {
+    lineage_name <- names(selected_types)[i]
+    ct <- selected_types[i]
+
+    spe$CellPopulation <- ifelse(spe$CellTypeLabel == ct, "CellType", "NotCellType")
+
+    n_present <- sum(spe$CellPopulation[spe$sample_id == roi] == "CellType")
+    if (n_present == 0) next
+
+    cat("#### ", lineage_name, " {-}\n\n")
+
+    plotCells(
+      mask = cur_masks[roi],
+      object = spe,
+      cell_id = "ObjectNumber",
+      img_id = "sample_id",
+      colour_by = "CellPopulation",
+      outline_by = NULL,
+      exprs_values = "counts",
+      colour = list(CellPopulation = c(`CellType` = "gold", `NotCellType` = "gray20")),
+      image_title = NULL
+    )
+    cat("\n\n")
+  }
+}
+```
+
+# 9. Circle Overlays (Centroid Points) {.tabset}
+
+Cell centroids as points via `imcRtools::plotSpatial()` instead of mask
+boundaries -- useful when mask boundaries get too dense to read across
+this many cell types, or for a quicker overview.
+
+## All Cells, Colored by Full Cell Type Label
+
+```{r circle-all-cells, results="asis", fig.width=8, fig.height=8}
+for (roi in img_ids) {
+  cat("### ", roi, " {-}\n\n")
+
+  spe_roi <- spe[, spe$sample_id == roi]
+  p <- plotSpatial(
+    spe_roi,
+    img_id = "sample_id",
+    node_color_by = "CellTypeLabel_display",
+    node_size_fix = 1,
+    colPairName = NULL
+  ) + scale_color_manual(values = display_cols) +
+    ggtitle(paste0(roi, " -- All cells")) +
+    theme(legend.position = "right",
+          legend.text = element_text(size = 13),
+          legend.title = element_text(size = 15),
+          legend.key.size = unit(1, "lines"),
+          legend.spacing.y = unit(0.3, "cm")) +
+    guides(colour = guide_legend(override.aes = list(size = 4)))
+
+  print(p)
+  cat("\n\n")
+}
+```
+
+# Notes
+
+- `img`/`masks_deepcell` paths are built per-patient via `patient_result_dir()`
+  (Section 2) -- update that helper if a patient's steinbock output moves.
+- ROI selection (Section 4) is hardcoded to one specific ROI per patient
+  (`Patient_10T_ROI_001_1`, `Patient_12T_ROI_001_1`) -- update
+  `patients_of_interest` directly for a different ROI.
+- Cell types shown are the curated `selected_types` shortlist (Section 8),
+  not the full ~40-type annotation -- see the sccomp analysis and per-ROI
+  count check for how these were chosen.

@@ -1,0 +1,156 @@
+---
+title: "Images of Cell Populations - Patient13, ROI 1"
+author: "Tazein Shah"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    theme: cosmo
+    code_folding: show
+    toc: true
+    toc_float: true
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(imcRtools)
+library(SpatialExperiment)
+library(cytomapper)
+library(tidyverse)
+```
+
+# Setup
+
+```{r load-data}
+base_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/steinbock"
+patient13_path <- file.path(base_path, "p13_results")
+
+images <- loadImages(file.path(patient13_path, "img/"))
+masks  <- loadImages(file.path(patient13_path, "masks_deepcell/"), as.is = TRUE)
+
+# plotCells needs img_id metadata on both images and masks to match against spe$sample_id
+mcols(images)$sample_id <- names(images)
+mcols(masks)$sample_id  <- names(masks)
+
+analysis_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/final_cell_annotation"
+spe_path      <- file.path(analysis_path, "r2_annotation", "spe_final_celltype_r2.rds")
+spe <- readRDS(spe_path)
+```
+
+```{r eval=FALSE, include=FALSE}
+sort(unique(spe$broad_celltype))
+length(unique(spe$broad_celltype))
+```
+
+```{r derive-display-celltype}
+# Derive display-level cell type grouping
+spe$CellTypeLabel_display <- case_when(
+  spe$broad_celltype == "12. Epithelial (EpCAM+)" ~ "Epithelial",
+  spe$broad_celltype %in% c("9. Tumor Epithelial (TTF1++)", "19. Tumor Epithelial (Neuroendocrine)") ~ "Tumor Epithelial",
+  spe$broad_celltype == "18. Proliferating Cells" ~ "Proliferating Cells",
+  spe$broad_celltype == "6. CD8+ T Cell" ~ "CD8+ T Cell",
+  spe$broad_celltype == "15. CD4+ T Cell/Treg, Heterogeneous" ~ "CD4+ T Cell",
+  spe$broad_celltype == "5. Treg" ~ "Treg",
+  spe$broad_celltype %in% c("1. cDC1", "4. DC/mregDC") ~ "Dendritic Cell",
+  spe$broad_celltype == "8. Macrophage (CD14++)" ~ "Macrophage",
+  spe$broad_celltype == "14. Monocyte (CD14+)" ~ "Monocyte",
+  spe$broad_celltype %in% c("3. B Cell (CD38+)", "16. Plasma Cell (CD19+)") ~ "B Cell/Plasmablast",
+  spe$broad_celltype == "2. Fibroblast/Stroma" ~ "Fibroblast",
+  spe$broad_celltype == "11. Mast Cell" ~ "Mast Cell",
+  spe$broad_celltype %in% c("7. Memory T Cell", "10. Memory T/Plasma Cell (CD45RO+)", "13. PMN-MDSC") ~ "Other",
+  TRUE ~ "Other"
+)
+
+# sanity check - should be 13 categories
+sort(unique(spe$CellTypeLabel_display))
+length(unique(spe$CellTypeLabel_display))
+```
+
+```{r color-vectors}
+color_vectors <- list()
+
+allCellTypes <- c("Epithelial", "Tumor Epithelial", "Proliferating Cells",
+                   "CD8+ T Cell", "CD4+ T Cell", "Treg", "Dendritic Cell",
+                   "Macrophage", "Monocyte", "B Cell/Plasmablast",
+                   "Fibroblast", "Mast Cell", "Other")
+
+CellTypeLabelCol <- setNames(c("red", "orange",
+                                "yellow", "darkgreen",
+                                "purple", "magenta",
+                                "gray90", "dodgerblue",
+                                "navy", "pink",
+                                "orchid", "deeppink",
+                                "gray70"),
+                allCellTypes)
+
+color_vectors$CellTypeLabel_display <- CellTypeLabelCol
+metadata(spe)$color_vectors <- color_vectors
+```
+
+# Level 1 Populations
+
+## Patient 13, ROI 1
+
+### All cells
+
+```{r all-cells-patient13-roi1}
+img_ids <- "Patient_13T_ROI_001_1"
+
+cur_images <- images[img_ids]
+cur_images <- cytomapper::normalize(cur_images, separateImages = TRUE)
+cur_images <- cytomapper::normalize(cur_images, inputRange = c(0, 0.5))
+
+plotCells(
+  mask = masks[img_ids],
+  object = spe,
+  cell_id = "ObjectNumber",
+  img_id = "sample_id",
+  colour_by = "CellTypeLabel_display",
+  outline_by = NULL,
+  exprs_values = "counts",
+  colour = list(CellTypeLabel_display = metadata(spe)$color_vectors$CellTypeLabel_display),
+  image_title = NULL
+)
+```
+
+### Level 1 overlays
+
+Each section below highlights one broad cell type (gold) against all
+other cells (gray) for this ROI.
+
+```{r level1-overlays-patient13-roi1}
+img_ids <- "Patient_13T_ROI_001_1"
+
+cur_images <- images[img_ids]
+cur_images <- cytomapper::normalize(cur_images, separateImages = TRUE)
+cur_images <- cytomapper::normalize(cur_images, inputRange = c(0, 0.5))
+
+level1CellTypes <- allCellTypes
+
+for (x in level1CellTypes) {
+    cat("\n\n---\n")
+    cat(paste0("Cell type: ", x, "\n"))
+    cat("---\n\n")
+
+    spe$CellPopulation <- ifelse(spe$CellTypeLabel_display == x, "CellType", "NotCellType")
+
+    p <- plotCells(
+      mask = masks[img_ids],
+      object = spe,
+      cell_id = "ObjectNumber",
+      img_id = "sample_id",
+      colour_by = "CellPopulation",
+      outline_by = NULL,
+      exprs_values = "counts",
+      colour = list(CellPopulation = c(`CellType` = "gold", `NotCellType` = "gray20")),
+      image_title = NULL
+    )
+
+    print(p)
+}
+```

@@ -1,0 +1,229 @@
+---
+title: "Final Cell Type Annotation Merge (v2 -- T Cell Subclustering Update)"
+author: "Vaidehi Gupta"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+Final merge of all subclustering results (myeloid, T cell, B cell, 
+DC/mregDC) into a single annotated `spe` object. This supersedes the
+previous merge notebook: cluster 15 is no longer merged on its own,
+it's folded into the new joint T cell subclustering (cluster 15 cleaned +
+broad clusters 5/6/7).
+
+**Important:** cluster 15's already-cleaned survivors are in
+`spe_tcell`, but the ~12,085 cells previously identified as low
+quality/artifact (original cluster 15 subclusters 2, 4, 7, 8) were
+*removed* before that subclustering ran -- they aren't covered by any
+subclustering object anymore. This notebook explicitly flags and excludes
+them again here, rather than letting them silently fall back to their
+stale pre-subclustering broad label.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+```
+
+# 1. Load Libraries
+
+```{r libraries}
+#.libPaths(c("/restricted/projectnb/camplab/home/vgupta7/R_libs", .libPaths()))
+
+library(tidyverse)
+library(SingleCellExperiment)
+library(SpatialExperiment)
+library(scater)
+```
+
+# 2. Paths
+
+```{r paths}
+analysis_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis"
+
+spe_path <- file.path(analysis_path, "final_cell_annotation", "final_broad_cluster", "h5_cluster_annot.rds")
+
+subclustering_path <- file.path(analysis_path, "final_cell_annotation", "subclustering")
+
+myeloid_path   <- file.path(subclustering_path, "myeloid_cells", "myeloid_subcluster.rds")
+tcell_path     <- file.path(subclustering_path, "tcells", "tcell_subclustering.rds")
+bcell_path     <- file.path(subclustering_path, "bcells", "bcell_wo_15", "bcell_subclustering_wo15.rds")
+dc_mregdc_path <- file.path(subclustering_path, "dc_mregdc", "dc_mregdc_subclustering.rds")
+
+# Original cluster 15 object, needed only to identify which cells were
+# excluded before the joint T cell subclustering, not used for labels
+cluster15_original_path <- file.path(subclustering_path, "cluster15", "cluster15_subcluster.rds")
+
+final_out_path <- file.path(analysis_path, "final_cell_annotation", "r2_annotation", "spe_final_celltype_r2.rds")
+```
+
+# 3. Load Broad-Annotated SPE and Subclustering Results
+
+```{r load-intermediates}
+spe <- readRDS(spe_path)
+
+myeloid_obj    <- readRDS(myeloid_path)
+tcell_obj      <- readRDS(tcell_path)
+bcell_obj      <- readRDS(bcell_path)
+dc_mregdc_obj  <- readRDS(dc_mregdc_path)
+cluster15_orig <- readRDS(cluster15_original_path)
+
+cat("Broad-annotated cells:", ncol(spe), "\n")
+cat("Myeloid subset cells:", ncol(myeloid_obj), "\n")
+cat("T cell subset cells:", ncol(tcell_obj), "\n")
+cat("B cell/plasma subset cells:", ncol(bcell_obj), "\n")
+cat("DC/mregDC subset cells:", ncol(dc_mregdc_obj), "\n")
+```
+
+# 4. Identify Cluster 15 Cells Excluded Before T Cell Subclustering
+
+These are the original cluster 15 cells (subclusters 2, 4, 7 -- low
+quality/patient-driven artifact, and 8, confirmed Patient20 CD19
+technical artifact) that were removed prior to the joint T cell
+subclustering, so they aren't present in `tcell_obj` at all.
+
+```{r identify-excluded-cluster15}
+cluster15_excluded_ids <- setdiff(colnames(cluster15_orig), colnames(tcell_obj))
+cat("Cluster 15 cells excluded before T cell subclustering:",
+    length(cluster15_excluded_ids), "\n")
+```
+
+# 5. Final Merge
+
+```{r final-merge}
+spe$final_celltype <- as.character(spe$broad_celltype)
+
+# Myeloid subcluster labels
+spe$final_celltype[match(colnames(myeloid_obj), colnames(spe))] <- as.character(myeloid_obj$sub_celltype)
+
+# Joint T cell subcluster labels (covers cleaned cluster 15 + broad clusters 5/6/7)
+spe$final_celltype[match(colnames(tcell_obj), colnames(spe))] <- as.character(tcell_obj$sub_celltype)
+
+# Flag cluster 15's previously-excluded low-quality/artifact cells explicitly,
+# so they get caught by the exclusion step below rather than silently
+# keeping their stale pre-subclustering broad label
+spe$final_celltype[colnames(spe) %in% cluster15_excluded_ids] <- "Unresolved/Low Quality"
+
+# B cell (rerun without cluster 15) subcluster labels
+spe$final_celltype[match(colnames(bcell_obj), colnames(spe))] <- as.character(bcell_obj$sub_celltype)
+
+# DC/mregDC subcluster labels
+spe$final_celltype[match(colnames(dc_mregdc_obj), colnames(spe))] <- as.character(dc_mregdc_obj$sub_celltype)
+
+spe$final_celltype <- factor(spe$final_celltype)
+
+cat("Cell types after merge:", nlevels(spe$final_celltype), "\n")
+cat("NAs:", sum(is.na(spe$final_celltype)), "\n")
+```
+
+# 6. Strip Tracking-Number Prefixes from Labels
+
+```{r strip-label-numbers}
+spe$final_celltype <- factor(gsub("^\\d+\\.\\s*", "", as.character(spe$final_celltype)))
+
+levels(spe$final_celltype)
+```
+
+# 7. Exclude Confirmed Low-Quality/Artifact Clusters
+
+- **Broad cluster 17**: confirmed low quality at the broad level.
+- **"Unresolved/Low Quality"**: cluster 15's previously-excluded
+  low-quality/Patient20-artifact cells, flagged explicitly in chunk 5
+  above (this is NOT optional -- without this, ~12,085 already-diagnosed
+  bad cells would silently re-enter the final annotation under their
+  stale broad label).
+
+```{r exclude-low-quality}
+n_before <- ncol(spe)
+
+spe <- spe[, spe$broad_clusters != "17"]
+
+low_quality_labels <- c("Unresolved/Low Quality")
+spe <- spe[, !(spe$final_celltype %in% low_quality_labels)]
+
+n_after <- ncol(spe)
+
+cat("Cells before exclusion:", n_before, "\n")
+cat("Cells after excluding low-quality/artifact clusters:", n_after, "\n")
+cat("Cells removed:", n_before - n_after,
+    sprintf("(%.1f%% of dataset)\n", 100 * (n_before - n_after) / n_before))
+
+spe$final_celltype <- droplevels(spe$final_celltype)
+```
+
+# 8. Final Cell Type Counts
+
+```{r final-celltype-table}
+spe$final_celltype |>
+  table(useNA = "ifany") |>
+  as.data.frame() |>
+  setNames(c("CellType", "Count")) |>
+  arrange(desc(Count)) |>
+  knitr::kable(caption = "Final cell type counts after merge and QC exclusion")
+```
+
+# 9. Validation: Heatmap of Marker Expression by Final Cell Type
+
+Violin plots will be handled separately in a separate notebook. 
+
+```{r validate-heatmap, fig.width=16, fig.height=12}
+all_markers <- rownames(spe)
+
+celltype_levels <- levels(spe$final_celltype)
+
+mean_expr <- sapply(celltype_levels, function(ct) {
+  idx <- which(spe$final_celltype == ct)
+  rowMeans(assay(spe, "scaled_0100")[all_markers, idx, drop = FALSE])
+})
+
+marker_order <- all_markers[hclust(dist(mean_expr))$order]
+
+celltype_sizes <- table(spe$final_celltype)
+celltype_labels <- paste0(celltype_levels, "\n(n=", celltype_sizes[celltype_levels], ")")
+names(celltype_labels) <- celltype_levels
+
+heatmap_df <- as.data.frame(mean_expr) |>
+  rownames_to_column("marker") |>
+  pivot_longer(-marker, names_to = "celltype", values_to = "mean_expr")
+
+heatmap_df$marker   <- factor(heatmap_df$marker, levels = marker_order)
+heatmap_df$celltype <- factor(heatmap_df$celltype, levels = celltype_levels)
+
+ggplot(heatmap_df, aes(x = celltype, y = marker, fill = mean_expr)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "steelblue", mid = "white", high = "firebrick",
+                       midpoint = 0, name = "Mean\nZ-score") +
+  scale_x_discrete(labels = celltype_labels) +
+  theme_bw(base_size = 9) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 6),
+        panel.grid = element_blank()) +
+  labs(x = "Final Cell Type (n)", y = "Marker",
+       title = "Final Annotation Validation: Mean Marker Expression by Cell Type")
+```
+
+# 10. Save Finalized Object
+
+```{r save-final}
+saveRDS(spe, final_out_path)
+cat("Saved final annotated object to:", final_out_path, "\n")
+```
+
+# Handoff Notes
+
+- This merge replaces cluster 15 as a standalone piece with the joint T
+  cell subclustering (`tcell_subclustering.rds`), which covers cluster 15's
+  cleaned survivors + broad clusters 5 (Treg), 6 (CD8+ T Cell), 7 (Memory
+  T Cell).
+- Cluster 15's originally-excluded low-quality/Patient20-artifact cells
+  (~12,085) are explicitly flagged and excluded in chunks 4/7 -- do not
+  remove this step even though "only cluster 17" was the stated intent,
+  since skipping it would silently reintroduce already-diagnosed bad cells.
+- Violin plots intentionally omitted -- see partner's separate notebook.
+- Given ~35-40 final cell types, the full-legend UMAP is best used as an
+  internal QC check (confirming each subcluster occupies a distinct region)
+  rather than a presentation figure. Consider faceting by broad lineage
+  (T cell / B cell / Myeloid / Epithelial) for anything shown to Campbell.

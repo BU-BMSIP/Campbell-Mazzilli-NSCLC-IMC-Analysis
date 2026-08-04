@@ -1,0 +1,336 @@
+---
+title: "Final Cell Type Annotation (R2) — Follow-up Diagnostic Checks"
+author: "Tazein Shah"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## 0. Setup
+
+```{r libraries}
+library(SpatialExperiment)
+library(SummarizedExperiment)
+library(tidyverse)
+library(ggplot2)
+```
+
+```{r paths}
+analysis_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/final_cell_annotation"
+spe_path      <- file.path(analysis_path, "r2_annotation", "spe_final_celltype_r2.rds")
+```
+
+```{r load-data}
+spe <- readRDS(spe_path)
+
+if (!"exprs" %in% assayNames(spe)) {
+  assay(spe, "exprs") <- asinh(assay(spe, "counts") / 1)
+}
+
+spe$patient_id <- as.character(as.vector(spe$patient_id))
+spe$sample_id  <- as.character(as.vector(spe$sample_id))
+
+print(table(spe$final_celltype, useNA = "ifany"))
+```
+
+```{r celltype-category}
+celltype_category <- c(
+  "B Cell (CD19+)"                                       = "B Cell/Plasma Cell",
+  "B Cell, Weak (CD19+)"                                 = "B Cell/Plasma Cell",
+  "B Cell/Plasma Cell, HLADRB-high (CD19+CD138+HLADRB+)" = "B Cell/Plasma Cell",
+  "Plasma Cell, Memory-like (Weak) (CD45RO+)"            = "B Cell/Plasma Cell",
+  "Plasma Cell, TIM3+ (CD138+TIM3+CD45RO-)"              = "B Cell/Plasma Cell",
+  "Plasmablast, Strongly Activated (CD38++)"             = "B Cell/Plasma Cell",
+  "Plasmablast/Activated B Cell (CD38+)"                 = "B Cell/Plasma Cell",
+  "Transitional B Cell/Plasmablast (CD19+CD138+HLADRB+)" = "B Cell/Plasma Cell",
+
+  "CD4+ T Cell, Activated"                               = "T Cell",
+  "CD4+ T Cell, Exhaustion-leaning"                      = "T Cell",
+  "CD8+ T Cell, Activated"                                = "T Cell",
+  "CD8+ T Cell, Resting"                                  = "T Cell",
+  "Memory T Cell"                                         = "T Cell",
+  "Treg, Activated"                                       = "T Cell",
+  "Treg, Resting"                                         = "T Cell",
+
+  "cDC1"                                                  = "Myeloid",
+  "DC/mregDC"                                             = "Myeloid",
+  "DC/mregDC (Epi Adj)"                                   = "Myeloid",
+  "DC/mregDC (LAMP3-)"                                    = "Myeloid",
+  "DC/mregDC Weak"                                         = "Myeloid",
+  "Dendritic Cell (CD11c+)"                               = "Myeloid",
+  "Macrophage (CD68+)"                                    = "Myeloid",
+  "Macrophage, Antigen-Presenting (HLADRB+)"              = "Myeloid",
+  "Macrophage, M2-like (CD163+)"                          = "Myeloid",
+  "Macrophage, Mixed Signal (PDL1+)"                      = "Myeloid",
+  "Macrophage, Proliferating (HLADRB+)"                   = "Myeloid",
+  "Macrophage, Proliferating (MKI67+)"                    = "Myeloid",
+  "Monocyte (Generic)"                                    = "Myeloid",
+  "Monocyte (PD1+)"                                       = "Myeloid",
+  "Monocyte-Macrophage Transitional (CD14+)"              = "Myeloid",
+  "Monocyte-Macrophage, Unresolved"                       = "Myeloid",
+  "Monocyte, Unresolved"                                  = "Myeloid",
+  "PMN-MDSC"                                               = "Myeloid",
+
+  "Epithelial (EpCAM+)"                                   = "Epithelial/Stroma",
+  "Fibroblast/Stroma"                                     = "Epithelial/Stroma",
+  "Tumor Epithelial (Neuroendocrine)"                     = "Epithelial/Stroma",
+  "Tumor Epithelial (TTF1++)"                             = "Epithelial/Stroma",
+
+  "Mast Cell"                                             = "Other",
+  "Proliferating Cells"                                   = "Other"
+)
+
+spe$celltype_category <- celltype_category[as.character(spe$final_celltype)]
+
+unmapped <- setdiff(unique(as.character(spe$final_celltype)), names(celltype_category))
+if (length(unmapped) > 0) {
+  cat("Unmapped final_celltype labels -- add these to celltype_category:\n")
+  print(unmapped)
+} else {
+  cat("All final_celltype labels mapped to a category.\n")
+}
+
+print(table(spe$celltype_category, useNA = "ifany"))
+```
+
+---
+
+## 1. DC/mregDC (LAMP3-) — Residual LAMP3 Signal Check
+
+The cluster is named LAMP3-negative but its LAMP3 median sits well
+above the myeloid baseline. Check whether this is graded spillover
+from the other DC/mregDC clusters, or a genuinely separable
+LAMP3-intermediate population.
+
+```{r lamp3neg-subset}
+lamp3neg_label <- "DC/mregDC (LAMP3-)"
+
+spe_myeloid_group <- spe[, spe$celltype_category == "Myeloid"]
+spe_myeloid_group$final_celltype <- droplevels(factor(spe_myeloid_group$final_celltype))
+
+idx_lamp3neg <- which(spe_myeloid_group$final_celltype == lamp3neg_label)
+cat("Number of cells in", lamp3neg_label, ":", length(idx_lamp3neg), "\n")
+```
+
+```{r lamp3neg-marker-compare}
+dc_labels <- c("DC/mregDC", "DC/mregDC (Epi Adj)", "DC/mregDC (LAMP3-)", "DC/mregDC Weak")
+
+lamp3_means <- sapply(dc_labels, function(cl) {
+  idx <- which(spe_myeloid_group$final_celltype == cl)
+  mean(assay(spe_myeloid_group, "exprs")["LAMP3", idx])
+})
+
+cat("Mean LAMP3 (asinh) expression across DC/mregDC labels:\n")
+print(lamp3_means)
+
+cat("\nFor comparison, myeloid-wide LAMP3-negative baseline (cDC1, monocytes, macrophages):\n")
+baseline_labels <- setdiff(unique(as.character(spe_myeloid_group$final_celltype)), dc_labels)
+idx_baseline <- which(spe_myeloid_group$final_celltype %in% baseline_labels)
+cat(mean(assay(spe_myeloid_group, "exprs")["LAMP3", idx_baseline]), "\n")
+```
+
+```{r lamp3neg-density}
+make_density_plot <- function(spe, assay_name, cluster_col, cluster_label, marker, title) {
+  expr_vec   <- assay(spe, assay_name)[marker, ]
+  cluster_id <- spe[[cluster_col]]
+
+  idx <- which(cluster_id == cluster_label)
+  plot_df <- data.frame(expr = expr_vec[idx])
+
+  ggplot(plot_df, aes(x = expr)) +
+    geom_histogram(aes(y = after_stat(density)), bins = 60, fill = "steelblue", alpha = 0.6) +
+    geom_density(color = "firebrick", linewidth = 0.8) +
+    labs(title = title, x = "asinh expression", y = "Density") +
+    theme_bw(base_size = 11)
+}
+
+p_lamp3neg_density <- make_density_plot(spe_myeloid_group, "exprs", "final_celltype",
+                                        lamp3neg_label, "LAMP3",
+                                        "DC/mregDC (LAMP3-): LAMP3 Density")
+print(p_lamp3neg_density)
+```
+
+A single unimodal peak at an intermediate level (between true LAMP3-
+myeloid and the other DC/mregDC clusters) argues for a graded/spillover
+signal and supports a rename to something like "LAMP3-intermediate."
+A bimodal shape with a genuine low-LAMP3 mode plus a smaller
+higher-LAMP3 tail would instead suggest the negative-gating threshold
+just needs adjusting, with most cells legitimately LAMP3-.
+
+```{r lamp3neg-patient-composition}
+cat("Patient composition of DC/mregDC (LAMP3-) cluster:\n")
+print(sort(table(spe_myeloid_group$patient_id[idx_lamp3neg]), decreasing = TRUE))
+```
+
+---
+
+## 2. Plasmablast, Strongly Activated (CD38++) — CD138 Check
+
+Strongly activated plasmablasts are typically CD38+CD138+. This
+cluster's CD138 median is negative, lower than several other B/plasma
+clusters. Check whether that's a real phenotype or spillover from an
+adjacent low-CD138 population.
+
+```{r sa-cd138-subset}
+sa_label <- "Plasmablast, Strongly Activated (CD38++)"
+
+spe_bcell_group <- spe[, spe$celltype_category == "B Cell/Plasma Cell"]
+spe_bcell_group$final_celltype <- droplevels(factor(spe_bcell_group$final_celltype))
+
+idx_sa <- which(spe_bcell_group$final_celltype == sa_label)
+cat("Number of cells in", sa_label, ":", length(idx_sa), "\n")
+```
+
+```{r sa-cd138-compare}
+bcell_labels <- levels(spe_bcell_group$final_celltype)
+
+cd138_means <- sapply(bcell_labels, function(cl) {
+  idx <- which(spe_bcell_group$final_celltype == cl)
+  mean(assay(spe_bcell_group, "exprs")["CD138", idx])
+})
+
+cat("Mean CD138 (asinh) expression across all B Cell/Plasma Cell labels:\n")
+print(sort(cd138_means, decreasing = TRUE))
+```
+
+```{r sa-cd138-density}
+p_sa_cd138_density <- make_density_plot(spe_bcell_group, "exprs", "final_celltype",
+                                        sa_label, "CD138",
+                                        "Plasmablast, Strongly Activated: CD138 Density")
+print(p_sa_cd138_density)
+
+p_sa_cd38_density <- make_density_plot(spe_bcell_group, "exprs", "final_celltype",
+                                       sa_label, "CD38",
+                                       "Plasmablast, Strongly Activated: CD38 Density")
+print(p_sa_cd38_density)
+```
+
+A unimodal CD138-low peak alongside a clean unimodal CD38-high peak
+would support a genuine CD38++CD138- phenotype (possibly an earlier
+activation stage before CD138 upregulation). A bimodal CD138
+distribution -- some cells clearly CD138+ mixed with a CD138- majority
+-- would instead suggest an admixed population that could be split.
+
+```{r sa-patient-composition}
+cat("Patient composition of Plasmablast, Strongly Activated cluster:\n")
+print(sort(table(spe_bcell_group$patient_id[idx_sa]), decreasing = TRUE))
+```
+
+---
+
+## 3. Plasma Cell Clusters — Unexpected CD45RA Elevation
+
+Plasma cells are terminally differentiated and typically CD45RA-low.
+Two plasma-cell-labeled clusters show CD45RA near ceiling, comparable
+to naive B cells. Check whether this reflects spillover from an
+adjacent naive B cell population or true co-expression.
+
+```{r cd45ra-subset}
+cd45ra_check_labels <- c(
+  "Plasma Cell, TIM3+ (CD138+TIM3+CD45RO-)",
+  "B Cell/Plasma Cell, HLADRB-high (CD19+CD138+HLADRB+)"
+)
+
+cd45ra_means <- sapply(bcell_labels, function(cl) {
+  idx <- which(spe_bcell_group$final_celltype == cl)
+  mean(assay(spe_bcell_group, "exprs")["CD45RA", idx])
+})
+
+cat("Mean CD45RA (asinh) expression across all B Cell/Plasma Cell labels:\n")
+print(sort(cd45ra_means, decreasing = TRUE))
+```
+
+```{r cd45ra-density}
+for (lbl in cd45ra_check_labels) {
+  p <- make_density_plot(spe_bcell_group, "exprs", "final_celltype",
+                          lbl, "CD45RA",
+                          paste(lbl, ": CD45RA Density"))
+  print(p)
+}
+```
+
+```{r cd45ra-cd138-crosscheck}
+# If CD45RA-high cells in these clusters are also CD138-low, that's
+# consistent with naive B cell contamination rather than a genuine
+# CD45RA+ plasma cell state (plasma cells should be CD138+ almost by
+# definition given how they were gated into this category).
+for (lbl in cd45ra_check_labels) {
+  idx <- which(spe_bcell_group$final_celltype == lbl)
+  cd45ra_vals <- assay(spe_bcell_group, "exprs")["CD45RA", idx]
+  cd138_vals  <- assay(spe_bcell_group, "exprs")["CD138", idx]
+
+  cat(lbl, "\n")
+  cat("  Correlation CD45RA vs CD138:", round(cor(cd45ra_vals, cd138_vals), 3), "\n")
+  cat("  Proportion CD45RA-high (>2) AND CD138-low (<0):",
+      round(mean(cd45ra_vals > 2 & cd138_vals < 0), 3), "\n\n")
+}
+```
+
+A negative CD45RA-CD138 correlation, with a meaningful share of cells
+CD45RA-high/CD138-low, points to admixture with a naive B cell
+population rather than a real CD45RA+ plasma cell phenotype. A
+positive or flat correlation, with CD45RA-high cells still CD138+,
+would argue the co-expression is real and worth a note rather than a
+split.
+
+```{r cd45ra-patient-composition}
+for (lbl in cd45ra_check_labels) {
+  idx <- which(spe_bcell_group$final_celltype == lbl)
+  cat("Patient composition of", lbl, ":\n")
+  print(sort(table(spe_bcell_group$patient_id[idx]), decreasing = TRUE))
+  cat("\n")
+}
+```
+
+---
+
+## 4. Monocyte, Unresolved — CD138 Check
+
+CD138 is a plasma cell marker with no expected myeloid role, but this
+"unresolved" monocyte cluster has the highest CD138 mean in the entire
+Myeloid category. Check whether this reflects genuine cross-lineage
+spillover consistent with an "unresolved" catch-all, or a specific
+subpopulation worth pulling out.
+
+```{r monounresolved-subset}
+mono_unresolved_label <- "Monocyte, Unresolved"
+
+idx_mono_unresolved <- which(spe_myeloid_group$final_celltype == mono_unresolved_label)
+cat("Number of cells in", mono_unresolved_label, ":", length(idx_mono_unresolved), "\n")
+```
+
+```{r monounresolved-cd138-compare}
+myeloid_labels <- levels(spe_myeloid_group$final_celltype)
+
+cd138_means_myeloid <- sapply(myeloid_labels, function(cl) {
+  idx <- which(spe_myeloid_group$final_celltype == cl)
+  mean(assay(spe_myeloid_group, "exprs")["CD138", idx])
+})
+
+cat("Mean CD138 (asinh) expression across all Myeloid labels:\n")
+print(sort(cd138_means_myeloid, decreasing = TRUE))
+```
+
+```{r monounresolved-cd138-density}
+p_mono_cd138_density <- make_density_plot(spe_myeloid_group, "exprs", "final_celltype",
+                                          mono_unresolved_label, "CD138",
+                                          "Monocyte, Unresolved: CD138 Density")
+print(p_mono_cd138_density)
+```
+
+A bimodal CD138 distribution -- most cells low, a distinct minority
+high -- would suggest a genuine plasma-cell-admixed subpopulation
+buried in the "unresolved" bucket that could potentially be pulled out
+with targeted resubclustering. A unimodal, moderately-elevated peak
+would just reflect diffuse cross-lineage noise consistent with an
+honest "unresolved" label, not warranting further splitting.
+
+```{r monounresolved-patient-composition}
+cat("Patient composition of Monocyte, Unresolved cluster:\n")
+print(sort(table(spe_myeloid_group$patient_id[idx_mono_unresolved]), decreasing = TRUE))
+```
+

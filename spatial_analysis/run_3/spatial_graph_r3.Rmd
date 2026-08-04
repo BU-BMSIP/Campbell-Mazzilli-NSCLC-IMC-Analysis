@@ -1,0 +1,104 @@
+---
+title: "Spatial Graph (Run 3)"
+author: "Vaidehi Gupta"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+Builds the cell-cell spatial graph from the current finalized annotated
+dataset (`spe_final_celltype.rds`, T-cell-subclustering update), for
+handoff to niche analysis.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+```
+
+# 1. Load Libraries
+
+```{r libraries}
+#.libPaths(c("/restricted/projectnb/camplab/home/vgupta7/R_libs", .libPaths()))
+
+library(imcRtools)
+library(tidyverse)
+library(SingleCellExperiment)
+library(SpatialExperiment)
+library(scater)
+```
+
+# 2. Paths
+
+```{r paths}
+analysis_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis"
+
+final_celltype_path <- file.path(analysis_path, "final_cell_annotation", "r2_annotation", "spe_final_celltype_r2.rds")
+
+spatial_analysis_path <- file.path(analysis_path, "spatial_analysis", "run_3")
+
+spatial_graph_out_path <- file.path(spatial_analysis_path, "spe_spatial_graph_r3.rds")
+```
+
+# 3. Load Finalized Annotated Object
+
+```{r load-spe}
+spe <- readRDS(final_celltype_path)
+
+cat("Cells loaded:", ncol(spe), "\n")
+cat("Cell types:", nlevels(spe$final_celltype), "\n")
+cat("Samples/ROIs:", length(unique(spe$sample_id)), "\n")
+```
+
+# 4. Build Spatial Graph
+
+Using `type = "expansion"` and `threshold = 20`, matching the convention
+used throughout this project (pending final confirmation from Campbell
+given the 20 vs. 50 discrepancy between the reference manuscript text and
+its code).
+
+```{r build-spatial-graph}
+t0 <- Sys.time()
+spe <- buildSpatialGraph(
+  spe,
+  img_id    = "sample_id",
+  type      = "expansion",
+  threshold = 20,
+  name      = "expansion_interaction_graph"
+)
+t1 <- Sys.time()
+cat("Spatial graph built on full dataset in",
+    round(as.numeric(t1 - t0, units = "mins"), 2), "minutes\n")
+
+colPairNames(spe)
+graph_name <- "expansion_interaction_graph"
+```
+
+# 5. Graph Diagnostics
+
+```{r graph-diagnostics}
+graph_obj <- colPair(spe, graph_name)
+cat("Total edges in graph:", length(graph_obj), "\n")
+cat("Mean neighbors per cell:", round(length(graph_obj) / ncol(spe), 2), "\n")
+```
+
+# 6. Save Spatial Graph Object
+
+```{r save-spatial-graph}
+saveRDS(spe, spatial_graph_out_path)
+cat("Saved spatial graph object to:", spatial_graph_out_path, "\n")
+```
+
+# Handoff Notes
+
+- Saved to: `spatial_analysis/spe_spatial_graph_r3.rds`
+- Built from `spe_final_celltype.rds` (T-cell-subclustering-updated
+  annotation, ~39 final cell types, cluster 17 and cluster 15
+  low-quality/artifact cells excluded).
+- Graph: `type = "expansion"`, `threshold = 20`, stored as
+  `"expansion_interaction_graph"` in `colPairNames(spe)`.
+- This file includes both the graph and the full `final_celltype`
+  annotation -- ready to hand directly to niche analysis
+  (`aggregateNeighbors()` + clustering) without needing any further
+  merging or relabeling.

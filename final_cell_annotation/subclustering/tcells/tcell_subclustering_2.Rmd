@@ -1,0 +1,469 @@
+---
+title: 'T Cell Subclustering: Combined Cluster 15 (Cleaned) + Clusters 5, 6, 7'
+author: "Vaidehi Gupta"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+This notebook combines cluster 15 (CD4+ T cell/Treg population) with the other 
+broad T cell clusters(5 = Treg, 6 = CD8+ T Cell, 7 = Memory T Cell) for a joint 
+subclustering pass, using k=20 Louvain.
+
+Cluster 15 contributes only its already-cleaned cells (excluding
+subclusters 2, 4, 7 (low quality/Patient 20 driven) and 8 (confirmed
+Patient20 CD19 technical artifact), rather than the raw broad cluster,
+since those issues are already diagnosed and there's no reason to
+reintroduce them. 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+```
+
+# 1. Load Libraries
+
+```{r libraries}
+.libPaths(c("/restricted/projectnb/camplab/home/vgupta7/R_libs", .libPaths()))
+
+library(imcRtools)
+library(tidyverse)
+library(dittoSeq)
+library(viridis)
+library(scater)
+library(scran)
+library(bluster)
+library(patchwork)
+library(RColorBrewer)
+library(ComplexHeatmap)
+library(circlize)
+```
+
+# 2. Paths
+
+```{r paths}
+analysis_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis"
+
+spe_path <- file.path(analysis_path, "final_cell_annotation", "final_broad_cluster", "h5_cluster_annot.rds")
+
+cluster15_clean_path <- file.path(analysis_path, "final_cell_annotation", "subclustering",
+                                   "cluster15", "cluster15_subcluster_clean.rds")
+
+tcell_clustering_path <- file.path(analysis_path, "final_cell_annotation", "subclustering", "tcells")
+out_path <- file.path(tcell_clustering_path, "tcell_subclustering.rds")
+findmarkers_path <- file.path(tcell_clustering_path, "tcell_subclustering_findmarkers.csv")
+```
+
+# 3. Load Data and Assemble Combined Cell Set
+
+```{r load-and-assemble}
+spe <- readRDS(spe_path)
+cluster15_clean <- readRDS(cluster15_clean_path)
+
+# Cluster 15's already-cleaned cells
+cluster15_clean_ids <- colnames(cluster15_clean)
+cat("Cluster 15 (cleaned) cells:", length(cluster15_clean_ids), "\n")
+
+# Full, unsubclustered cells from the other broad T cell clusters
+tcell_broad_clusters <- c("5", "6", "7")  # Treg, CD8+ T Cell, Memory T Cell
+other_tcell_ids <- colnames(spe)[as.character(spe$broad_clusters) %in% tcell_broad_clusters]
+cat("Cells from broad clusters 5/6/7:", length(other_tcell_ids), "\n")
+
+for (cl in tcell_broad_clusters) {
+  n <- sum(as.character(spe$broad_clusters) == cl)
+  cat("  Cluster", cl, ":", n, "cells\n")
+}
+
+combined_ids <- union(cluster15_clean_ids, other_tcell_ids)
+cat("\nTotal combined T cell subset:", length(combined_ids), "\n")
+
+spe_tcell <- spe[, combined_ids]
+```
+
+```{r patient-cell-counts, fig.width=10, fig.height=6}
+patient_counts <- as.data.frame(table(patient_id = spe_tcell$patient_id))
+
+p_patient_comp <- ggplot(patient_counts, aes(x = patient_id, y = Freq, fill = patient_id)) +
+  geom_col() +
+  labs(title = "T Cell Subset: Cell Count by Patient",
+       x = "Patient", y = "Cell Count") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+print(p_patient_comp)
+
+cat("T cell subset composition by patient:\n")
+print(patient_counts[order(-patient_counts$Freq), ])
+```
+
+# 4. Recluster: Louvain on Existing Harmony Embedding (k = 20)
+
+```{r recluster}
+if (file.exists(out_path)) {
+  cat("Output already exists, loading instead of reclustering:", out_path, "\n")
+  spe_tcell <- readRDS(out_path)
+} else {
+  harmony_tcell <- reducedDim(spe_tcell, "Harmony")
+
+  set.seed(220225)
+  snn_graph <- buildSNNGraph(spe_tcell, use.dimred = "Harmony", k = 20,
+                              BPPARAM = BiocParallel::SerialParam())
+  clusters <- igraph::cluster_louvain(snn_graph)$membership
+  spe_tcell$tcell_subclusters <- factor(clusters)
+}
+
+cat("Number of subclusters:", nlevels(spe_tcell$tcell_subclusters), "\n")
+print(table(spe_tcell$tcell_subclusters))
+```
+
+# 5. UMAP on the Subset
+
+```{r umap}
+if ("UMAP_sub" %in% reducedDimNames(spe_tcell)) {
+  cat("UMAP_sub already exists, skipping recomputation.\n")
+} else {
+  set.seed(220225)
+  spe_tcell <- runUMAP(spe_tcell, dimred = "Harmony", name = "UMAP_sub")
+}
+
+p_sub_original <- dittoDimPlot(spe_tcell, var = "broad_celltype",
+                                reduction.use = "UMAP_sub",
+                                size = 0.4) +
+  ggtitle("T Cell Subset: UMAP colored by Original Broad Label") +
+  theme(legend.position = "right")
+print(p_sub_original)
+```
+
+```{r umap-subclusters, fig.width=10, fig.height=8}
+p_sub_clusters <- dittoDimPlot(spe_tcell, var = "tcell_subclusters",
+                                reduction.use = "UMAP_sub",
+                                size = 0.4, do.label = TRUE, labels.size = 4) +
+  ggtitle("T Cell Subset: UMAP colored by Subcluster") +
+  theme(legend.position = "right")
+print(p_sub_clusters)
+```
+
+# 6. Marker Sets for T Cell Subtyping
+
+```{r markers}
+lineage_markers <- c("CD4", "CD8a", "FoxP3")
+state_markers <- c("CD45RO", "MKI67", "PD1", "PDL1", "TIM3", "HLADRB", "CD127", "TIGIT", "CTLA4")
+
+# Used to catch contamination/spillover
+admixture_markers <- c("CD19", "CD138", "CD11c", "CD14", "CD1c", "CD68")
+
+tcell_markers <- c(lineage_markers, state_markers, admixture_markers)
+tcell_markers <- tcell_markers[tcell_markers %in% rownames(spe_tcell)]
+cat("Markers found:", paste(tcell_markers, collapse = ", "), "\n")
+```
+
+# 7. Violin Plots per Subcluster
+
+```{r violin-fn, fig.width=14, fig.height=6}
+make_violinplot <- function(spe, assay_name, cluster_col, marker_set, title, ncol = 3) {
+  expr_mat  <- assay(spe, assay_name)[marker_set, , drop = FALSE]
+  cluster_id <- spe[[cluster_col]]
+
+  mean_expr <- sapply(levels(cluster_id), function(cl) {
+    idx <- which(cluster_id == cl)
+    rowMeans(expr_mat[, idx, drop = FALSE])
+  })
+
+  if (is.matrix(mean_expr) && nrow(mean_expr) > 1) {
+    marker_order <- rownames(mean_expr)[hclust(dist(mean_expr))$order]
+  } else {
+    marker_order <- marker_set
+  }
+
+  plot_df <- as.data.frame(t(expr_mat)) |>
+    mutate(cluster = cluster_id) |>
+    pivot_longer(-cluster, names_to = "marker", values_to = "expr")
+
+  plot_df$marker  <- factor(plot_df$marker, levels = marker_order)
+  plot_df$cluster <- factor(plot_df$cluster, levels = levels(cluster_id))
+
+  ggplot(plot_df, aes(x = cluster, y = expr, fill = cluster)) +
+    geom_violin(scale = "width", trim = TRUE, linewidth = 0.2) +
+    stat_summary(fun = median, geom = "point", size = 0.6, color = "black") +
+    facet_wrap(~ marker, scales = "free_y", ncol = ncol) +
+    labs(title = title, x = "Subcluster", y = "Z-score expression") +
+    theme_bw(base_size = 11) +
+    theme(
+      axis.text.x = element_text(angle = 0, hjust = 0.5, size = 9),
+      strip.text = element_text(face = "bold"),
+      panel.grid.major.x = element_blank(),
+      legend.position = "none"
+    )
+}
+
+p_violin_lineage <- make_violinplot(spe_tcell, "scaled_0100", "tcell_subclusters",
+                                     lineage_markers,
+                                     "T Cell Subset: Lineage Markers per Subcluster",
+                                     ncol = 3)
+print(p_violin_lineage)
+```
+
+```{r violin-state, fig.width=12, fig.height=10}
+p_violin_state <- make_violinplot(spe_tcell, "scaled_0100", "tcell_subclusters",
+                                   state_markers,
+                                   "T Cell Subset: State/Checkpoint Markers per Subcluster",
+                                   ncol = 3)
+print(p_violin_state)
+```
+
+```{r violin-admixture, fig.width=12, fig.height=8}
+p_violin_admixture <- make_violinplot(spe_tcell, "scaled_0100", "tcell_subclusters",
+                                       admixture_markers,
+                                       "T Cell Subset: Admixture/Spillover Markers per Subcluster",
+                                       ncol = 3)
+print(p_violin_admixture)
+```
+
+# 8. Heatmap: All Subclusters
+
+```{r heatmap-all, fig.width=12, fig.height=8}
+all_clusters <- levels(spe_tcell$tcell_subclusters)
+
+mean_expr_all <- sapply(all_clusters, function(cl) {
+  idx <- which(spe_tcell$tcell_subclusters == cl)
+  rowMeans(assay(spe_tcell, "scaled_0100")[tcell_markers, idx, drop = FALSE])
+})
+
+marker_order <- tcell_markers[hclust(dist(mean_expr_all))$order]
+
+cluster_sizes <- table(spe_tcell$tcell_subclusters)
+cluster_labels <- paste0(all_clusters, "\n(n=", cluster_sizes[all_clusters], ")")
+names(cluster_labels) <- all_clusters
+
+heatmap_df <- as.data.frame(mean_expr_all) |>
+  rownames_to_column("marker") |>
+  pivot_longer(-marker, names_to = "subcluster", values_to = "mean_expr")
+
+heatmap_df$marker     <- factor(heatmap_df$marker, levels = marker_order)
+heatmap_df$subcluster <- factor(heatmap_df$subcluster, levels = all_clusters)
+
+p_heatmap <- ggplot(heatmap_df, aes(x = subcluster, y = marker, fill = mean_expr)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(mean_expr, 2)), size = 3) +
+  scale_fill_gradient2(low = "steelblue", mid = "white", high = "firebrick",
+                       midpoint = 0, name = "Mean\nZ-score") +
+  scale_x_discrete(labels = cluster_labels) +
+  labs(title = "Mean Marker Expression: All T Cell Subclusters",
+       x = "Subcluster (cell count)", y = "Marker") +
+  theme_bw(base_size = 11) +
+  theme(panel.grid = element_blank())
+print(p_heatmap)
+```
+
+# 9. Statistical Marker Discovery (findMarkers)
+
+```{r findmarkers}
+markers_de <- findMarkers(spe_tcell,
+                           groups = spe_tcell$tcell_subclusters,
+                           assay.type = "scaled_0100",
+                           subset.row = tcell_markers)
+
+all_markers_df <- do.call(rbind, lapply(levels(spe_tcell$tcell_subclusters), function(cl) {
+  df <- as.data.frame(markers_de[[cl]])
+  data.frame(
+    subcluster = cl,
+    marker     = rownames(df),
+    Top        = df$Top,
+    FDR        = df$FDR,
+    logFC      = df$summary.logFC
+  )
+}))
+
+dir.create(dirname(findmarkers_path), recursive = TRUE, showWarnings = FALSE)
+write.csv(all_markers_df, findmarkers_path, row.names = FALSE)
+
+top1_summary <- do.call(rbind, lapply(levels(spe_tcell$tcell_subclusters), function(cl) {
+  sub <- all_markers_df[all_markers_df$subcluster == cl & all_markers_df$logFC > 1.0, ]
+  sub <- sub[order(sub$Top, -sub$logFC), ]
+  if (nrow(sub) == 0) {
+    data.frame(subcluster = cl, top_markers = "none above logFC 1.0")
+  } else {
+    data.frame(subcluster = cl, top_markers = paste(head(sub$marker, 5), collapse = ", "))
+  }
+}))
+
+cat("Top positive markers (logFC > 1.0) per subcluster:\n")
+knitr::kable(top1_summary, col.names = c("Subcluster", "Top Positive Markers"))
+```
+
+```{r findmarkers-per-subcluster-tables}
+cat("Detailed tables:\n\n")
+for (cl in levels(spe_tcell$tcell_subclusters)) {
+  sub <- all_markers_df[all_markers_df$subcluster == cl & all_markers_df$Top <= 5, ]
+  sub <- sub[order(sub$Top, -sub$logFC), ]
+  if (nrow(sub) == 0) {
+    cat("Subcluster", cl, ": no markers in top 5\n\n")
+  } else {
+    print(knitr::kable(sub[, c("marker", "Top", "FDR", "logFC")],
+                       caption = paste("Subcluster", cl),
+                       digits  = 3, row.names = FALSE))
+  }
+}
+```
+
+# 10. Quality/Origin Checks
+
+Following the same diagnostic pattern used for cluster 15 and the B cell
+subclustering -- check total counts, cell area, and patient composition for
+any subcluster that looks flat/low-signal in the heatmap above (update
+`check_clusters` once you've looked at chunks 8-9).
+
+```{r quality-checks}
+check_clusters <- c("4")  # large, flat CD45RO-only signature -- same profile as prior artifacts
+
+spe_tcell$total_counts <- colSums(assay(spe_tcell, "counts"))
+
+quality_check <- colData(spe_tcell) |>
+  as.data.frame() |>
+  mutate(group = ifelse(tcell_subclusters %in% check_clusters,
+                         "Flagged subcluster(s)", "Other subclusters")) |>
+  group_by(group) |>
+  summarise(
+    n = n(),
+    mean_area = mean(area, na.rm = TRUE),
+    median_area = median(area, na.rm = TRUE),
+    mean_total_counts = mean(total_counts, na.rm = TRUE),
+    median_total_counts = median(total_counts, na.rm = TRUE)
+  )
+print(quality_check)
+```
+Mean area is nearly identical and total counts are only modestly lower (about 10% less). So this looks like a genuine (lower signal) resting memory T cell population, not a staining artifact. 
+
+## Intensity confound check
+
+```{r checkpoint-intensity-check-sub1}
+# Subcluster 1 shows heavy co-elevation of CD45RO/CD138/TIGIT/TIM3/PD1/CTLA4 --
+# given the CD138/TIM3 intensity-confound pattern found in cluster 15, check
+# whether this co-elevation reflects real coordinated checkpoint biology or
+# just generic high signal intensity
+checkpoint_markers <- c("PD1", "TIM3", "TIGIT", "CTLA4", "CD138")
+checkpoint_markers <- checkpoint_markers[checkpoint_markers %in% rownames(spe_tcell)]
+
+sub1_mask <- spe_tcell$tcell_subclusters == "1"
+
+expr_df_sub1 <- as.data.frame(t(assay(spe_tcell, "counts")[checkpoint_markers, sub1_mask]))
+expr_df_sub1$total_counts <- spe_tcell$total_counts[sub1_mask]
+
+cat("Subcluster 1: checkpoint marker correlations, including total_counts:\n")
+print(cor(expr_df_sub1, method = "spearman"))
+```
+PD1 and TIGIT correlate strongly with each other (r=0.42) much more than either correlates with total_counts. This is good evidence that PD1/TIGIT co-expression is real, coordinated checkpoint biology and not an intensity artifact. 
+
+TIM3 is still correlating far more with total_counts (0.41) than with any other checkpoint marker. TIM3 negatively correlates with PD1 and TIGIT, meaning cells with high TIM3 tend to have lower PD1/TIGIT. This is the same intensity-confound signature identified earlier in Cluster 15.
+
+CD138 sits in between, with weak-to-moderate correlations with everything, not clearly artifact driven but not strongly confirmed either. 
+
+## Patient Composition heatmap
+
+```{r patient-composition, fig.width=10, fig.height=6}
+comp_patient <- table(subcluster = spe_tcell$tcell_subclusters,
+                       patient    = spe_tcell$patient_id)
+comp_patient_props <- prop.table(comp_patient, margin = 1)
+
+col_fun_patient <- colorRamp2(c(0, 0.5, 1), rev(brewer.pal(3, "RdBu")))
+
+ht_patient <- Heatmap(
+  comp_patient_props,
+  name = "Proportion",
+  col = col_fun_patient,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  column_title = "Patient",
+  column_title_side = "bottom",
+  row_title = "Subcluster",
+  column_names_rot = 45,
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    val <- comp_patient_props[i, j]
+    text_col <- if (val < 0.2 || val > 0.8) "white" else "black"
+    grid.text(sprintf("%.2f", val), x, y, gp = gpar(col = text_col, fontsize = 7))
+  }
+)
+draw(ht_patient, column_title = "T Cell Subcluster Composition by Patient (row-normalized %)")
+```
+
+# 11. Manual Subcluster Annotation
+
+Fill in based on violin plots (chunk 7), heatmap (chunk 8), findMarkers
+(chunk 9), and quality/patient checks (chunk 10) above.
+
+Resting: T cell in its baseline, stand-by state. It hasn't recently encountered its target antigen or received the signals that would trigger it into action. Characterized by low levels of markers of activation, proliferation, and effector function. 
+
+Activated: T cell that has recognized its antigen or received other activating signals and is not actively engaged. It's proliferating, producing cytokines, and upregulating markers that support its immune function. 
+
+```{r annotate}
+tcell_subannotation <- c(
+  "1" = "CD4+ T Cell, Exhaustion-leaning", # PD1+/TIGIT+
+  "2" = "CD4+ T Cell, Activated",  # CD45RO+, TIM3/CD138 also elevated due to intensity-confound
+  "3" = "Treg, Activated",  # FoxP3+, CD4 and CD45RO also co-elevated
+  "4" = "Memory T Cell",  # CD45RO+, CD1c+ (need to investigate that)
+  "5" = "CD8+ T Cell, Activated",  # CD45RO and CD138 also elevated (activation)
+  "6" = "Treg, Resting",  # FoxP3+, everything else strongly negative
+  "7" = "CD8+ T Cell, Resting" # CD8a sole positive marker, everything else negative
+)
+
+if (!any(tcell_subannotation == "PLACEHOLDER") &&
+    length(tcell_subannotation) == nlevels(spe_tcell$tcell_subclusters)) {
+  spe_tcell$sub_celltype <- tcell_subannotation[as.character(spe_tcell$tcell_subclusters)]
+  spe_tcell$sub_celltype <- factor(spe_tcell$sub_celltype, levels = unique(tcell_subannotation))
+  cat("Subcluster annotation applied.\n")
+  print(table(spe_tcell$sub_celltype, useNA = "ifany"))
+} else {
+  cat("Fill in tcell_subannotation above before proceeding",
+      "-- check length matches nlevels(spe_tcell$tcell_subclusters).\n")
+}
+```
+
+```{r umap-celltype, fig.width=10, fig.height=8}
+if ("sub_celltype" %in% colnames(colData(spe_tcell))) {
+  p_sub_celltype <- dittoDimPlot(spe_tcell, var = "sub_celltype",
+                                  reduction.use = "UMAP_sub",
+                                  size = 0.4, do.label = TRUE, labels.size = 3.5) +
+    ggtitle("T Cell Subset: UMAP colored by Subcluster Cell Type") +
+    theme(legend.position = "right")
+  print(p_sub_celltype)
+} else {
+  cat("Run the annotate chunk first.\n")
+}
+```
+
+### Quick Check: Is subcluster 3 genuinely cluster 15 derived? Is subcluster 6 genuinely cluster 5 derived?
+```{r}
+table(spe_tcell$broad_clusters[spe_tcell$tcell_subclusters == "3"])
+table(spe_tcell$broad_clusters[spe_tcell$tcell_subclusters == "6"])
+```
+
+# 12. Save Subclustered/Annotated Object
+
+```{r save}
+dir.create(dirname(out_path), recursive = TRUE, showWarnings = FALSE)
+saveRDS(spe_tcell, out_path)
+cat("Saved T cell subcluster object to:", out_path, "\n")
+```
+
+# Notes
+
+- Combined input: cluster 15's already-cleaned cells (excludes subclusters
+  2, 4, 7 -- low quality/artifact -- and 8 -- Patient20 CD19 artifact) +
+  full cell sets from broad clusters 5 (Treg), 6 (CD8+ T Cell), 7 (Memory
+  T Cell). Cluster 10 (Memory T/Plasma Cell) intentionally excluded --
+  already covered by the B cell/plasma subclustering.
+- k=20 used for Louvain clustering per team convention (matching the B
+  cell/plasma subclustering approach), rather than k=10 used in the
+  standalone cluster 15 pass.
+- This is the first joint pass across clusters 5/6/7, which haven't been
+  individually vetted for low-quality/artifact subpopulations the way
+  cluster 15 has -- pay close attention to chunk 10's checks in case any
+  new subcluster shows the same low-signal or patient-driven signature
+  found previously in cluster 15 and the B cell/plasma subclustering.
+- Fill in `check_clusters` (chunk 10) and `tcell_subannotation` (chunk 11)
+  once actual heatmap/findMarkers/quality-check output is reviewed --
+  placeholders won't auto-resolve.

@@ -51,11 +51,10 @@ library(kableExtra)
 ```{r paths}
 analysis_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis"
 
-# Update to whichever is the current, Campbell-approved final annotation file
-final_celltype_path <- file.path(analysis_path, "final_cell_annotation", "r1_annotation", "annotation_inspection", "final_cell_annotation_post_inspect.rds")
+final_celltype_path <- file.path(analysis_path, "final_cell_annotation", "r2_annotation",
+                                  "spe_final_celltype_r2.rds")
 
-sccomp_out_dir <- file.path(analysis_path, "spatial_analysis", "run_2")
-dir.create(sccomp_out_dir, recursive = TRUE, showWarnings = FALSE)
+sccomp_out_dir <- file.path(analysis_path, "spatial_analysis", "run_3")
 
 sccomp_vs_benign_path   <- file.path(sccomp_out_dir, "sccomp_celltype_vs_benign.rds")
 sccomp_higher_v_lower_path <- file.path(sccomp_out_dir, "sccomp_celltype_higher_v_lower.rds")
@@ -68,6 +67,19 @@ spe <- readRDS(final_celltype_path)
 
 cat("Cells:", ncol(spe), "\n")
 cat("Cell types:", nlevels(spe$final_celltype), "\n")
+```
+
+## 3a. Sanity Check on Updated Annotation
+
+Given the T cell subclustering update, worth confirming the labels look
+right before running sccomp: no leftover numbered prefixes, new T cell
+subtypes present, no stray low-quality labels slipped through.
+
+```{r sanity-check-annotation}
+levels(spe$final_celltype)
+
+cat("\nAny bare-number labels remaining:",
+    any(grepl("^[0-9]+$", levels(spe$final_celltype))), "\n")
 ```
 
 # 4. Build sccomp Input Object (Benign as Reference)
@@ -85,8 +97,6 @@ cat("Cell types:", n_distinct(sceIMC$CellType), "\n")
 ```
 
 # 5. Run sccomp: Lower & Higher vs. Benign
-
-Loads from disk if already run, to avoid re-fitting unnecessarily.
 
 ```{r sccomp-run-vs-benign}
 if (file.exists(sccomp_vs_benign_path)) {
@@ -138,7 +148,7 @@ only; CI-crosses-zero cases are excluded rather than just flagged, given
 the earlier finding that FDR alone can pass while the credible interval
 still spans zero.
 
-```{r forest-vs-benign, fig.width=16, fig.height=12}
+```{r forest-vs-benign, fig.width=10, fig.height=12}
 effect_df_benign <- sccomp_vs_benign_res |>
   as.data.frame() |>
   filter(parameter %in% c("DiseaseStateLower", "DiseaseStateHigher")) |>
@@ -154,17 +164,17 @@ ggplot(effect_df_benign, aes(x = c_effect, y = CellType_ordered)) +
   scale_y_reordered() +
   facet_wrap(~ parameter, scales = "free_y") +
   theme_classic() +
-  theme(axis.text.y = element_text(size = 11)) +
+  theme(axis.text.y = element_text(size = 7)) +
   labs(
     x = "Effect size (logit fold-change)",
     y = NULL,
-    title = "Cell type composition: Lower and Higher vs. Benign",
+    title = "Cell type composition: Lower & Higher vs. Benign",
     subtitle = "FDR < 0.05, CI excludes zero; red = increases, blue = decreases"
   )
 ```
 
-```{r save-forest-vs-benign}
-ggsave(file.path(analysis_path, "figures", "celltype_comp_vs_benign.png"),
+```{r save-forest-vs-benign, eval=FALSE}
+ggsave(file.path(sccomp_out_dir, "celltype_comp_vs_benign.png"),
        width = 10, height = 12, dpi = 300)
 ```
 
@@ -184,7 +194,7 @@ ggplot(effect_df_hvl, aes(x = c_effect, y = CellType)) +
   geom_point(aes(color = c_effect > 0), size = 2, show.legend = FALSE) +
   scale_color_manual(values = c("TRUE" = "firebrick", "FALSE" = "steelblue")) +
   theme_classic() +
-  theme(axis.text.y = element_text(size = 11)) +
+  theme(axis.text.y = element_text(size = 9)) +
   labs(
     x = "Effect size (logit fold-change)",
     y = NULL,
@@ -193,14 +203,14 @@ ggplot(effect_df_hvl, aes(x = c_effect, y = CellType)) +
   )
 ```
 
-```{r save-forest-higher-v-lower}
-ggsave(file.path(analysis_path, "figures", "celltype_comp_higher_vs_lower.png"),
+```{r save-forest-higher-v-lower, eval=FALSE}
+ggsave(file.path(sccomp_out_dir, "celltype_comp_higher_vs_lower.png"),
        width = 8, height = 12, dpi = 300)
 ```
 
 # 9. Results Table
 
-```{r sccomp-results-table}
+```{r sccomp-results-table, eval=FALSE}
 sccomp_results_df <- sccomp_vs_benign_res |>
   arrange(c_FDR) |>
   as.data.frame() |>
@@ -219,11 +229,11 @@ write.csv(sccomp_higher_v_lower_df,
           file.path(sccomp_out_dir, "sccomp_celltype_results_higher_v_lower.csv"),
           row.names = FALSE)
 
-sccomp_results_df |>
-  knitr::kable(digits = 3, caption = "Cell type composition: Lower \\& Higher vs. Benign",
-               format = "latex", booktabs = TRUE, longtable = TRUE) |>
-  kable_styling(latex_options = c("striped", "repeat_header", "hold_position"),
-                font_size = 8)
+#sccomp_results_df |>
+  #knitr::kable(digits = 3, caption = "Cell type composition: Lower & Higher vs. Benign",
+               #format = "latex", booktabs = TRUE, longtable = TRUE) |>
+  #kable_styling(latex_options = c("striped", "repeat_header", "hold_position"),
+                #font_size = 8)
 ```
 
 # Notes

@@ -1,0 +1,440 @@
+---
+title: "Cell Type Distribution Across Patients and ROIs"
+author: "Tazein Shah"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    theme: cosmo
+    code_folding: show
+    toc: true
+    toc_float: true
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(tidyverse)
+library(SpatialExperiment)
+library(ComplexHeatmap)
+library(circlize)
+library(knitr)
+library(kableExtra)
+
+print_kable <- function(df, ...) {
+  kable(df, ...) |>
+    kable_styling(latex_options = c("scale_down", "hold_position"), font_size = 8)
+}
+```
+
+# 1. Load Data
+
+```{r load-data}
+analysis_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/final_cell_annotation/r2_annotation"
+spe_path <- file.path(analysis_path, "spe_final_celltype_r2.rds")
+figure_path <- file.path(analysis_path, "figures")
+
+spe <- readRDS(spe_path)
+
+plot_df <- data.frame(
+  celltype       = as.character(spe$final_celltype),
+  broad_celltype = as.character(spe$broad_celltype),
+  patient_id     = as.character(as.vector(spe$patient_id)),
+  sample_id      = as.character(as.vector(spe$sample_id))
+)
+```
+
+# 2. Group Final Cell Types into Broad Categories
+
+```{r categories}
+celltype_category <- c(
+  "B Cell (CD19+)"                                       = "B Cell/Plasma Cell",
+  "B Cell, Weak (CD19+)"                                 = "B Cell/Plasma Cell",
+  "B Cell/Plasma Cell, HLADRB-high (CD19+CD138+HLADRB+)" = "B Cell/Plasma Cell",
+  "Plasma Cell, Memory-like (Weak) (CD45RO+)"            = "B Cell/Plasma Cell",
+  "Plasma Cell, TIM3+ (CD138+TIM3+CD45RO-)"              = "B Cell/Plasma Cell",
+  "Plasmablast, Strongly Activated (CD38++)"             = "B Cell/Plasma Cell",
+  "Plasmablast/Activated B Cell (CD38+)"                 = "B Cell/Plasma Cell",
+  "Transitional B Cell/Plasmablast (CD19+CD138+HLADRB+)" = "B Cell/Plasma Cell",
+  "CD4+ T Cell, Activated"                               = "T Cell",
+  "CD4+ T Cell, Exhaustion-leaning"                      = "T Cell",
+  "CD8+ T Cell, Activated"                                = "T Cell",
+  "CD8+ T Cell, Resting"                                  = "T Cell",
+  "Memory T Cell"                                         = "T Cell",
+  "Treg, Activated"                                       = "T Cell",
+  "Treg, Resting"                                         = "T Cell",
+  "cDC1"                                                  = "Myeloid",
+  "DC/mregDC"                                             = "Myeloid",
+  "DC/mregDC (Epi Adj)"                                   = "Myeloid",
+  "DC/mregDC (LAMP3-)"                                    = "Myeloid",
+  "DC/mregDC Weak"                                         = "Myeloid",
+  "Dendritic Cell (CD11c+)"                               = "Myeloid",
+  "Macrophage (CD68+)"                                    = "Myeloid",
+  "Macrophage, Antigen-Presenting (HLADRB+)"              = "Myeloid",
+  "Macrophage, M2-like (CD163+)"                          = "Myeloid",
+  "Macrophage, Mixed Signal (PDL1+)"                      = "Myeloid",
+  "Macrophage, Proliferating (HLADRB+)"                   = "Myeloid",
+  "Macrophage, Proliferating (MKI67+)"                    = "Myeloid",
+  "Monocyte (Generic)"                                    = "Myeloid",
+  "Monocyte (PD1+)"                                       = "Myeloid",
+  "Monocyte-Macrophage Transitional (CD14+)"              = "Myeloid",
+  "Monocyte-Macrophage, Unresolved"                       = "Myeloid",
+  "Monocyte, Unresolved"                                  = "Myeloid",
+  "PMN-MDSC"                                               = "Myeloid",
+  "Epithelial (EpCAM+)"                                   = "Epithelial/Stroma",
+  "Fibroblast/Stroma"                                     = "Epithelial/Stroma",
+  "Tumor Epithelial (Neuroendocrine)"                     = "Epithelial/Stroma",
+  "Tumor Epithelial (TTF1++)"                             = "Epithelial/Stroma",
+  "Mast Cell"                                             = "Other",
+  "Proliferating Cells"                                   = "Other"
+)
+
+spe$celltype_category <- celltype_category[as.character(spe$final_celltype)]
+plot_df$celltype_category <- celltype_category[plot_df$celltype]
+
+# Flag any final_celltype not covered by the mapping above
+unmapped <- unique(plot_df$celltype[is.na(plot_df$celltype_category)])
+if (length(unmapped) > 0) {
+  warning("Unmapped final_celltype values (will show as NA category): ",
+          paste(unmapped, collapse = ", "))
+}
+```
+
+# 3. Broad vs. Final Cell Type Consistency Check
+
+Sanity check that `final_celltype` nests cleanly within `broad_celltype`
+— i.e. each fine-grained annotation should trace back to overwhelmingly
+one broad cluster, with only small "boundary spillover" from
+neighboring clusters. A `final_celltype` split roughly evenly across
+multiple unrelated broad parents would flag a genuinely ambiguous
+cluster worth investigating.
+
+```{r broad-vs-final-check, results='asis'}
+broad_final_tbl <- plot_df |>
+  dplyr::count(broad_celltype, celltype, name = "Freq") |>
+  dplyr::filter(Freq > 0) |>
+  dplyr::arrange(celltype)
+
+print_kable(broad_final_tbl)
+
+broad_final_tbl <- plot_df |>
+  dplyr::count(broad_celltype, celltype, name = "Freq") |>
+  dplyr::filter(Freq > 0) |>
+  dplyr::arrange(celltype)
+
+print_kable(broad_final_tbl)
+
+# Flag final_celltypes that split across multiple broad parents,
+# and how dominant the top parent is
+nesting_check <- broad_final_tbl |>
+  dplyr::group_by(celltype) |>
+  dplyr::mutate(
+    n_broad_parents = dplyr::n(),
+    total = sum(Freq),
+    pct = Freq / total * 100
+  ) |>
+  dplyr::slice_max(pct, n = 1) |>
+  dplyr::ungroup() |>
+  dplyr::rename(top_broad_parent = broad_celltype, pct_top_parent = pct) |>
+  dplyr::mutate(flag = dplyr::case_when(
+    n_broad_parents == 1 ~ "clean 1:1 mapping",
+    pct_top_parent > 90 ~ "ok: minor boundary spillover",
+    pct_top_parent > 70 ~ "moderate split - review",
+    TRUE ~ "HIGH RISK: ambiguous, no dominant parent"
+  )) |>
+  dplyr::arrange(pct_top_parent) |>
+  dplyr::select(celltype, n_broad_parents, top_broad_parent, pct_top_parent, flag)
+
+k <- kable(nesting_check, digits = 1) |>
+  kable_styling(latex_options = c("scale_down", "hold_position"), font_size = 8)
+
+char_cols <- which(sapply(nesting_check, is.character))
+for (i in char_cols) {
+  k <- k |> column_spec(i, width = "3cm")
+}
+
+k
+```
+
+# 4. Cell Type Composition by Patient
+
+One bar chart per cell type, printed separately, with one bar per
+patient labeled with % and cell count.
+
+```{r prep-patient-counts}
+patient_counts <- plot_df |>
+  dplyr::count(patient_id, celltype, celltype_category, name = "n") |>
+  dplyr::group_by(celltype) |>
+  dplyr::mutate(prop = n / sum(n),
+                pct = round(prop * 100, 1),
+                label = paste0(pct, "% (", n, ")")) |>
+  dplyr::ungroup()
+
+categories <- sort(unique(patient_counts$celltype_category))
+
+make_patient_barplot <- function(df_ct, ct_name) {
+  ggplot(df_ct, aes(x = patient_id, y = pct, fill = patient_id)) +
+    geom_col(show.legend = FALSE) +
+    geom_text(aes(label = label), vjust = -0.3, size = 3) +
+    labs(x = "Patient", y = "% of cell type's total cells",
+         title = ct_name) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+```
+
+## 4.1 B Cell/Plasma Cell
+
+```{r patient-bcell, fig.width=10, fig.height=5, results='asis'}
+df_bcell <- patient_counts |> dplyr::filter(celltype_category == "B Cell/Plasma Cell")
+celltypes_bcell <- sort(unique(df_bcell$celltype))
+
+for (ct in celltypes_bcell) {
+  cat("\n\n### ", ct, "\n\n")
+  p <- make_patient_barplot(df_bcell |> dplyr::filter(celltype == ct), ct)
+  print(p)
+}
+```
+
+## 4.2 T Cell
+
+```{r patient-tcell, fig.width=10, fig.height=5, results='asis'}
+df_tcell <- patient_counts |> dplyr::filter(celltype_category == "T Cell")
+celltypes_tcell <- sort(unique(df_tcell$celltype))
+
+for (ct in celltypes_tcell) {
+  cat("\n\n### ", ct, "\n\n")
+  p <- make_patient_barplot(df_tcell |> dplyr::filter(celltype == ct), ct)
+  print(p)
+}
+```
+
+## 4.3 Myeloid
+
+```{r patient-myeloid, fig.width=10, fig.height=5, results='asis'}
+df_myeloid <- patient_counts |> dplyr::filter(celltype_category == "Myeloid")
+celltypes_myeloid <- sort(unique(df_myeloid$celltype))
+
+for (ct in celltypes_myeloid) {
+  cat("\n\n### ", ct, "\n\n")
+  p <- make_patient_barplot(df_myeloid |> dplyr::filter(celltype == ct), ct)
+  print(p)
+}
+```
+
+## 4.4 Epithelial/Stroma
+
+```{r patient-epi-stroma, fig.width=10, fig.height=5, results='asis'}
+df_epi <- patient_counts |> dplyr::filter(celltype_category == "Epithelial/Stroma")
+celltypes_epi <- sort(unique(df_epi$celltype))
+
+for (ct in celltypes_epi) {
+  cat("\n\n### ", ct, "\n\n")
+  p <- make_patient_barplot(df_epi |> dplyr::filter(celltype == ct), ct)
+  print(p)
+}
+```
+
+## 4.5 Other
+
+```{r patient-other, fig.width=10, fig.height=5, results='asis'}
+df_other <- patient_counts |> dplyr::filter(celltype_category == "Other")
+celltypes_other <- sort(unique(df_other$celltype))
+
+for (ct in celltypes_other) {
+  cat("\n\n### ", ct, "\n\n")
+  p <- make_patient_barplot(df_other |> dplyr::filter(celltype == ct), ct)
+  print(p)
+}
+```
+
+## 4.6 High-Concentration Annotations (Patient)
+
+Flags every annotation/patient pair where a single patient accounts
+for more than 25% of that annotation's cells — pulled directly from
+the bar charts above. Unlike the top-patient-only summary later in
+this document, this can list more than one patient per annotation if
+several each cross the 25% threshold.
+
+```{r high-patient-concentration-flags, results='asis'}
+patient_flags <- plot_df |>
+  dplyr::count(celltype, patient_id, name = "n") |>
+  dplyr::group_by(celltype) |>
+  dplyr::mutate(pct = round(n / sum(n) * 100, 1)) |>
+  dplyr::ungroup() |>
+  dplyr::filter(pct > 25) |>
+  dplyr::arrange(dplyr::desc(pct)) |>
+  dplyr::select(celltype, patient_id, pct)
+
+print_kable(patient_flags, col.names = c("Annotation", "Patient", "% of Cells"), digits = 1)
+```
+
+# 5. Cell Type Composition by ROI
+
+Same format at the ROI level — one bar chart per cell type, printed
+separately, with one bar per ROI labeled with % and cell count.
+
+```{r prep-roi-counts}
+roi_counts <- plot_df |>
+  dplyr::count(sample_id, celltype, celltype_category, name = "n") |>
+  dplyr::group_by(celltype) |>
+  dplyr::mutate(prop = n / sum(n),
+                pct = round(prop * 100, 1),
+                label = paste0(pct, "% (", n, ")")) |>
+  dplyr::ungroup()
+
+make_roi_barplot <- function(df_ct, ct_name) {
+  ggplot(df_ct, aes(x = sample_id, y = pct, fill = sample_id)) +
+    geom_col(show.legend = FALSE) +
+    geom_text(aes(label = label), vjust = -0.3, size = 2.5) +
+    labs(x = "ROI", y = "% of cell type's total cells",
+         title = ct_name) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 7))
+}
+```
+
+## 5.1 B Cell/Plasma Cell
+
+```{r roi-bcell, fig.width=12, fig.height=5, results='asis'}
+df_bcell_roi <- roi_counts |> dplyr::filter(celltype_category == "B Cell/Plasma Cell")
+celltypes_bcell_roi <- sort(unique(df_bcell_roi$celltype))
+
+for (ct in celltypes_bcell_roi) {
+  cat("\n\n### ", ct, "\n\n")
+  p <- make_roi_barplot(df_bcell_roi |> dplyr::filter(celltype == ct), ct)
+  print(p)
+}
+```
+
+## 5.2 T Cell
+
+```{r roi-tcell, fig.width=12, fig.height=5, results='asis'}
+df_tcell_roi <- roi_counts |> dplyr::filter(celltype_category == "T Cell")
+celltypes_tcell_roi <- sort(unique(df_tcell_roi$celltype))
+
+for (ct in celltypes_tcell_roi) {
+  cat("\n\n### ", ct, "\n\n")
+  p <- make_roi_barplot(df_tcell_roi |> dplyr::filter(celltype == ct), ct)
+  print(p)
+}
+```
+
+## 5.3 Myeloid
+
+```{r roi-myeloid, fig.width=12, fig.height=5, results='asis'}
+df_myeloid_roi <- roi_counts |> dplyr::filter(celltype_category == "Myeloid")
+celltypes_myeloid_roi <- sort(unique(df_myeloid_roi$celltype))
+
+for (ct in celltypes_myeloid_roi) {
+  cat("\n\n### ", ct, "\n\n")
+  p <- make_roi_barplot(df_myeloid_roi |> dplyr::filter(celltype == ct), ct)
+  print(p)
+}
+```
+
+## 5.4 Epithelial/Stroma
+
+```{r roi-epi-stroma, fig.width=12, fig.height=5, results='asis'}
+df_epi_roi <- roi_counts |> dplyr::filter(celltype_category == "Epithelial/Stroma")
+celltypes_epi_roi <- sort(unique(df_epi_roi$celltype))
+
+for (ct in celltypes_epi_roi) {
+  cat("\n\n### ", ct, "\n\n")
+  p <- make_roi_barplot(df_epi_roi |> dplyr::filter(celltype == ct), ct)
+  print(p)
+}
+```
+
+## 5.5 Other
+
+```{r roi-other, fig.width=12, fig.height=5, results='asis'}
+df_other_roi <- roi_counts |> dplyr::filter(celltype_category == "Other")
+celltypes_other_roi <- sort(unique(df_other_roi$celltype))
+
+for (ct in celltypes_other_roi) {
+  cat("\n\n### ", ct, "\n\n")
+  p <- make_roi_barplot(df_other_roi |> dplyr::filter(celltype == ct), ct)
+  print(p)
+}
+```
+
+## 5.6 High-Concentration Annotations (ROI)
+
+Flags every annotation/ROI pair where a single ROI accounts for more
+than 7% of that annotation's cells — pulled directly from the bar
+charts in Section 5. Since there are far more ROIs than patients,
+7% is a lower bar than the 25% patient threshold, but still flags
+ROIs punching above an even distribution.
+
+```{r high-roi-concentration-flags, results='asis'}
+roi_flags <- plot_df |>
+  dplyr::count(celltype, sample_id, patient_id, name = "n") |>
+  dplyr::group_by(celltype) |>
+  dplyr::mutate(pct = round(n / sum(n) * 100, 1)) |>
+  dplyr::ungroup() |>
+  dplyr::filter(pct > 7) |>
+  dplyr::arrange(dplyr::desc(pct)) |>
+  dplyr::select(celltype, sample_id, patient_id, pct)
+
+print_kable(roi_flags, col.names = c("Annotation", "ROI", "Patient", "% of Cells"), digits = 1)
+```
+
+## 5.7 ROIs Driving High-Concentration Annotations (Grouped by Annotation)
+
+Same flagged ROI/annotation pairs as above, but grouped by annotation
+so it's easy to see, for a given cell type, which ROI(s) are
+inflating its composition.
+
+```{r high-roi-concentration-grouped, results='asis'}
+flagged_celltypes <- roi_flags |>
+  dplyr::pull(celltype) |>
+  unique() |>
+  sort()
+
+for (ct in flagged_celltypes) {
+
+  cat("\n\n### ", ct, "\n\n")
+
+  df_ct <- roi_flags |>
+    dplyr::filter(celltype == ct) |>
+    dplyr::arrange(dplyr::desc(pct)) |>
+    dplyr::select(sample_id, patient_id, pct)
+
+  print(print_kable(df_ct, col.names = c("ROI", "Patient", "% of Cells"), digits = 1, row.names = FALSE))
+}
+```
+
+# 6. Concentration Summary Table
+
+Flags cell types where a single patient accounts for a large share of
+cells — same logic applied to the P10 Proliferating Myeloid check.
+
+```{r concentration-flags, results='asis'}
+patient_conc <- plot_df |>
+  dplyr::count(celltype, patient_id) |>
+  dplyr::group_by(celltype) |>
+  dplyr::mutate(pct = n / sum(n) * 100) |>
+  dplyr::slice_max(pct, n = 1) |>
+  dplyr::ungroup() |>
+  dplyr::rename(top_patient = patient_id, n_top_patient = n, pct_top_patient = pct) |>
+  dplyr::mutate(flag = dplyr::case_when(
+    pct_top_patient > 50 ~ "HIGH RISK: single-patient dominated",
+    pct_top_patient > 30 ~ "moderate patient skew",
+    TRUE ~ "ok"
+  )) |>
+  dplyr::arrange(desc(pct_top_patient)) |>
+  dplyr::select(celltype, top_patient, pct_top_patient, flag)
+
+print_kable(patient_conc, digits = 1)
+```
+
+# 7. Session Info
+
+```{r session-info}
+sessionInfo()
+```

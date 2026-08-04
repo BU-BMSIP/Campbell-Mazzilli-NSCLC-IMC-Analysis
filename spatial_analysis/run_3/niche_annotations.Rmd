@@ -1,0 +1,601 @@
+---
+title: "Niche Annotation: Composition Summary for Significant Niches"
+author: "Tazein Shah"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    code_folding: show
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 8)
+
+suppressPackageStartupMessages({
+  library(SpatialExperiment)
+  library(tidyverse)
+  library(pheatmap)
+  library(janitor)
+  library(kableExtra)
+})
+```
+---
+
+## 1. Paths
+
+```{r paths}
+analysis_path      <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/spatial_analysis/run_3"
+spatial_graph_path <- file.path(analysis_path, "spe_spatial_graph_r3.rds")
+niche_path         <- file.path(analysis_path, "niche_k50_thresh20")
+
+niche_spe_path      <- file.path(niche_path, "spe_niche.rds")
+sccomp_nstatus_path <- file.path(niche_path, "sccomp_nstatus.rds")
+sccomp_stage_path   <- file.path(niche_path, "sccomp_stage.rds")
+
+composition_out_path   <- file.path(niche_path, "niche_avg_composition.csv")
+top_celltypes_out_path <- file.path(niche_path, "niche_top_celltypes.csv")
+```
+
+---
+
+## 2. Load objects
+
+```{r load}
+spe <- readRDS(niche_spe_path)
+sccomp_niche_nstatus <- readRDS(sccomp_nstatus_path)
+sccomp_niche_stage   <- readRDS(sccomp_stage_path)
+```
+
+---
+
+## 2b. Diagnose cell type naming
+
+Checks whether `spe$aggregatedNeighbors` column names match
+`levels(spe$final_celltype)` exactly -- confirmed clean at this stage
+(`identical()` returns `TRUE`). The mangling actually originates one
+step later: `spe$aggregatedNeighbors` is an S4 `DFrame`
+(`S4Vectors`), and its `as.data.frame()` S4 method silently ignores
+`check.names = FALSE`, so names got mangled on conversion in Section 4
+despite that argument being set. Fixed there by routing the conversion
+through `as.matrix()` first. `column_to_rownames()` remains a separate,
+secondary source of mangling further downstream (fixed in Sections 4b
+and 5 by building matrices manually with `as.matrix()` instead).
+
+```{r diagnose-names}
+raw_names   <- colnames(spe$aggregatedNeighbors)
+clean_names <- levels(spe$final_celltype)
+
+cat("Raw column names (n =", length(raw_names), "):\n")
+print(raw_names)
+
+cat("\nClean cell type levels (n =", length(clean_names), "):\n")
+print(clean_names)
+
+# Direct comparison -- raw names should already match clean levels
+# exactly (no make.names() mangling at this stage).
+cat("\nRaw names identical to clean levels (same set, same order):",
+    identical(raw_names, clean_names), "\n")
+
+setdiff_raw_clean <- setdiff(raw_names, clean_names)
+setdiff_clean_raw <- setdiff(clean_names, raw_names)
+
+if (length(setdiff_raw_clean) == 0 && length(setdiff_clean_raw) == 0) {
+  cat("Confirmed: no mismatch. spe$aggregatedNeighbors column names are clean.\n")
+} else {
+  cat("Mismatch found:\n")
+  cat("  In raw but not in clean levels:\n"); print(setdiff_raw_clean)
+  cat("  In clean levels but not in raw:\n"); print(setdiff_clean_raw)
+}
+```
+
+---
+
+## 3. Identify significant niches
+
+Significant niches (FDR < 0.05) from each model, unioned.
+
+```{r significant-niches}
+sig_nstatus <- sccomp_niche_nstatus |>
+  filter(factor == "N_status", c_FDR < 0.05) |>
+  pull(Niche) |>
+  unique()
+
+sig_stage <- sccomp_niche_stage |>
+  filter(factor == "Stage", c_FDR < 0.05) |>
+  pull(Niche) |>
+  unique()
+
+sig_niches <- union(sig_nstatus, sig_stage)
+
+cat("Significant niches (N-status):", length(sig_nstatus), "\n")
+cat("Significant niches (Stage):", length(sig_stage), "\n")
+cat("Significant niches (union):", length(sig_niches), "\n")
+print(sort(as.numeric(as.character(sig_niches))))
+```
+
+---
+
+## 3a. Significant niches: effect size and FDR
+
+Table of every niche x contrast pair that cleared FDR < 0.05 in either
+model, showing which factor (N-status vs. Stage) each significant
+niche was found under, sorted by FDR, with MCMC convergence
+diagnostics (`c_rhat`, `c_ess_bulk`, `c_ess_tail`) and `c_pH0`
+included for reference.
+
+```{r significant-niches-table}
+sig_nstatus_table <- sccomp_niche_nstatus |>
+  filter(factor == "N_status", c_FDR < 0.05) |>
+  select(Niche, factor, parameter, c_effect, c_FDR, c_pH0, c_rhat, c_ess_bulk, c_ess_tail)
+
+sig_stage_table <- sccomp_niche_stage |>
+  filter(factor == "Stage", c_FDR < 0.05) |>
+  select(Niche, factor, parameter, c_effect, c_FDR, c_pH0, c_rhat, c_ess_bulk, c_ess_tail)
+
+sig_niches_table <- bind_rows(sig_nstatus_table, sig_stage_table) |>
+  arrange(c_FDR)
+
+sig_niches_table |>
+  as.data.frame() |>
+  knitr::kable(digits = 3, caption = "Significant niches: effect size and FDR (N-status and Stage models)")
+```
+
+---
+
+## 3b. Patient-dominance check across flagged annotations
+
+Several annotations show a single patient accounting for a
+disproportionate share of that cluster cohort-wide, per the diagnostic
+review table:
+
+| Annotation                                             | Dominant Patient | % of Cells |
+|---------------------------------------------------------|------------------|-----------:|
+| Monocyte (PD1+)                                          | Patient10        | 48.4       |
+| Macrophage, Proliferating (MKI67+)                       | Patient10        | 44.7       |
+| Tumor Epithelial (Neuroendocrine)                         | Patient17        | 39.6       |
+| B Cell (CD19+)                                            | Patient20_519    | 34.7       |
+| Plasma Cell, TIM3+ (CD138+TIM3+CD45RO-)                   | Patient10        | 32.1       |
+| DC/mregDC (Epi Adj)                                       | Patient10        | 28.9       |
+
+Since all of these feed directly into niche composition, this reports,
+per niche, what fraction of each flagged cluster's cells come from its
+dominant patient -- joined onto the significant-niches table below
+(3c) so it's visible alongside FDR/effect size when writing annotation
+comments.
+
+```{r patient-dominance-check}
+flagged_annotations <- tribble(
+  ~celltype_label,                                           ~dominant_patient,
+  "Monocyte (PD1+)",                                         "Patient10",
+  "Macrophage, Proliferating (MKI67+)",                      "Patient10",
+  "Tumor Epithelial (Neuroendocrine)",                        "Patient17",
+  "B Cell (CD19+)",                                           "Patient20_519",
+  "Plasma Cell, TIM3+ (CD138+TIM3+CD45RO-)",                  "Patient10",
+  "DC/mregDC (Epi Adj)",                                      "Patient10"
+)
+
+niche_patient_dominance <- purrr::map2_dfr(
+  flagged_annotations$celltype_label,
+  flagged_annotations$dominant_patient,
+  function(label, dom_patient) {
+    idx <- which(spe$final_celltype == label)
+
+    if (length(idx) == 0) {
+      warning("No cells found for annotation: ", label)
+      return(tibble())
+    }
+
+    data.frame(
+      Niche = spe$Niche[idx],
+      Patient = spe$patient_id[idx]
+    ) |>
+      group_by(Niche) |>
+      summarise(
+        n_cells = n(),
+        pct_dominant_patient = mean(Patient == dom_patient) * 100,
+        .groups = "drop"
+      ) |>
+      mutate(celltype_label = label, dominant_patient = dom_patient)
+  }
+)
+```
+
+---
+
+## 3c. Significant niches: FDR with patient-dominance flag
+
+Lighter companion to 3a/3b -- just Niche and FDR alongside the
+patient-dominance summary. Note the percentage here differs from 3b:
+`max_patient_share` is the dominant patient's share of *all* cells in
+the niche (not just cells of the flagged annotation), so it reflects
+how much of the niche's total composition that single patient/
+annotation combination actually represents.
+
+```{r significant-niches-table-with-dominance}
+# Full long-format diagnostic (within-annotation %, as computed in 3b),
+# saved for reference/drill-down
+dominance_out_path <- file.path(niche_path, "niche_patient_dominance_full.csv")
+write_csv(niche_patient_dominance, dominance_out_path)
+cat("Saved full patient-dominance diagnostic to:", dominance_out_path, "\n")
+
+# Total cells per niche -- denominator for the "% of all niche cells" calc
+niche_total_cells <- data.frame(Niche = spe$Niche) |>
+  group_by(Niche) |>
+  summarise(n_total_niche_cells = n(), .groups = "drop") |>
+  mutate(Niche = as.character(Niche))
+
+# Recompute dominance as % of all niche cells, then collapse to the
+# annotation with the highest share per niche
+niche_max_dominance <- niche_patient_dominance |>
+  mutate(Niche = as.character(Niche)) |>
+  left_join(niche_total_cells, by = "Niche") |>
+  mutate(pct_of_niche = n_cells / n_total_niche_cells * 100) |>
+  group_by(Niche) |>
+  slice_max(pct_of_niche, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  transmute(
+    Niche,
+    n_cells,
+    n_total_niche_cells,
+    max_share_annotation = celltype_label,
+    max_share_patient = dominant_patient,
+    max_patient_share = round(pct_of_niche, 1)
+  )
+
+# Niche + FDR only (not the full 3a table) -- lowest FDR per niche across
+# both models, since a niche can appear under both N_status and Stage
+niche_min_fdr <- sig_niches_table |>
+  mutate(Niche = as.character(Niche)) |>
+  group_by(Niche) |>
+  slice_min(c_FDR, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  select(Niche, c_FDR)
+
+niche_dominance_summary <- niche_min_fdr |>
+  left_join(niche_max_dominance, by = "Niche") |>
+  mutate(
+    n_cells = replace_na(n_cells, 0),
+    n_total_niche_cells = replace_na(n_total_niche_cells, 0),
+    max_share_annotation = replace_na(max_share_annotation, "none"),
+    max_share_patient = replace_na(max_share_patient, "-"),
+    max_patient_share = replace_na(max_patient_share, 0)
+  ) |>
+  arrange(c_FDR)
+
+niche_dominance_summary |>
+  as.data.frame() |>
+  knitr::kable(
+    digits = 3,
+    caption = "Significant niches: FDR with maximum single-patient share of niche cells among flagged annotations",
+    booktabs = knitr::is_latex_output(),
+    col.names = c("Niche", "FDR", "n cells", "n total\nniche cells",
+                  "Max-share annotation", "Max-share patient", "Max patient\nshare (%)")
+  ) |>
+  {\(kbl) if (knitr::is_latex_output()) {
+    kbl |>
+      kableExtra::kable_styling(
+        latex_options = c("hold_position", "repeat_header"),
+        font_size = 9
+      ) |>
+      kableExtra::column_spec(1, width = "1.2cm") |>
+      kableExtra::column_spec(2, width = "1.5cm") |>
+      kableExtra::column_spec(3, width = "1.5cm") |>
+      kableExtra::column_spec(4, width = "2cm") |>
+      kableExtra::column_spec(5, width = "4.5cm") |>
+      kableExtra::column_spec(6, width = "3cm") |>
+      kableExtra::column_spec(7, width = "2cm")
+  } else {
+    kbl
+  }}()
+```
+
+---
+
+## 4. Average neighborhood composition per niche
+
+All 50 niches, saved for reference.
+
+```{r composition}
+# spe$aggregatedNeighbors is an S4 DFrame (S4Vectors) -- its as.data.frame
+# S4 method does not honor check.names = FALSE the way base
+# as.data.frame.matrix does, so names were silently getting mangled here
+# even with check.names = FALSE set. Routing through as.matrix() first
+# strips the S4 class before any renaming logic can run, and the explicit
+# colnames() reassignment guarantees the clean names survive regardless.
+raw_neighbors <- spe$aggregatedNeighbors
+neighbor_mat  <- as.data.frame(as.matrix(raw_neighbors))
+colnames(neighbor_mat) <- colnames(raw_neighbors)
+neighbor_mat$Niche <- spe$Niche
+
+niche_composition <- neighbor_mat |>
+  group_by(Niche) |>
+  summarise(across(everything(), mean), .groups = "drop")
+
+# Sanity check: confirm no mangling crept in before this gets used
+# downstream in 4b, 5, and 6.
+mangled_check <- grepl("\\.", setdiff(colnames(niche_composition), "Niche"))
+cat("niche_composition mangled column check -- any TRUE below means trouble:\n")
+print(any(mangled_check))
+if (any(mangled_check)) {
+  cat("Mangled columns:\n")
+  print(colnames(niche_composition)[-1][mangled_check])
+} else {
+  cat("niche_composition column names look clean.\n")
+}
+
+write_csv(niche_composition, composition_out_path)
+cat("Saved full niche composition table to:", composition_out_path, "\n")
+```
+
+---
+
+## 4b. Detailed composition dot plot (all niches)
+
+Dot size and color both encode mean fraction; niches and cell types
+are hierarchically clustered so similar composition profiles sit next
+to each other. Long annotation names are wrapped onto multiple lines
+rather than truncated, and figure height scales with the number of
+cell types shown so labels get fixed vertical spacing instead of
+compressing.
+
+```{r composition-dotplot-setup}
+niche_mat_full <- niche_composition |> select(-Niche) |> as.matrix()
+rownames(niche_mat_full) <- niche_composition$Niche
+
+niche_order    <- rownames(niche_mat_full)[hclust(dist(niche_mat_full))$order]
+celltype_order <- colnames(niche_mat_full)[hclust(dist(t(niche_mat_full)))$order]
+
+niche_long <- niche_composition |>
+  pivot_longer(-Niche, names_to = "cell_type", values_to = "mean_fraction") |>
+  mutate(
+    Niche = factor(Niche, levels = niche_order),
+    # wrap long cell type names onto multiple lines instead of letting
+    # them get clipped or run off the plot area
+    cell_type = factor(str_wrap(cell_type, width = 30),
+                        levels = str_wrap(celltype_order, width = 30))
+  )
+
+# Fixed height per cell type row instead of a flat fig.height -- this is
+# the same fix applied to the heatmap in Section 5: a per-row constant
+# guarantees labels get consistent room no matter how many rows there are.
+n_celltypes_4b <- n_distinct(niche_long$cell_type)
+dotplot_height <- max(10, n_celltypes_4b * 0.35)
+cat("Cell types:", n_celltypes_4b, "-> computed fig height:", round(dotplot_height, 1), "in\n")
+```
+
+```{r composition-dotplot, fig.width=14, fig.height=dotplot_height}
+ggplot(niche_long, aes(x = Niche, y = cell_type, size = mean_fraction, color = mean_fraction)) +
+  geom_point() +
+  scale_color_viridis_c() +
+  scale_size_continuous(range = c(0.5, 6)) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 7),
+    axis.text.y = element_text(size = 8),
+    plot.margin = margin(t = 10, r = 20, b = 10, l = 10)
+  ) +
+  labs(x = "Niche", y = "Cell type", color = "Mean fraction", size = "Mean fraction",
+       title = "Average neighborhood composition per niche (all 50 niches)")
+```
+
+---
+
+## 5. Heatmap (significant niches only)
+
+Displayed inline only -- not saved to disk.
+
+```{r heatmap}
+suppressPackageStartupMessages({
+  library(RColorBrewer)
+})
+
+niche_composition_sig <- niche_composition |>
+  filter(Niche %in% sig_niches)
+
+# Drop cell types with near-zero variance across these niches. Column
+# z-scoring (scale = "column") divides by each column's SD -- a flat/near-zero
+# column has a tiny SD, so a single stray value blows up into an extreme
+# z-score. That's what was producing the noisy, extreme-red heatmap.
+range_cutoff_sig <- 0.05
+
+celltype_range_sig <- niche_composition_sig |>
+  select(-Niche) |>
+  summarise(across(everything(), ~ max(.x) - min(.x))) |>
+  pivot_longer(everything(), names_to = "cell_type", values_to = "range")
+
+keep_celltypes_sig <- celltype_range_sig |>
+  filter(range > range_cutoff_sig) |>
+  pull(cell_type)
+
+cat("Keeping", length(keep_celltypes_sig), "of", ncol(niche_composition_sig) - 1,
+    "cell types (range >", range_cutoff_sig, ")\n")
+
+niche_composition_sig_filtered <- niche_composition_sig |>
+  select(Niche, all_of(keep_celltypes_sig))
+
+niche_mat_sig <- niche_composition_sig_filtered |> select(-Niche) |> as.matrix()
+rownames(niche_mat_sig) <- niche_composition_sig_filtered$Niche
+
+# Pre-scale (column z-score) ourselves so we can force symmetric, well-
+# contrasted breaks around zero rather than relying on pheatmap's default
+# range, which produced the washed-out/inconsistent coloring above.
+niche_mat_scaled <- scale(niche_mat_sig)
+max_abs <- max(abs(niche_mat_scaled), na.rm = TRUE)
+breaks <- seq(-max_abs, max_abs, length.out = 101)
+heat_colors <- colorRampPalette(rev(brewer.pal(11, "RdBu")))(100)
+
+# Fixed cell size instead of guessing overall device dimensions from
+# string length -- this guarantees every row/column gets the same
+# amount of room no matter how many niches or cell types are shown,
+# which is what actually prevents condensed/overlapping labels.
+cell_w <- 14   # points per column (cell type)
+cell_h <- 14   # points per row (niche)
+
+# silent = TRUE builds the heatmap grob without drawing it anywhere yet,
+# so it can be drawn inline in the next chunk.
+ph <- pheatmap(
+  niche_mat_scaled,
+  scale = "none",
+  color = heat_colors,
+  breaks = breaks,
+  fontsize_row = 9,
+  fontsize_col = 9,
+  cellwidth = cell_w,
+  cellheight = cell_h,
+  labels_col = colnames(niche_mat_scaled),
+  border_color = NA,
+  angle_col = 45,
+  main = "Average neighborhood composition: significant niches only",
+  silent = TRUE
+)
+
+cat("Heatmap grid size:", nrow(niche_mat_scaled), "rows x", ncol(niche_mat_scaled), "cols\n")
+```
+
+```{r heatmap-inline, fig.width=12, fig.height=10}
+# Draw directly from the grob rather than relying on print.pheatmap()
+# dispatch, which isn't guaranteed to call grid.draw() consistently
+# across pheatmap versions -- this is what actually renders the plot.
+grid::grid.newpage()
+grid::grid.draw(ph$gtable)
+grid::grid.text("Z-score", x = 0.98, y = 0.5, rot = 270,
+                 gp = grid::gpar(fontsize = 10))
+```
+
+---
+
+## 6. Top dominant cell types per significant niche
+
+For writing the usual `#Niche N: cell_type1, cell_type2: reasoning`
+annotation comments. Long-format table (`niche_top_celltypes`) is still
+saved to CSV for reference. The table below collapses each niche to a
+single row with its top cell types formatted as `Name (XX%)`; full
+names are kept intact (no truncation), with wrapping handled via
+`kableExtra` for PDF output.
+
+```{r top-celltypes}
+top_n <- 5
+
+niche_top_celltypes <- niche_composition_sig |>
+  pivot_longer(-Niche, names_to = "cell_type", values_to = "mean_fraction") |>
+  group_by(Niche) |>
+  slice_max(mean_fraction, n = top_n) |>
+  arrange(Niche, desc(mean_fraction))
+
+# Semicolon separator instead of comma, since annotation names themselves
+# contain commas (e.g. "Plasma Cell, TIM3+ (...)"), which made the
+# collapsed string ambiguous with a comma separator.
+niche_top_celltypes_wide <- niche_top_celltypes |>
+  mutate(label = sprintf("%s (%.0f%%)", cell_type, mean_fraction * 100)) |>
+  group_by(Niche) |>
+  summarise(top_celltypes = paste(label, collapse = "; "), .groups = "drop") |>
+  arrange(as.numeric(as.character(Niche)))
+
+# Saving the collapsed/wide version instead of the long-format table --
+# this is the one with full, untruncated annotation names per niche,
+# which is what's actually useful to read back later. The long-format
+# table (niche_top_celltypes) is kept in-memory for the kable below but
+# no longer written to CSV.
+write_csv(niche_top_celltypes_wide, top_celltypes_out_path)
+cat("Saved top-", top_n, " cell types per significant niche to:", top_celltypes_out_path, "\n")
+
+# kable alone doesn't wrap long strings in PDF output -- kableExtra's
+# column_spec with an explicit width lets LaTeX wrap the text instead
+# of truncating or overflowing the page. HTML wraps naturally, so the
+# plain kable() is used there instead.
+niche_kable <- niche_top_celltypes_wide |>
+  as.data.frame() |>
+  knitr::kable(caption = "Top dominant cell types per significant niche (collapsed for annotation)",
+               booktabs = knitr::is_latex_output())
+
+if (knitr::is_latex_output()) {
+  niche_kable |>
+    kableExtra::kable_styling(latex_options = c("hold_position"), font_size = 9) |>
+    kableExtra::column_spec(1, width = "2cm") |>
+    kableExtra::column_spec(2, width = "16cm")
+} else {
+  niche_kable
+}
+```
+
+---
+
+## 7. Auto-drafted annotation comments
+
+Assembles a `#Niche N: ...` comment per significant niche in the
+convention used for cluster annotation, combining:
+
+- **Composition** (Section 6) -- the dominant cell type and its %
+- **Statistical context** (Section 3a) -- which factor(s) flagged it,
+  effect direction, and FDR
+- **Patient-dominance flag** (Section 3c) -- whether the dominant
+  cell type is one of the six flagged annotations, and how much of
+  the niche's total cells that single patient represents
+
+These are drafts, not final annotations -- review each one, especially
+any flagged for patient dominance, before committing it to the
+pipeline.
+
+```{r auto-annotation-drafts}
+# Effect direction per niche: take the same lowest-FDR row used in 3c
+# for consistency, and pull its factor + effect sign.
+niche_effect_direction <- sig_niches_table |>
+  mutate(Niche = as.character(Niche)) |>
+  group_by(Niche) |>
+  slice_min(c_FDR, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  transmute(
+    Niche,
+    factor,
+    c_FDR,
+    direction = ifelse(c_effect > 0, "enriched", "depleted")
+  )
+
+# Top cell type + % per niche, from the same data Section 6 uses
+niche_top1 <- niche_composition_sig |>
+  pivot_longer(-Niche, names_to = "cell_type", values_to = "mean_fraction") |>
+  group_by(Niche) |>
+  slice_max(mean_fraction, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  transmute(
+    Niche = as.character(Niche),
+    top_celltype = cell_type,
+    top_pct = round(mean_fraction * 100)
+  )
+
+# Assemble the draft comment per niche
+niche_annotation_drafts <- niche_effect_direction |>
+  left_join(niche_top1, by = "Niche") |>
+  left_join(
+    niche_dominance_summary |> select(Niche, max_share_annotation, max_share_patient, max_patient_share),
+    by = "Niche"
+  ) |>
+  mutate(
+    is_flagged = !is.na(max_share_annotation) & max_share_annotation == top_celltype,
+    draft_comment = case_when(
+      is_flagged ~ sprintf(
+        "#Niche %s: %s (%d%%): %s in %s (FDR = %.3f) -- CAUTION: dominant cell type is patient-dominance flagged, %s accounts for %.1f%% of this niche's total cells. Review before finalizing.",
+        Niche, top_celltype, top_pct, direction, factor, c_FDR, max_share_patient, max_patient_share
+      ),
+      TRUE ~ sprintf(
+        "#Niche %s: %s (%d%%): %s in %s (FDR = %.3f)",
+        Niche, top_celltype, top_pct, direction, factor, c_FDR
+      )
+    )
+  ) |>
+  arrange(as.numeric(Niche))
+
+annotation_drafts_out_path <- file.path(niche_path, "niche_annotation_drafts.txt")
+writeLines(niche_annotation_drafts$draft_comment, annotation_drafts_out_path)
+cat("Saved draft annotation comments to:", annotation_drafts_out_path, "\n\n")
+
+cat(paste(niche_annotation_drafts$draft_comment, collapse = "\n\n"))
+```
