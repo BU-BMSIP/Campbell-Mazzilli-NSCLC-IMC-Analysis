@@ -1,0 +1,100 @@
+---
+title: "Poster Figures"
+output:
+  html_document:
+    theme: cosmo
+    code_folding: show
+    toc: true
+    toc_float: true
+  pdf_document: default
+editor_options:
+  markdown:
+    wrap: 72
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(tidyverse)
+```
+## Patient metadata, ROI counts, and total cells
+```{r patient-data}
+# Combined patient metadata + ROI/cell counts + disease_state grouping
+patient_data <- tibble(
+  patient = c("Patient10","Patient11","Patient12","Patient13","Patient14",
+              "Patient15","Patient16","Patient17","Patient18","Patient19",
+              "Patient20_425","Patient20_519"),
+  stage = c("Benign","IA3","IIB","IIA","IA2","IIB","IA2","IA2","IA2","IB",
+            "IA3","IA3"),
+  disease_state = c("Benign","Lower","Higher","Higher","Lower","Higher",
+                     "Lower","Lower","Lower","Higher","Lower","Lower"),
+  nsclc_type = c("Hamartoma","Adenocarcinoma","LCNEC + Adenocarcinoma",
+                 "Adenocarcinoma","Adenocarcinoma","Adenocarcinoma",
+                 "Adenocarcinoma","Carcinoma/Neuroendocrine","Adenocarcinoma",
+                 "Adenocarcinoma","Adenocarcinoma","Adenocarcinoma"),
+  rois = c(8,4,4,4,4,4,4,2,5,4,5,6),
+  total_cells = c(29495,19894,25208,26273,22630,20921,21014,14018,35358,
+                  17187,20457,35111)
+)
+
+# --- Custom patient ordering: Lower group (left) -> Higher group (right) ---
+# Within each group, ordered by stage severity (Benign < IA2 < IA3 < IB < IIA < IIB)
+patient_order <- c(
+  "Patient10",       # Benign
+  "Patient14","Patient16","Patient17","Patient18",  # IA2, Lower
+  "Patient11","Patient20_425","Patient20_519",      # IA3, Lower
+  "Patient19",       # IB, Higher
+  "Patient13",       # IIA, Higher
+  "Patient12","Patient15"  # IIB, Higher
+)
+
+patient_data <- patient_data %>%
+  mutate(patient = factor(patient, levels = patient_order)) %>%
+  arrange(patient)
+
+# Stage severity order for consistent color mapping
+stage_levels <- c("Benign","IA2","IA3","IB","IIA","IIB")
+patient_data <- patient_data %>%
+  mutate(stage = factor(stage, levels = stage_levels))
+
+knitr::kable(patient_data, caption = "Patient stage, disease state group, NSCLC type, ROI count, and total cell count")
+```
+## Combined plot: ROIs and total cells per patient, by stage
+```{r combined-plot, fig.width=10, fig.height=6}
+# Cool tones for Lower/Benign, red tones for Higher
+stage_colors <- c(
+  Benign = "#999999",  # grey
+  IA2     = "#56B4E9",  # light blue (Lower)
+  IA3     = "#0072B2",  # darker blue (Lower)
+  IB      = "#F4A582",  # light red/salmon (Higher)
+  IIA     = "#D6604D",  # medium red (Higher)
+  IIB     = "#B2182B"   # dark red (Higher)
+)
+
+# x-axis position of the Lower/Higher divider
+# (8 patients in the Lower group, so the line sits between positions 8 and 9)
+divider_pos <- sum(patient_data$disease_state %in% c("Benign","Lower")) + 0.5
+
+p <- ggplot(patient_data, aes(x = patient, y = total_cells, fill = stage)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = paste0("ROIs: ", rois)),
+            vjust = -0.5, size = 3.2, color = "grey30") +
+  geom_vline(xintercept = divider_pos, linetype = "dashed",
+             color = "grey40", linewidth = 0.6) +
+  scale_fill_manual(values = stage_colors, name = "Stage") +
+  scale_y_continuous(labels = scales::comma,
+                      expand = expansion(mult = c(0, 0.12))) +
+  labs(x = "Patient", y = "Total cells",
+       title = "ROIs and Total Cells per Patient, by Stage",
+       subtitle = "Lower disease state (left) vs. Higher disease state (right)") +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    legend.position = "right"
+  )
+print(p)
+
+# Save outputs
+ggsave("roi_cells_by_stage.png", plot = p, width = 10, height = 6, dpi = 300)
+ggsave("roi_cells_by_stage.pdf", plot = p, width = 10, height = 6)
+```

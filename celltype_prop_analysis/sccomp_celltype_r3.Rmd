@@ -51,10 +51,10 @@ library(kableExtra)
 ```{r paths}
 analysis_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis"
 
-final_celltype_path <- file.path(analysis_path, "final_cell_annotation", "r2_annotation",
-                                  "spe_final_celltype_r2.rds")
+final_celltype_path <- file.path(analysis_path, "final_cell_annotation", "r3_annotation",
+                                  "spe_final_celltype_r3.rds")
 
-sccomp_out_dir <- file.path(analysis_path, "spatial_analysis", "run_3")
+sccomp_out_dir <- file.path(analysis_path, "celltype_prop_analysis")
 
 sccomp_vs_benign_path   <- file.path(sccomp_out_dir, "sccomp_celltype_vs_benign.rds")
 sccomp_higher_v_lower_path <- file.path(sccomp_out_dir, "sccomp_celltype_higher_v_lower.rds")
@@ -208,45 +208,83 @@ ggsave(file.path(sccomp_out_dir, "celltype_comp_higher_vs_lower.png"),
        width = 8, height = 12, dpi = 300)
 ```
 
-# 9. Results Table
+# 9. Stacked Bar Chart: Cell Type Proportions by Disease State
 
-```{r sccomp-results-table, eval=FALSE}
-sccomp_results_df <- sccomp_vs_benign_res |>
-  arrange(c_FDR) |>
-  as.data.frame() |>
-  select(CellType, parameter, c_effect, c_lower, c_upper, c_FDR)
+Complementary view to the forest plots above -- shows actual proportions
+per sample rather than effect sizes, grouped by disease state.
 
-write.csv(sccomp_results_df,
-          file.path(sccomp_out_dir, "sccomp_celltype_results_vs_benign.csv"),
-          row.names = FALSE)
+## Compute per-sample proportions
 
-sccomp_higher_v_lower_df <- sccomp_higher_v_lower_res |>
-  arrange(c_FDR) |>
-  as.data.frame() |>
-  select(CellType, parameter, c_effect, c_lower, c_upper, c_FDR)
+```{r per-sample-props}
+selected_types <- c(
+  "Epithelial", "Tumor Epithelial", "Proliferating Cells", "CD8+ T Cell",
+  "CD4+ T Cell", "Treg", "Dendritic Cell", "Macrophage", "Monocyte",
+  "B Cell/Plasmablast", "Fibroblast", "Mast Cell"
+)
+display_levels <- c(selected_types, "Other")
 
-write.csv(sccomp_higher_v_lower_df,
-          file.path(sccomp_out_dir, "sccomp_celltype_results_higher_v_lower.csv"),
-          row.names = FALSE)
+spe$CellTypeLabel_display <- case_when(
+  spe$final_celltype == "Epithelial (EpCAM+)" ~ "Epithelial",
+  str_detect(spe$final_celltype, "Tumor Epithelial") ~ "Tumor Epithelial",
+  spe$final_celltype == "Proliferating Cells" ~ "Proliferating Cells",
+  str_detect(spe$final_celltype, "^CD8") ~ "CD8+ T Cell",
+  str_detect(spe$final_celltype, "^CD4") ~ "CD4+ T Cell",
+  str_detect(spe$final_celltype, "^Treg") ~ "Treg",
+  str_detect(spe$final_celltype, "^cDC|DC/mregDC|Dendritic Cell") ~ "Dendritic Cell",
+  str_detect(spe$final_celltype, "^Macrophage") ~ "Macrophage",
+  str_detect(spe$final_celltype, "^Monocyte") ~ "Monocyte",
+  str_detect(spe$final_celltype, "B Cell|Plasma") ~ "B Cell/Plasmablast",
+  spe$final_celltype == "Fibroblast/Stroma" ~ "Fibroblast",
+  spe$final_celltype == "Mast Cell" ~ "Mast Cell",
+  TRUE ~ "Other"
+)
+spe$CellTypeLabel_display <- factor(spe$CellTypeLabel_display, levels = display_levels)
 
-#sccomp_results_df |>
-  #knitr::kable(digits = 3, caption = "Cell type composition: Lower & Higher vs. Benign",
-               #format = "latex", booktabs = TRUE, longtable = TRUE) |>
-  #kable_styling(latex_options = c("striped", "repeat_header", "hold_position"),
-                #font_size = 8)
+celltype_props <- as.data.frame(
+  table(sample_id = spe$sample_id, CellType = spe$CellTypeLabel_display)
+) |>
+  group_by(sample_id) |>
+  mutate(Proportion = Freq / sum(Freq)) |>
+  ungroup()
+
+sample_disease_state <- unique(data.frame(sample_id = spe$sample_id,
+                                           disease_state = spe$disease_state))
+celltype_props <- celltype_props |> left_join(sample_disease_state, by = "sample_id")
+
+celltype_props <- celltype_props |>
+  mutate(patient_num = str_extract(sample_id, "(?<=Patient_?)\\d+"),
+         roi_suffix = str_extract(sample_id, "(?<=ROI_\\d{3}_)[0-9A-Za-z]+"),
+         sample_short = paste0("P", patient_num, "-", roi_suffix))
+
+celltype_cols <- c(
+  "Epithelial"          = "lightpink",
+  "Tumor Epithelial"     = "darkorange",
+  "Proliferating Cells"  = "deeppink",
+  "CD8+ T Cell"          = "forestgreen",
+  "CD4+ T Cell"          = "yellowgreen",
+  "Treg"                 = "purple",
+  "Dendritic Cell"       = "lightblue",
+  "Macrophage"           = "dodgerblue",
+  "Monocyte"             = "navy",
+  "B Cell/Plasmablast"   = "gold",
+  "Fibroblast"           = "firebrick",
+  "Mast Cell"            = "violet",
+  "Other"                = "gray85"
+)
+
 ```
 
-# Notes
+```{r stacked-bar-chart, fig.width=12, fig.height=4}
+ggplot(celltype_props, aes(x = reorder(sample_short, as.numeric(factor(disease_state))),
+                            y = Proportion, fill = CellType)) +
+  geom_col() +
+  facet_grid(~ disease_state, scales = "free_x", space = "free_x") +
+  scale_fill_manual(values = celltype_cols) +
+  theme_bw() +
+  theme(axis.text.x = element_blank()) +
+  labs(x = "Sample", y = "Proportion", fill = "Cell Type",
+       title = "Cell Type Composition by Sample, Grouped by Disease State")
 
-- Loaded from `final_cell_annotation_post_inspect.rds` -- update
-  `final_celltype_path` once Campbell's feedback produces a further-updated
-  file, and re-run both sccomp calls fresh (delete the cached `.rds` outputs
-  in `spatial_analysis/` first, since the load-from-cache logic will
-  otherwise silently reuse stale results).
-- Both forest plots now exclude cases where `c_FDR < 0.05` but the credible
-  interval still crosses zero (the cDC1/Lower issue found earlier) --
-  double check this doesn't unexpectedly drop a cell type you expected to
-  see, given the updated annotation labels from today's inspection.
-- Volcano plot intentionally omitted this round -- code available in the
-  original `spatial_setup_celltype.Rmd` (`eval=FALSE`'d there) if needed
-  again for a specific request.
+```
+
+

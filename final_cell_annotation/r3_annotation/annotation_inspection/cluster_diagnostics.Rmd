@@ -34,8 +34,8 @@ print_kable <- function(df, ...) {
 # 1. Load Data
 
 ```{r load-data}
-analysis_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/final_cell_annotation/r2_annotation"
-spe_path <- file.path(analysis_path, "spe_final_celltype_r2.rds")
+analysis_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/final_cell_annotation/r3_annotation"
+spe_path <- file.path(analysis_path, "spe_final_celltype_r3.rds")
 figure_path <- file.path(analysis_path, "figures")
 
 spe <- readRDS(spe_path)
@@ -449,116 +449,4 @@ for (ct in flagged_celltypes) {
 
   print(print_kable(df_ct, col.names = c("ROI", "Patient", "% of Cells"), digits = 1, row.names = FALSE))
 }
-```
-
-# 7. Cell Type Ratios by Patient
-
-Ratios between biologically meaningful cell type groups (e.g.
-CD8+ T Cell : Treg), computed per patient. **Edit `ratio_groups` and
-`ratio_pairs` below** to match the comparisons you actually want —
-the groups here are placeholders combining related fine-grained
-annotations into one denominator/numerator.
-
-```{r ratio-groups}
-ratio_groups <- list(
-  "CD8+ T Cell" = c("CD8+ T Cell, Activated", "CD8+ T Cell, Resting"),
-  "Treg"        = c("Treg, Activated", "Treg, Resting"),
-  "CD4+ T Cell" = c("CD4+ T Cell, Activated", "CD4+ T Cell, Exhaustion-leaning"),
-  "Macrophage"  = c("Macrophage (CD68+)", "Macrophage, Antigen-Presenting (HLADRB+)",
-                     "Macrophage, M2-like (CD163+)", "Macrophage, Mixed Signal (PDL1+)",
-                     "Macrophage, Proliferating (HLADRB+)", "Macrophage, Proliferating (MKI67+)")
-)
-
-# Each pair is numerator : denominator
-ratio_pairs <- list(
-  c("CD8+ T Cell", "Treg"),
-  c("CD4+ T Cell", "Treg"),
-  c("Macrophage", "CD8+ T Cell")
-)
-```
-
-```{r ratio-prep}
-group_lookup <- purrr::map_dfr(names(ratio_groups), function(g) {
-  tibble::tibble(celltype = ratio_groups[[g]], group = g)
-})
-
-group_counts <- plot_df |>
-  dplyr::inner_join(group_lookup, by = "celltype") |>
-  dplyr::count(patient_id, group, name = "n") |>
-  tidyr::complete(patient_id, group, fill = list(n = 0))
-
-group_wide <- group_counts |>
-  tidyr::pivot_wider(names_from = group, values_from = n)
-
-ratio_tbl <- purrr::map_dfr(ratio_pairs, function(pair) {
-  num <- pair[1]; den <- pair[2]
-  group_wide |>
-    dplyr::transmute(
-      patient_id,
-      pair = paste0(num, " : ", den),
-      numerator_n = .data[[num]],
-      denominator_n = .data[[den]],
-      ratio = ifelse(denominator_n == 0, NA_real_, round(numerator_n / denominator_n, 2))
-    )
-})
-```
-
-## 7.1 Ratio Table
-
-```{r ratio-table, results='asis'}
-print_kable(
-  ratio_tbl,
-  col.names = c("Patient", "Pair", "Numerator N", "Denominator N", "Ratio"),
-  digits = 2
-)
-```
-
-## 7.2 Ratio Bar Charts
-
-```{r ratio-barplots, fig.width=10, fig.height=5, results='asis'}
-for (p in unique(ratio_tbl$pair)) {
-
-  cat("\n\n### ", p, "\n\n")
-
-  df_p <- ratio_tbl |> dplyr::filter(pair == p)
-
-  g <- ggplot(df_p, aes(x = patient_id, y = ratio, fill = patient_id)) +
-    geom_col(show.legend = FALSE) +
-    geom_text(aes(label = ratio), vjust = -0.3, size = 3) +
-    labs(x = "Patient", y = "Ratio", title = p) +
-    theme_minimal() +
-    theme(axis.text.x = element_text(angle = 45, hjust = 1))
-
-  print(g)
-}
-```
-
-# 8. Concentration Summary Table
-
-Flags cell types where a single patient accounts for a large share of
-cells — same logic applied to the P10 Proliferating Myeloid check.
-
-```{r concentration-flags, results='asis'}
-patient_conc <- plot_df |>
-  dplyr::count(celltype, patient_id) |>
-  dplyr::group_by(celltype) |>
-  dplyr::mutate(pct = n / sum(n) * 100) |>
-  dplyr::slice_max(pct, n = 1) |>
-  dplyr::ungroup() |>
-  dplyr::rename(top_patient = patient_id, n_top_patient = n, pct_top_patient = pct) |>
-  dplyr::mutate(flag = dplyr::case_when(
-    pct_top_patient > 50 ~ "HIGH RISK: single-patient dominated",
-    pct_top_patient > 30 ~ "moderate patient skew",
-    TRUE ~ "ok"
-  )) |>
-  dplyr::arrange(desc(pct_top_patient)) |>
-  dplyr::select(celltype, top_patient, pct_top_patient, flag)
-
-print_kable(patient_conc, digits = 1)
-```
-
-# 9. Session Info
-
-```{r session-info}
-sessionInfo()
 ```

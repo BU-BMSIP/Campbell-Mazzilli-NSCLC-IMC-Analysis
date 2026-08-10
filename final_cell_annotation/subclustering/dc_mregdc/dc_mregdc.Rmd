@@ -26,9 +26,15 @@ marker, so AT2 identity can't be confirmed directly -- the question
 here is resolved indirectly: do subclusters show a clean DC/mregDC
 signature (CD11c/HLADRB/LAMP3/CCR7/CD141/CD1c) with epithelial markers
 riding along as spillover, or does a subset instead show a
-predominantly epithelial signature (EpCAM/CD117/TTF1orCD16) with DC
-markers as the weaker, spillover-level signal -- which would point to
-misclustered AT2-like epithelial cells rather than true DC/mregDC.
+predominantly epithelial signature (EpCAM/CD117/TTF1orCD16/GATA3) with
+DC markers as the weaker, spillover-level signal -- which would point
+to misclustered AT2-like epithelial cells rather than true DC/mregDC.
+
+Broad clusters 9 (Tumor Epithelial), 12 (Epithelial), and 19 (Tumor
+Epithelial Neuroendocrine) are pulled in as visual reference groups
+for the violin plots and heatmap only -- they are not reclustered and
+never merged into the saved `spe_dc` object. The UMAP (Section 11)
+plots the DC/mregDC subset only.
 
 ---
 
@@ -111,18 +117,44 @@ spe_dc <- runUMAP(spe_dc, dimred = "Harmony", name = "UMAP_sub")
 
 ```{r plot-patient-composition, fig.width=10, fig.height=5}
 patient_counts <- as.data.frame(table(patient_id = spe_dc$patient_id))
+patient_counts$pct <- patient_counts$Freq / sum(patient_counts$Freq) * 100
+patient_counts$pct_label <- paste0(round(patient_counts$pct, 1), "%")
 
 p_patient_comp <- ggplot(patient_counts, aes(x = patient_id, y = Freq, fill = patient_id)) +
   geom_col() +
+  geom_text(aes(label = pct_label), vjust = -0.5, size = 3.5) +
   labs(title = "DC/mregDC Subset: Cell Count by Patient",
        x = "Patient", y = "Cell Count") +
   theme_bw() +
   theme(axis.text.x = element_text(angle = 45, hjust = 1),
-        legend.position = "none")
+        legend.position = "none") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1)))  # headroom so labels don't clip
 print(p_patient_comp)
 
 cat("DC/mregDC subset composition by patient:\n")
-print(patient_counts[order(-patient_counts$Freq), ])
+print(patient_counts[order(-patient_counts$Freq), c("patient_id", "Freq", "pct")])
+```
+
+---
+
+## 6.5. Reference Epithelial Clusters for Visualization (No Reclustering)
+
+```{r epi-reference-extract}
+# Broad clusters pulled in purely as visual reference groups -- not
+# reclustered, not merged into spe_dc, just plotted alongside it.
+epi_ref_clusters <- c("9", "12", "19")
+
+epi_ref_labels <- c(
+  "9"  = "Tumor Epithelial (C9)",
+  "12" = "Epithelial (C12)",
+  "19" = "Tumor Epithelial NE (C19)"
+)
+
+spe_epi_ref <- spe[, as.character(spe$broad_clusters) %in% epi_ref_clusters]
+spe_epi_ref$vis_group <- epi_ref_labels[as.character(spe_epi_ref$broad_clusters)]
+
+cat("Reference epithelial cells pulled in for visualization:\n")
+print(table(spe_epi_ref$vis_group))
 ```
 
 ---
@@ -135,7 +167,7 @@ dc_markers <- c("CD11c", "HLADRB", "CD141", "CD1c", "LAMP3", "CCR7")
 
 # epithelial markers -- if a subcluster is dominated by these instead,
 # that's the AT2-like/misclustered-epithelial signal, not DC/mregDC
-epithelial_markers <- c("EpCAM", "CD117", "TTF1orCD16")
+epithelial_markers <- c("EpCAM", "CD117", "TTF1orCD16", "GATA3")
 
 # activation / functional state markers, useful either way
 state_markers <- c("PD1", "PDL1", "TIM3", "CD86", "MKI67", "CD45RO")
@@ -143,23 +175,26 @@ state_markers <- c("PD1", "PDL1", "TIM3", "CD86", "MKI67", "CD45RO")
 # other-lineage spillover flags, to rule out non-DC/non-epithelial admixture
 admixture_markers <- c("CD68", "CD14", "CD19")
 
-dc_all_markers <- c(dc_markers, epithelial_markers, state_markers, admixture_markers)
-dc_all_markers <- dc_all_markers[dc_all_markers %in% rownames(spe_dc)]
+# everything else in the panel, plotted too so nothing is left out
+other_markers <- setdiff(rownames(spe_dc), c(dc_markers, epithelial_markers,
+                                              state_markers, admixture_markers,
+                                              "DNA191", "DNA193", "Membrane"))
+
+dc_all_markers <- c(dc_markers, epithelial_markers, state_markers, admixture_markers, other_markers)
 
 cat("Markers found:", paste(dc_all_markers, collapse = ", "), "\n")
 ```
 
 ---
 
-## 8. Violin Plots per Subcluster
+## 8. Violin Plots: DC/mregDC Subclusters vs. Reference Epithelial Clusters
 
 ```{r make-violinplot}
-make_violinplot <- function(spe, assay_name, cluster_col, marker_set, title, ncol = 3) {
-  expr_mat   <- assay(spe, assay_name)[marker_set, , drop = FALSE]
-  cluster_id <- spe[[cluster_col]]
+make_violinplot_df <- function(expr_mat, group_vec, group_levels, marker_set, title, ncol = 3) {
+  expr_mat <- expr_mat[marker_set, , drop = FALSE]
 
-  mean_expr <- sapply(levels(cluster_id), function(cl) {
-    idx <- which(cluster_id == cl)
+  mean_expr <- sapply(group_levels, function(g) {
+    idx <- which(group_vec == g)
     rowMeans(expr_mat[, idx, drop = FALSE])
   })
 
@@ -170,20 +205,19 @@ make_violinplot <- function(spe, assay_name, cluster_col, marker_set, title, nco
   }
 
   plot_df <- as.data.frame(t(expr_mat)) |>
-    mutate(cluster = cluster_id) |>
-    pivot_longer(-cluster, names_to = "marker", values_to = "expr")
+    mutate(group = factor(group_vec, levels = group_levels)) |>
+    pivot_longer(-group, names_to = "marker", values_to = "expr")
 
-  plot_df$marker  <- factor(plot_df$marker, levels = marker_order)
-  plot_df$cluster <- factor(plot_df$cluster, levels = levels(cluster_id))
+  plot_df$marker <- factor(plot_df$marker, levels = marker_order)
 
-  ggplot(plot_df, aes(x = cluster, y = expr, fill = cluster)) +
+  ggplot(plot_df, aes(x = group, y = expr, fill = group)) +
     geom_violin(scale = "width", trim = TRUE, linewidth = 0.2) +
     stat_summary(fun = median, geom = "point", size = 0.6, color = "black") +
     facet_wrap(~ marker, scales = "free_y", ncol = ncol) +
-    labs(title = title, x = "Subcluster", y = "Z-score expression") +
+    labs(title = title, x = "Group", y = "Z-score expression") +
     theme_bw(base_size = 11) +
     theme(
-      axis.text.x      = element_text(angle = 0, hjust = 0.5, size = 9),
+      axis.text.x       = element_text(angle = 45, hjust = 1, size = 8),
       strip.text        = element_text(face = "bold"),
       panel.grid.major.x = element_blank(),
       legend.position   = "none"
@@ -191,150 +225,122 @@ make_violinplot <- function(spe, assay_name, cluster_col, marker_set, title, nco
 }
 ```
 
+```{r combine-for-viz}
+# DC subclusters keep their own labels; reference epithelial cells keep
+# their broad-cluster labels. Nothing here feeds back into spe_dc.
+dc_group_vec  <- paste0("DC Sub ", as.character(spe_dc$dc_subclusters))
+epi_group_vec <- spe_epi_ref$vis_group
+
+vis_group_levels <- c(paste0("DC Sub ", levels(spe_dc$dc_subclusters)),
+                       unname(epi_ref_labels))  # strip names so they aren't used as identifiers downstream
+
+vis_group_vec <- c(dc_group_vec, epi_group_vec)
+
+expr_vis_0100 <- cbind(
+  assay(spe_dc, "scaled_0100")[dc_all_markers, , drop = FALSE],
+  assay(spe_epi_ref, "scaled_0100")[dc_all_markers, , drop = FALSE]
+)
+```
+
 ```{r violin-dc-global, fig.width=10, fig.height=5}
-p_violin_dc_global <- make_violinplot(spe_dc, "scaled_0100", "dc_subclusters",
-                                      dc_markers,
-                                      "DC/mregDC Subset: DC Lineage Markers per Subcluster (Global Z-score)",
-                                      ncol = 3)
+p_violin_dc_global <- make_violinplot_df(expr_vis_0100, vis_group_vec, vis_group_levels,
+                                         dc_markers,
+                                         "DC/mregDC Subclusters vs. Reference Epithelial Clusters: DC Lineage Markers",
+                                         ncol = 3)
 print(p_violin_dc_global)
 ```
 
 ```{r violin-epithelial-global, fig.width=10, fig.height=5}
-p_violin_epi_global <- make_violinplot(spe_dc, "scaled_0100", "dc_subclusters",
-                                       epithelial_markers,
-                                       "DC/mregDC Subset: Epithelial (AT2-like) Markers per Subcluster (Global Z-score)",
-                                       ncol = 3)
+p_violin_epi_global <- make_violinplot_df(expr_vis_0100, vis_group_vec, vis_group_levels,
+                                          epithelial_markers,
+                                          "DC/mregDC Subclusters vs. Reference Epithelial Clusters: Epithelial Markers",
+                                          ncol = 3)
 print(p_violin_epi_global)
 ```
 
 ```{r violin-state-global, fig.width=12, fig.height=8}
-p_violin_state_global <- make_violinplot(spe_dc, "scaled_0100", "dc_subclusters",
-                                         state_markers,
-                                         "DC/mregDC Subset: State Markers per Subcluster (Global Z-score)",
-                                         ncol = 3)
+p_violin_state_global <- make_violinplot_df(expr_vis_0100, vis_group_vec, vis_group_levels,
+                                            state_markers,
+                                            "DC/mregDC Subclusters vs. Reference Epithelial Clusters: State Markers",
+                                            ncol = 3)
 print(p_violin_state_global)
 ```
 
 ```{r violin-admixture-global, fig.width=10, fig.height=5}
-p_violin_admixture_global <- make_violinplot(spe_dc, "scaled_0100", "dc_subclusters",
-                                             admixture_markers,
-                                             "DC/mregDC Subset: Other-Lineage Admixture Markers per Subcluster (Global Z-score)",
-                                             ncol = 3)
+p_violin_admixture_global <- make_violinplot_df(expr_vis_0100, vis_group_vec, vis_group_levels,
+                                                admixture_markers,
+                                                "DC/mregDC Subclusters vs. Reference Epithelial Clusters: Other-Lineage Admixture Markers",
+                                                ncol = 3)
 print(p_violin_admixture_global)
 ```
 
-Subset-relative renormalization: since `scaled_0100` was capped and
-Z-scored over the full run5 dataset, this recomputes the same
-cap+Z-score recipe from raw counts using only this DC/mregDC subset's
-own distribution -- one normalization layer, just a different
-denominator.
-
-```{r renorm-subset}
-cap_99 <- function(mat) {
-  t(apply(mat, 1, function(x) {
-    q99 <- quantile(x, 0.99)
-    pmin(x, q99)
-  }))
-}
-
-zscore_rows <- function(mat) {
-  t(scale(t(mat)))
-}
-
-mat_sub_0100 <- counts(spe_dc) |> cap_99() |> zscore_rows()
-assay(spe_dc, "scaled_0100_sub") <- mat_sub_0100
-```
-
-```{r violin-dc-subset, fig.width=10, fig.height=5}
-p_violin_dc_sub <- make_violinplot(spe_dc, "scaled_0100_sub", "dc_subclusters",
-                                   dc_markers,
-                                   "DC/mregDC Subset: DC Lineage Markers per Subcluster (Subset-Renormalized Z-score)",
-                                   ncol = 3)
-print(p_violin_dc_sub)
-```
-
-```{r violin-epithelial-subset, fig.width=10, fig.height=5}
-p_violin_epi_sub <- make_violinplot(spe_dc, "scaled_0100_sub", "dc_subclusters",
-                                    epithelial_markers,
-                                    "DC/mregDC Subset: Epithelial (AT2-like) Markers per Subcluster (Subset-Renormalized Z-score)",
-                                    ncol = 3)
-print(p_violin_epi_sub)
-```
-
-```{r violin-state-subset, fig.width=12, fig.height=8}
-p_violin_state_sub <- make_violinplot(spe_dc, "scaled_0100_sub", "dc_subclusters",
-                                      state_markers,
-                                      "DC/mregDC Subset: State Markers per Subcluster (Subset-Renormalized Z-score)",
-                                      ncol = 3)
-print(p_violin_state_sub)
-```
-
-```{r violin-admixture-subset, fig.width=10, fig.height=5}
-p_violin_admixture_sub <- make_violinplot(spe_dc, "scaled_0100_sub", "dc_subclusters",
-                                          admixture_markers,
-                                          "DC/mregDC Subset: Other-Lineage Admixture Markers per Subcluster (Subset-Renormalized Z-score)",
-                                          ncol = 3)
-print(p_violin_admixture_sub)
+```{r violin-other-global, fig.width=14, fig.height=16}
+p_violin_other_global <- make_violinplot_df(expr_vis_0100, vis_group_vec, vis_group_levels,
+                                            other_markers,
+                                            "DC/mregDC Subclusters vs. Reference Epithelial Clusters: All Other Panel Markers",
+                                            ncol = 4)
+print(p_violin_other_global)
 ```
 
 ---
 
-## 9. Heatmap: DC vs. Epithelial Signal per Subcluster
+## 9. Heatmap: DC/mregDC Subclusters vs. Reference Epithelial Clusters (All Markers)
 
 ```{r dc-vs-epi-heatmap-matrix}
-heatmap_markers <- c(dc_markers, epithelial_markers)
-heatmap_markers <- heatmap_markers[heatmap_markers %in% rownames(spe_dc)]
-
-expr_scaled <- assay(spe_dc, "scaled_0100")[heatmap_markers, , drop = FALSE]
-cluster_id  <- spe_dc$dc_subclusters
-
-mean_expr_mat <- sapply(levels(cluster_id), function(cl) {
-  idx <- which(cluster_id == cl)
-  rowMeans(expr_scaled[, idx, drop = FALSE])
+mean_expr_mat <- sapply(vis_group_levels, function(g) {
+  idx <- which(vis_group_vec == g)
+  rowMeans(expr_vis_0100[, idx, drop = FALSE])
 })
 
-# keep DC markers and epithelial markers grouped as blocks rather than
-# clustering rows freely, so the DC-vs-epithelial split stays visually clear
-row_order <- heatmap_markers
-mean_expr_mat <- mean_expr_mat[row_order, , drop = FALSE]
+# keep DC / Epithelial / State / Admixture / Other markers grouped as
+# blocks rather than clustering rows freely, so the marker-class split
+# stays visually clear
+mean_expr_mat <- mean_expr_mat[dc_all_markers, , drop = FALSE]
 
-print(round(mean_expr_mat, 2))
+#print(round(mean_expr_mat, 2))
 ```
 
-```{r dc-vs-epi-heatmap-plot, fig.width=8, fig.height=6}
-n_dc_markers <- sum(rownames(mean_expr_mat) %in% dc_markers)
+```{r dc-vs-epi-heatmap-plot, fig.width=11, fig.height=14}
+n_dc_markers    <- sum(rownames(mean_expr_mat) %in% dc_markers)
+n_epi_markers   <- sum(rownames(mean_expr_mat) %in% epithelial_markers)
+n_state_markers <- sum(rownames(mean_expr_mat) %in% state_markers)
+n_admix_markers <- sum(rownames(mean_expr_mat) %in% admixture_markers)
+gap_positions   <- cumsum(c(n_dc_markers, n_epi_markers, n_state_markers, n_admix_markers))
 
-p_heatmap <- pheatmap(
+p_heatmap <- pheatmap::pheatmap(
   mean_expr_mat,
-  scale = "row",  # rescale each marker across subclusters so LAMP3's
+  scale = "row",  # rescale each marker across groups so LAMP3's
                   # magnitude doesn't compress every other marker's range
   color = colorRampPalette(rev(brewer.pal(11, "RdBu")))(100),
   cluster_rows = FALSE,
-  cluster_cols = TRUE,
-  gaps_row = n_dc_markers,  # visual break between DC block (top) and Epithelial block (bottom)
+  cluster_cols = FALSE,  # keep DC subclusters left, reference epithelial groups right
+  gaps_row = gap_positions,  # breaks between DC | Epithelial | State | Admixture | Other blocks
+  gaps_col = nlevels(spe_dc$dc_subclusters),  # break between DC subclusters and reference groups
   display_numbers = TRUE,
   number_format = "%.2f",
   number_color = "black",
-  fontsize_number = 8,
-  main = "DC/mregDC Subset: Mean DC vs. Epithelial Marker Expression per Subcluster",
+  fontsize_number = 7,
+  main = "DC/mregDC Subclusters vs. Reference Epithelial Clusters: Mean Marker Expression (All Markers)",
   fontsize = 10,
-  fontsize_row = 9,
+  fontsize_row = 8,
   fontsize_col = 9,
+  angle_col = 45,  # reference group labels are full text now, need the angle
   border_color = NA,
   silent = TRUE
 )
 
 grid::grid.newpage()
 grid::grid.draw(p_heatmap$gtable)
-grid::grid.text("Row Z-score", x = 0.92, y = 0.85,
+grid::grid.text("Row Z-score", x = 0.94, y = 0.98,
                  gp = grid::gpar(fontsize = 9, fontface = "bold"))
 ```
 
-A subcluster that lights up red/blue consistently across the DC block
-and stays flat across the Epithelial block supports true DC/mregDC. A
-subcluster with the pattern flipped -- flat or negative across DC
-markers, strongly positive across EpCAM/CD117/TTF1orCD16 -- is the
-AT2-like/misclustered-epithelial signal.
+A DC subcluster that lights up red/blue consistently across the DC
+block and stays flat across the Epithelial block supports true
+DC/mregDC. A DC subcluster with the pattern flipped -- flat or
+negative across DC markers, strongly positive across
+EpCAM/CD117/TTF1orCD16/GATA3 (resembling the reference C9/C12/C19
+columns) -- is the AT2-like/misclustered-epithelial signal.
 
 ---
 
@@ -370,7 +376,7 @@ if ("sub_celltype" %in% colnames(colData(spe_dc))) {
 
   p_sub_celltype <- dittoDimPlot(spe_dc, var = "sub_celltype",
                                  reduction.use = "UMAP_sub",
-                                 size = 0.4) +
+                                 size = 1.2) +
     ggtitle("DC/mregDC Subset: UMAP colored by Subcluster Cell Type") +
     theme(legend.position = "right")
   print(p_sub_celltype)
@@ -423,3 +429,7 @@ dir.create(dirname(out_path), recursive = TRUE, showWarnings = FALSE)
 saveRDS(spe_dc, out_path)
 cat("Saved DC/mregDC subcluster object to:", out_path, "\n")
 ```
+
+Note: only `spe_dc` is saved here -- `spe_epi_ref` (the reference
+epithelial cells used in Sections 8–9) is a plotting-only object and
+is never written to disk or merged in.

@@ -1,0 +1,342 @@
+---
+title: "Poster Figures: Cell Type Composition (Higher vs. Lower Stage)"
+author: "Vaidehi Gupta"
+output:
+ html_document:
+     toc: true
+     toc_float: true
+     code_folding: hide
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+
+.libPaths(c("/restricted/projectnb/camplab/home/vgupta7/R_libs", .libPaths()))
+
+suppressPackageStartupMessages({
+    library(SingleCellExperiment)
+    library(SpatialExperiment)
+    library(sccomp)
+    library(dplyr)
+    library(ggplot2)
+    library(forcats)
+})
+
+set.seed(12345)
+```
+
+# Step 0. Paths and Load Data
+
+```{r paths}
+analysis_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis"
+
+final_celltype_path <- file.path(analysis_path, "final_cell_annotation",
+                                  "r3_annotation", "spe_final_celltype_r3.rds")
+
+celltype_prop_dir <- file.path(analysis_path, "celltype_prop_analysis")
+
+sccomp_higher_v_lower_path <- file.path(celltype_prop_dir, "sccomp_celltype_higher_v_lower.rds")
+```
+
+```{r load-data}
+spe <- readRDS(final_celltype_path)
+
+sceIMC <- SingleCellExperiment(list(counts = assay(spe, "counts")))
+sceIMC$Patient      <- factor(spe$patient_id)
+sceIMC$Sample       <- factor(spe$sample_id)
+sceIMC$DiseaseState <- factor(spe$disease_state, levels = c("Benign", "Lower", "Higher"))
+sceIMC$CellType     <- factor(spe$final_celltype)
+
+cat("Cells:", ncol(sceIMC), "\n")
+cat("Cell types:", nlevels(sceIMC$CellType), "\n")
+```
+
+# Step 1. Load Existing sccomp Result
+
+Reusing the already-run Higher vs. Lower result rather than re-fitting.
+
+```{r load-sccomp-result}
+stopifnot(file.exists(sccomp_higher_v_lower_path))
+sccompRes <- readRDS(sccomp_higher_v_lower_path)
+
+unique(sccompRes$parameter)
+```
+
+# Step 2. Tidy sccomp Output for Plotting
+
+```{r tidy-sccomp}
+sceIMCHvL <- sceIMC[, sceIMC$DiseaseState %in% c("Lower", "Higher")]
+sceIMCHvL$DiseaseState <- factor(sceIMCHvL$DiseaseState, levels = c("Lower", "Higher"))
+
+sccompResSub <- sccompRes |>
+  as.data.frame() |>
+  filter(parameter == "DiseaseStateHigher")   # Higher vs. Lower, since Lower is the reference
+
+sccompResSub$Significant <- ifelse(sccompResSub$c_FDR < 0.05, "FDR < 0.05", "Not significant")
+sccompResSub$Direction <- ifelse(sccompResSub$c_effect > 0, "Higher stage", "Lower stage")
+
+# Cell counts per cell type, for optional point/bar sizing
+numCells <- as.data.frame(table(sceIMCHvL$CellType))
+colnames(numCells) <- c("CellType", "n_cells")
+sccompResSub <- merge(sccompResSub, numCells, by = "CellType")
+```
+
+---
+
+# Figure Option 1: Curated Diverging Bar Chart (Poster Main Figure)
+
+This is the poster-friendly replacement for the dense dot-and-whisker forest
+plot. Two things make it poster-legible: (1) only significant, story-relevant
+cell types are shown -- edit `keepCellTypes` below to your final curated list --
+and (2) solid bars read better than thin dot+CI lines at a distance.
+
+```{r diverging-bar, fig.width=10, fig.height=6}
+# Note: pick the cell types that carry your actual narrative.
+
+keepCellTypes <- c(
+  "Proliferating Cells",
+  "Macrophage, M2-like (CD163+)",
+  "Monocyte-Macrophage Transitional (CD14+)",
+  "Treg, Memory",
+  "PMN-MDSC",
+  "CD4+ Memory T Cell, Exhaustion-leaning",
+  "CD8+ Memory T Cell",
+  "Plasmablast/Activated B Cell (CD38+)",
+  "B Cell (CD19+)",
+  "DC/mregDC (Epi Adj)",
+  "Mast Cell",
+  "Tumor Epithelial (TTF1++)"
+)
+
+still_present <- setdiff(keepCellTypes, levels(sceIMC$CellType))
+if (length(still_present) > 0) {
+  cat("WARNING -- these keepCellTypes entries weren't found in current annotation:\n")
+  print(still_present)
+}
+
+plotDF <- sccompResSub[sccompResSub$CellType %in% keepCellTypes, ]
+plotDF <- plotDF[plotDF$c_FDR < 0.05, ]  # keep only significant, since these are your curated "story" cell types
+
+# Display-only rename -- TTF1 is a normal lung differentiation marker, not
+# tumor-specific, per PI feedback. Real annotation label unchanged for now.
+plotDF$CellType <- recode(plotDF$CellType,
+                           "Tumor Epithelial (TTF1++)" = "Lung Epithelial (TTF1+)")
+
+# Order bars by effect size for a clean diverging look
+plotDF$CellType <- fct_reorder(plotDF$CellType, plotDF$c_effect)
+
+divergingBarPlot <- ggplot(plotDF, aes(x = CellType, y = c_effect, fill = Direction)) +
+  geom_col(width = 0.7) +
+  geom_errorbar(aes(ymin = c_lower, ymax = c_upper), width = 0.2, linewidth = 0.5) +
+  coord_flip() +
+  scale_fill_manual(values = c("Higher stage" = "firebrick3", "Lower stage" = "steelblue3")) +
+  scale_y_continuous(breaks = seq(-1.5, 1, by = 0.5)) +
+  labs(
+    x = NULL,
+    y = "Effect size (logit fold-change)",
+    fill = NULL,
+    title = "Cell Type Proportion Differences Between Higher and Lower Disease Stage"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.text.y = element_text(size = 12, face = "bold"),
+    axis.text.x = element_text(size = 10),
+    axis.title.x = element_text(size = 12),
+    plot.title = element_text(size = 14, hjust = 0),
+    legend.text = element_text(size = 11),
+    legend.title = element_text(size = 12),
+    legend.position = "top"
+  )
+
+divergingBarPlot
+
+#ggsave(file.path(celltype_prop_dir, "Fig_DivergingBar_HigherVsLower.pdf"),
+       #divergingBarPlot, width = 10, height = 7)
+```
+
+```{r}
+sccompResSub |>
+  filter(c_FDR < 0.05, !(c_lower < 0 & c_upper > 0), Direction == "Lower stage") |>
+  arrange(c_effect) |>
+  select(CellType, c_effect, c_lower, c_upper, c_FDR)
+
+```
+## Full bar plot 
+
+```{r fig.width=10, fig.height=10}
+plotDF_full <- sccompResSub[sccompResSub$c_FDR < 0.05 & !(sccompResSub$c_lower < 0 & sccompResSub$c_upper > 0), ]
+
+plotDF_full$CellType <- fct_reorder(plotDF_full$CellType, plotDF_full$c_effect)
+
+n_full <- nrow(plotDF_full)
+cat("Cell types passing FDR < 0.05 and CI excludes zero:", n_full, "\n")
+
+divergingBarPlotFull <- ggplot(plotDF_full, aes(x = CellType, y = c_effect, fill = Direction)) +
+  geom_col(width = 0.7) +
+  geom_errorbar(aes(ymin = c_lower, ymax = c_upper), width = 0.2, linewidth = 0.5) +
+  coord_flip() +
+  scale_fill_manual(values = c("Higher stage" = "firebrick3", "Lower stage" = "steelblue3")) +
+  labs(
+    x = NULL,
+    y = "Effect size (logit fold-change)",
+    fill = NULL,
+    title = "Cell type proportion differences: Higher vs. Lower disease stage (all significant cell types)"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.y = element_text(size = 9, face = "bold"),
+    axis.text.x = element_text(size = 9),
+    axis.title.x = element_text(size = 11),
+    plot.title = element_text(size = 12, hjust = 0),
+    legend.text = element_text(size = 10),
+    legend.title = element_text(size = 11),
+    legend.position = "top"
+  )
+
+divergingBarPlotFull
+
+#ggsave(file.path(sccomp_out_dir, "Fig_DivergingBar_HigherVsLower_Full.pdf"),
+       #divergingBarPlotFull, width = 9, height = max(6, n_full * 0.3))
+
+```
+
+---
+
+# Figure Option 2: Small-Multiples Boxplots per Cell Type
+
+One clean panel per curated cell type, showing individual samples (colored by
+patient) plus a boxplot summary, faceted by cell type.
+
+```{r small-multiples, fig.width=10, fig.height=12}
+# Build a long-format proportion table: one row per sample x cell type
+propTable <- table(sceIMC$Sample, sceIMC$CellType) |> prop.table(margin = 1)
+propDF <- as.data.frame(propTable)
+colnames(propDF) <- c("Sample", "CellType", "Proportion")
+propDF$Proportion <- propDF$Proportion * 100
+
+# Attach patient + disease state metadata back onto each sample
+sampleMeta <- unique(data.frame(
+  Sample       = sceIMC$Sample,
+  Patient      = sceIMC$Patient,
+  DiseaseState = sceIMC$DiseaseState
+))
+propDF <- merge(propDF, sampleMeta, by = "Sample")
+
+# Keep only Lower/Higher for this comparison (drop Benign, or keep it -- your call)
+propDF <- propDF[propDF$DiseaseState %in% c("Lower", "Higher"), ]
+propDF$DiseaseState <- factor(propDF$DiseaseState, levels = c("Lower", "Higher"))
+
+propDFSub <- propDF[propDF$CellType %in% keepCellTypes, ]
+propDFSub$CellType <- factor(propDFSub$CellType, levels = keepCellTypes)
+
+# Restrict to the same curated cell types as Figure 1, for a consistent story
+smallMultiplesPlot <- ggplot(propDFSub, aes(x = DiseaseState, y = Proportion)) +
+  geom_boxplot(outlier.shape = NA, width = 0.5) +
+  geom_jitter(aes(color = Patient), width = 0.12, size = 1.8) +
+  facet_wrap(~ CellType, scales = "free_y", ncol = 3,
+             labeller = labeller(CellType = label_wrap_gen(20))) +
+  labs(x = NULL, y = "% of cells in sample") +
+  theme_classic(base_size = 14) +
+  theme(
+    strip.text = element_text(size = 10, face = "bold"),
+    axis.text.x = element_text(size = 13),
+    axis.text.y = element_text(size = 11),
+    axis.title.y = element_text(size = 14),
+    legend.position = "right"
+  )
+
+smallMultiplesPlot
+
+#ggsave(file.path(celltype_prop_dir, "Fig_SmallMultiplesBoxplots_HigherVsLower.pdf"),
+       #smallMultiplesPlot, width = 14, height = 10)
+```
+
+---
+
+```{r, fig.width=10, fig.height=8}
+# Order panels to match the forest plot's effect-size ranking
+forest_order <- plotDF |> arrange(c_effect) |> pull(CellType) |> as.character()
+
+# Trim to a smaller, poster-appropriate subset -- adjust this list as you like
+poster_subset <- c(
+  "Proliferating Cells", "Macrophage, M2-like (CD163+)",
+  "Treg, Memory", "CD4+ Memory T Cell, Exhaustion-leaning",
+  "DC/mregDC (Epi Adj)", "Mast Cell"
+)
+
+propDFPoster <- propDFSub |>
+  filter(CellType %in% poster_subset) |>
+  mutate(CellType = factor(CellType, levels = intersect(forest_order, poster_subset)))
+
+smallMultiplesPosterPlot <- ggplot(propDFPoster, aes(x = DiseaseState, y = Proportion)) +
+  geom_boxplot(outlier.shape = NA, width = 0.5, fill = "gray95") +
+  geom_jitter(aes(color = DiseaseState), width = 0.12, size = 1.6, alpha = 0.7) +
+  scale_color_manual(values = c("Lower" = "steelblue3", "Higher" = "firebrick3")) +
+  facet_wrap(~ CellType, scales = "free_y", ncol = 3,
+             labeller = labeller(CellType = label_wrap_gen(20))) +
+  labs(x = NULL, y = "% of cells in sample") +
+  theme_classic(base_size = 14) +
+  theme(
+    strip.text = element_text(size = 11, face = "bold"),
+    axis.text.x = element_text(size = 13),
+    axis.text.y = element_text(size = 11),
+    axis.title.y = element_text(size = 14),
+    legend.position = "none"
+  )
+
+smallMultiplesPosterPlot
+
+```
+```{r, fig.width=10, fig.height=14}
+# Build proportion data for every significant cell type, not just the curated subset
+forest_order_full <- plotDF_full |> arrange(c_effect) |> pull(CellType) |> as.character()
+
+propDFAll <- propDF[propDF$CellType %in% forest_order_full, ]
+propDFAll$CellType <- factor(propDFAll$CellType, levels = forest_order_full)
+
+n_panels <- nlevels(propDFAll$CellType)
+cat("Cell types to plot:", n_panels, "\n")
+
+smallMultiplesAllPlot <- ggplot(propDFAll, aes(x = DiseaseState, y = Proportion)) +
+  geom_boxplot(outlier.shape = NA, width = 0.5, fill = "gray95") +
+  geom_jitter(aes(color = DiseaseState), width = 0.12, size = 1.4, alpha = 0.7) +
+  scale_color_manual(values = c("Lower" = "steelblue3", "Higher" = "firebrick3")) +
+  facet_wrap(~ CellType, scales = "free_y", ncol = 4,
+             labeller = labeller(CellType = label_wrap_gen(20))) +
+  labs(x = NULL, y = "% of cells in sample") +
+  theme_classic(base_size = 12) +
+  theme(
+    strip.text = element_text(size = 9, face = "bold"),
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 9),
+    axis.title.y = element_text(size = 12),
+    legend.position = "none"
+  )
+
+smallMultiplesAllPlot
+
+```
+
+
+# Notes
+
+- Both figures pull from the **same curated `keepCellTypes` list** -- edit that
+  one vector and both figures update consistently. Verify it against
+  `levels(spe$final_celltype)` before finalizing -- several entries were
+  updated here to match the post-relabeling names (naive/memory/exhaustion),
+  but other drift may exist that wasn't caught.
+- Figure 1 (diverging bar) is best as your **main poster figure**: it directly
+  shows the statistical result (effect size + CI) your talk already leans on.
+- Figure 2 (small multiples) is a strong **secondary/supporting figure**: it
+  reassures a reader that the effect isn't being driven by one outlier patient,
+  since every dot (sample) is visible and colored by patient.
+- If poster space is tight, Figure 1 alone is sufficient; Figure 2 is the first
+  thing to cut, not the reverse.
+- Assumes `sccomp_celltype_r3.Rmd` follows the same object-building convention
+  as the original `sccomp_celltype.Rmd` (`Patient`/`Sample`/`DiseaseState`/
+  `CellType` columns on a `SingleCellExperiment`) -- if that's since changed,
+  the Step 0 chunk above will need matching updates.
+
+```{r session-info}
+sessionInfo()
+```

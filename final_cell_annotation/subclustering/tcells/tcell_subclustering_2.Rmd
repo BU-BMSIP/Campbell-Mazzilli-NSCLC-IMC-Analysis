@@ -1,5 +1,5 @@
 ---
-title: 'T Cell Subclustering: Combined Cluster 15 (Cleaned) + Clusters 5, 6, 7'
+title: 'T Cell Subclustering: Combined Cluster 15 (Cleaned) + Clusters 5, 6, 7 (Round 2)'
 author: "Vaidehi Gupta"
 date: "`r Sys.Date()`"
 output:
@@ -20,6 +20,13 @@ subclusters 2, 4, 7 (low quality/Patient 20 driven) and 8 (confirmed
 Patient20 CD19 technical artifact), rather than the raw broad cluster,
 since those issues are already diagnosed and there's no reason to
 reintroduce them. 
+
+This is a round-2 pass following PI review of the initial subclustering
+(`tcell_subclustering.Rmd`): adds a CD45RA violin panel, remakes the
+marker heatmap with the full marker panel labeled by annotated subcluster
+name rather than numeric ID, drops the intensity-confound check, and
+updates subcluster naming per PI feedback (resting -> naive;
+CD45RO-elevated -> memory rather than activated).
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(message = FALSE, warning = FALSE)
@@ -151,7 +158,7 @@ print(p_sub_clusters)
 
 ```{r markers}
 lineage_markers <- c("CD4", "CD8a", "FoxP3")
-state_markers <- c("CD45RO", "MKI67", "PD1", "PDL1", "TIM3", "HLADRB", "CD127", "TIGIT", "CTLA4")
+state_markers <- c("CD45RA", "CD45RO", "MKI67", "PD1", "PDL1", "TIM3", "HLADRB", "CD127", "TIGIT", "CTLA4")
 
 # Used to catch contamination/spillover
 admixture_markers <- c("CD19", "CD138", "CD11c", "CD14", "CD1c", "CD68")
@@ -161,7 +168,57 @@ tcell_markers <- tcell_markers[tcell_markers %in% rownames(spe_tcell)]
 cat("Markers found:", paste(tcell_markers, collapse = ", "), "\n")
 ```
 
-# 7. Violin Plots per Subcluster
+# 7. Manual Subcluster Annotation
+
+Naive: T cell that has not yet encountered its cognate antigen.
+Characterized by low levels of activation, proliferation, and CD45RO
+(memory) markers.
+
+Activated: T cell that has recognized its antigen or received other
+activating signals and is actively engaged -- proliferating, producing
+cytokines, and upregulating markers that support its immune function.
+
+Memory: T cell that has previously encountered antigen and persists in a
+poised, CD45RO+ state that allows faster reactivation upon re-exposure --
+distinct from actively engaged (Activated) or naive (CD45RO-) cells.
+
+```{r annotate}
+tcell_subannotation <- c(
+  "1" = "CD4+ Memory T Cell, Exhaustion-leaning", # CD45RO+, PD1+/TIGIT+, mild CTLA4 and LAG3 positive (exhausion signature)
+  "2" = "CD4+ Memory T Cell, Partial-exhausion",  # CD45RO+, CD4+, TIM3/CD138 co-elevation attributed to intensity confound
+  "3" = "Treg, Memory",  # FoxP3+, CD4 and CD45RO co-elevated
+  "4" = "Memory T Cell (Unresolved)",  # CD45RO+, negative for both CD4 and CD8a which is weird
+  "5" = "CD8+ Memory T Cell",  # CD45RO and CD138 also elevated
+  "6" = "Treg, Naive",  # FoxP3+, everything else strongly negative
+  "7" = "CD8+ Naive T Cell" # CD8a sole positive marker, everything else negative
+)
+
+if (!any(tcell_subannotation == "PLACEHOLDER") &&
+    length(tcell_subannotation) == nlevels(spe_tcell$tcell_subclusters)) {
+  spe_tcell$sub_celltype <- tcell_subannotation[as.character(spe_tcell$tcell_subclusters)]
+  spe_tcell$sub_celltype <- factor(spe_tcell$sub_celltype, levels = unique(tcell_subannotation))
+  cat("Subcluster annotation applied.\n")
+  print(table(spe_tcell$sub_celltype, useNA = "ifany"))
+} else {
+  cat("Fill in tcell_subannotation above before proceeding",
+      "-- check length matches nlevels(spe_tcell$tcell_subclusters).\n")
+}
+```
+
+```{r umap-celltype, fig.width=10, fig.height=8}
+if ("sub_celltype" %in% colnames(colData(spe_tcell))) {
+  p_sub_celltype <- dittoDimPlot(spe_tcell, var = "sub_celltype",
+                                  reduction.use = "UMAP_sub",
+                                  size = 0.4, do.label = TRUE, labels.size = 3.5) +
+    ggtitle("T Cell Subset: UMAP colored by Subcluster Cell Type") +
+    theme(legend.position = "right")
+  print(p_sub_celltype)
+} else {
+  cat("Run the annotate chunk first.\n")
+}
+```
+
+# 8. Violin Plots per Subcluster
 
 ```{r violin-fn, fig.width=14, fig.height=6}
 make_violinplot <- function(spe, assay_name, cluster_col, marker_set, title, ncol = 3) {
@@ -223,43 +280,50 @@ p_violin_admixture <- make_violinplot(spe_tcell, "scaled_0100", "tcell_subcluste
 print(p_violin_admixture)
 ```
 
-# 8. Heatmap: All Subclusters
+# 9. Heatmap: All Markers, Labeled by Subcluster Name
 
-```{r heatmap-all, fig.width=12, fig.height=8}
-all_clusters <- levels(spe_tcell$tcell_subclusters)
+Remade from the first-pass heatmap to (1) use the full marker panel rather
+than just the curated lineage/state/admixture subset, and (2) label
+columns by annotated subcluster name (Section 7) instead of numeric ID.
 
-mean_expr_all <- sapply(all_clusters, function(cl) {
-  idx <- which(spe_tcell$tcell_subclusters == cl)
-  rowMeans(assay(spe_tcell, "scaled_0100")[tcell_markers, idx, drop = FALSE])
+```{r heatmap-all-named, fig.width=12, fig.height=14}
+all_panel_markers <- rownames(spe_tcell)
+
+celltype_levels <- levels(spe_tcell$sub_celltype)
+
+mean_expr_all <- sapply(celltype_levels, function(ct) {
+  idx <- which(spe_tcell$sub_celltype == ct)
+  rowMeans(assay(spe_tcell, "scaled_0100")[all_panel_markers, idx, drop = FALSE])
 })
 
-marker_order <- tcell_markers[hclust(dist(mean_expr_all))$order]
+marker_order <- all_panel_markers[hclust(dist(mean_expr_all))$order]
 
-cluster_sizes <- table(spe_tcell$tcell_subclusters)
-cluster_labels <- paste0(all_clusters, "\n(n=", cluster_sizes[all_clusters], ")")
-names(cluster_labels) <- all_clusters
+celltype_sizes <- table(spe_tcell$sub_celltype)
+celltype_labels <- paste0(celltype_levels, "\n(n=", celltype_sizes[celltype_levels], ")")
+names(celltype_labels) <- celltype_levels
 
 heatmap_df <- as.data.frame(mean_expr_all) |>
   rownames_to_column("marker") |>
-  pivot_longer(-marker, names_to = "subcluster", values_to = "mean_expr")
+  pivot_longer(-marker, names_to = "sub_celltype", values_to = "mean_expr")
 
-heatmap_df$marker     <- factor(heatmap_df$marker, levels = marker_order)
-heatmap_df$subcluster <- factor(heatmap_df$subcluster, levels = all_clusters)
+heatmap_df$marker       <- factor(heatmap_df$marker, levels = marker_order)
+heatmap_df$sub_celltype <- factor(heatmap_df$sub_celltype, levels = celltype_levels)
 
-p_heatmap <- ggplot(heatmap_df, aes(x = subcluster, y = marker, fill = mean_expr)) +
+p_heatmap_named <- ggplot(heatmap_df, aes(x = sub_celltype, y = marker, fill = mean_expr)) +
   geom_tile(color = "white") +
-  geom_text(aes(label = round(mean_expr, 2)), size = 3) +
+  geom_text(aes(label = round(mean_expr, 2)), size = 2.5) +
   scale_fill_gradient2(low = "steelblue", mid = "white", high = "firebrick",
                        midpoint = 0, name = "Mean\nZ-score") +
-  scale_x_discrete(labels = cluster_labels) +
-  labs(title = "Mean Marker Expression: All T Cell Subclusters",
+  scale_x_discrete(labels = celltype_labels) +
+  labs(title = "Mean Marker Expression: All Markers, Annotated T Cell Subclusters",
        x = "Subcluster (cell count)", y = "Marker") +
-  theme_bw(base_size = 11) +
-  theme(panel.grid = element_blank())
-print(p_heatmap)
+  theme_bw(base_size = 10) +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 10))
+print(p_heatmap_named)
 ```
 
-# 9. Statistical Marker Discovery (findMarkers)
+# 10. Statistical Marker Discovery (findMarkers)
 
 ```{r findmarkers}
 markers_de <- findMarkers(spe_tcell,
@@ -278,8 +342,8 @@ all_markers_df <- do.call(rbind, lapply(levels(spe_tcell$tcell_subclusters), fun
   )
 }))
 
-dir.create(dirname(findmarkers_path), recursive = TRUE, showWarnings = FALSE)
-write.csv(all_markers_df, findmarkers_path, row.names = FALSE)
+#dir.create(dirname(findmarkers_path), recursive = TRUE, showWarnings = FALSE)
+#write.csv(all_markers_df, findmarkers_path, row.names = FALSE)
 
 top1_summary <- do.call(rbind, lapply(levels(spe_tcell$tcell_subclusters), function(cl) {
   sub <- all_markers_df[all_markers_df$subcluster == cl & all_markers_df$logFC > 1.0, ]
@@ -310,7 +374,7 @@ for (cl in levels(spe_tcell$tcell_subclusters)) {
 }
 ```
 
-# 10. Quality/Origin Checks
+# 11. Quality/Origin Checks
 
 Following the same diagnostic pattern used for cluster 15 and the B cell
 subclustering -- check total counts, cell area, and patient composition for
@@ -338,29 +402,39 @@ print(quality_check)
 ```
 Mean area is nearly identical and total counts are only modestly lower (about 10% less). So this looks like a genuine (lower signal) resting memory T cell population, not a staining artifact. 
 
-## Intensity confound check
+## Subcluster 4: Lineage Ambiguity Check
 
-```{r checkpoint-intensity-check-sub1}
-# Subcluster 1 shows heavy co-elevation of CD45RO/CD138/TIGIT/TIM3/PD1/CTLA4 --
-# given the CD138/TIM3 intensity-confound pattern found in cluster 15, check
-# whether this co-elevation reflects real coordinated checkpoint biology or
-# just generic high signal intensity
-checkpoint_markers <- c("PD1", "TIM3", "TIGIT", "CTLA4", "CD138")
-checkpoint_markers <- checkpoint_markers[checkpoint_markers %in% rownames(spe_tcell)]
+```{r lineage-ambiguity}
 
-sub1_mask <- spe_tcell$tcell_subclusters == "1"
+# CD4/CD8a/FoxP3 are all near-zero for subcluster 4 despite elevated CD45RO,
+# with CD1c (admixture marker) also elevated -- checking whether this is a
+# genuine double-negative memory population or myeloid contamination/artifact
+sub4_mask <- spe_tcell$tcell_subclusters == "4"
 
-expr_df_sub1 <- as.data.frame(t(assay(spe_tcell, "counts")[checkpoint_markers, sub1_mask]))
-expr_df_sub1$total_counts <- spe_tcell$total_counts[sub1_mask]
+lineage_check_markers <- c("CD4", "CD8a", "FoxP3", "CCR7", "CD1c", "CD11c", "CD68")
+lineage_check_markers <- lineage_check_markers[lineage_check_markers %in% rownames(spe_tcell)]
 
-cat("Subcluster 1: checkpoint marker correlations, including total_counts:\n")
-print(cor(expr_df_sub1, method = "spearman"))
+sub4_expr <- rowMeans(assay(spe_tcell, "scaled_0100")[lineage_check_markers, sub4_mask, drop = FALSE])
+cat("Subcluster 4 -- mean expression (lineage + admixture markers):\n")
+print(round(sub4_expr, 2))
+
+# Same area/total-counts comparison used for the earlier flagged cluster
+sub4_quality <- colData(spe_tcell) |>
+  as.data.frame() |>
+  mutate(group = ifelse(tcell_subclusters == "4", "Subcluster 4", "Other subclusters")) |>
+  group_by(group) |>
+  summarise(
+    n = n(),
+    mean_area = mean(area, na.rm = TRUE),
+    median_area = median(area, na.rm = TRUE),
+    mean_total_counts = mean(total_counts, na.rm = TRUE),
+    median_total_counts = median(total_counts, na.rm = TRUE)
+  )
+cat("\nSubcluster 4 vs. rest -- area/total counts:\n")
+print(sub4_quality)
+
 ```
-PD1 and TIGIT correlate strongly with each other (r=0.42) much more than either correlates with total_counts. This is good evidence that PD1/TIGIT co-expression is real, coordinated checkpoint biology and not an intensity artifact. 
-
-TIM3 is still correlating far more with total_counts (0.41) than with any other checkpoint marker. TIM3 negatively correlates with PD1 and TIGIT, meaning cells with high TIM3 tend to have lower PD1/TIGIT. This is the same intensity-confound signature identified earlier in Cluster 15.
-
-CD138 sits in between, with weak-to-moderate correlations with everything, not clearly artifact driven but not strongly confirmed either. 
+Subcluster 4 is likely a genuine biological population, not an artifact. It's negative for both CD4 and CD8a, which is an uncommon category of T cells.
 
 ## Patient Composition heatmap
 
@@ -390,57 +464,6 @@ ht_patient <- Heatmap(
 draw(ht_patient, column_title = "T Cell Subcluster Composition by Patient (row-normalized %)")
 ```
 
-# 11. Manual Subcluster Annotation
-
-Fill in based on violin plots (chunk 7), heatmap (chunk 8), findMarkers
-(chunk 9), and quality/patient checks (chunk 10) above.
-
-Resting: T cell in its baseline, stand-by state. It hasn't recently encountered its target antigen or received the signals that would trigger it into action. Characterized by low levels of markers of activation, proliferation, and effector function. 
-
-Activated: T cell that has recognized its antigen or received other activating signals and is not actively engaged. It's proliferating, producing cytokines, and upregulating markers that support its immune function. 
-
-```{r annotate}
-tcell_subannotation <- c(
-  "1" = "CD4+ T Cell, Exhaustion-leaning", # PD1+/TIGIT+
-  "2" = "CD4+ T Cell, Activated",  # CD45RO+, TIM3/CD138 also elevated due to intensity-confound
-  "3" = "Treg, Activated",  # FoxP3+, CD4 and CD45RO also co-elevated
-  "4" = "Memory T Cell",  # CD45RO+, CD1c+ (need to investigate that)
-  "5" = "CD8+ T Cell, Activated",  # CD45RO and CD138 also elevated (activation)
-  "6" = "Treg, Resting",  # FoxP3+, everything else strongly negative
-  "7" = "CD8+ T Cell, Resting" # CD8a sole positive marker, everything else negative
-)
-
-if (!any(tcell_subannotation == "PLACEHOLDER") &&
-    length(tcell_subannotation) == nlevels(spe_tcell$tcell_subclusters)) {
-  spe_tcell$sub_celltype <- tcell_subannotation[as.character(spe_tcell$tcell_subclusters)]
-  spe_tcell$sub_celltype <- factor(spe_tcell$sub_celltype, levels = unique(tcell_subannotation))
-  cat("Subcluster annotation applied.\n")
-  print(table(spe_tcell$sub_celltype, useNA = "ifany"))
-} else {
-  cat("Fill in tcell_subannotation above before proceeding",
-      "-- check length matches nlevels(spe_tcell$tcell_subclusters).\n")
-}
-```
-
-```{r umap-celltype, fig.width=10, fig.height=8}
-if ("sub_celltype" %in% colnames(colData(spe_tcell))) {
-  p_sub_celltype <- dittoDimPlot(spe_tcell, var = "sub_celltype",
-                                  reduction.use = "UMAP_sub",
-                                  size = 0.4, do.label = TRUE, labels.size = 3.5) +
-    ggtitle("T Cell Subset: UMAP colored by Subcluster Cell Type") +
-    theme(legend.position = "right")
-  print(p_sub_celltype)
-} else {
-  cat("Run the annotate chunk first.\n")
-}
-```
-
-### Quick Check: Is subcluster 3 genuinely cluster 15 derived? Is subcluster 6 genuinely cluster 5 derived?
-```{r}
-table(spe_tcell$broad_clusters[spe_tcell$tcell_subclusters == "3"])
-table(spe_tcell$broad_clusters[spe_tcell$tcell_subclusters == "6"])
-```
-
 # 12. Save Subclustered/Annotated Object
 
 ```{r save}
@@ -459,11 +482,18 @@ cat("Saved T cell subcluster object to:", out_path, "\n")
 - k=20 used for Louvain clustering per team convention (matching the B
   cell/plasma subclustering approach), rather than k=10 used in the
   standalone cluster 15 pass.
-- This is the first joint pass across clusters 5/6/7, which haven't been
-  individually vetted for low-quality/artifact subpopulations the way
-  cluster 15 has -- pay close attention to chunk 10's checks in case any
-  new subcluster shows the same low-signal or patient-driven signature
-  found previously in cluster 15 and the B cell/plasma subclustering.
-- Fill in `check_clusters` (chunk 10) and `tcell_subannotation` (chunk 11)
-  once actual heatmap/findMarkers/quality-check output is reviewed --
-  placeholders won't auto-resolve.
+- Round-2 changes from PI feedback: added CD45RA to the state/checkpoint
+  marker set (Section 6, flows into the violin panel in Section 8);
+  remade the marker heatmap (Section 9) with the full marker panel labeled
+  by annotated subcluster name rather than numeric ID; dropped the
+  intensity-confound correlation check; relabeled subclusters 6/7 from
+  "Resting" to "Naive" and subclusters 2/3/5 from "Activated" to "Memory"
+  given their CD45RO elevation (Section 7).
+- Annotation (Section 7) was moved earlier in this revision, right after
+  clustering, so the heatmap and everything downstream can reference
+  subcluster names -- in the original first-pass notebook it came after
+  the heatmap/findMarkers/quality checks, since those were needed to
+  decide the annotation in the first place.
+- The CD45RO-elevated -> "Memory" relabeling was applied to subclusters
+  2, 3, and 5 based on their existing comments; double check this matches
+  intent, since it wasn't given as an explicit 1:1 mapping.

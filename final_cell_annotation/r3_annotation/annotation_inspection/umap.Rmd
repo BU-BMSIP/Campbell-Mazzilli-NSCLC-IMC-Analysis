@@ -1,0 +1,73 @@
+## UMAP Visualization — Final Cell Type Annotation (r3)
+
+```{r umap-setup, message=FALSE, warning=FALSE}
+library(SpatialExperiment)
+library(dittoSeq)
+library(ggplot2)
+
+analysis_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/final_cell_annotation"
+spe_path <- file.path(analysis_path, "r3_annotation", "spe_final_celltype_r3.rds")
+spe <- readRDS(spe_path)
+
+if (is(colData(spe)$patient_id, "Rle")) {
+  colData(spe)$patient_id <- as.character(as.vector(colData(spe)$patient_id))
+}
+```
+
+```{r umap-celltype, fig.width=10, fig.height=7}
+p_umap_celltype <- dittoDimPlot(
+  spe,
+  var = "final_celltype",
+  reduction.use = "UMAP_harmony",
+  size = 0.5,
+  do.label = TRUE,
+  labels.size = 3,
+  legend.size = 3
+) + 
+  ggtitle("UMAP (Harmony): Final Cell Type Annotation") +
+  guides(color = guide_legend(override.aes = list(size = 3), ncol = 1)) +
+  theme(legend.text = element_text(size = 7))
+
+print(p_umap_celltype)
+```
+
+```{r umap-patient, fig.width=8, fig.height=6}
+p_umap_patient <- dittoDimPlot(
+  spe,
+  var = "patient_id",
+  reduction.use = "UMAP_harmony",
+  size = 0.5
+) + ggtitle("UMAP (Harmony): Patient ID")
+
+print(p_umap_patient)
+```
+
+```{r umap-disease-state, fig.width=8, fig.height=6}
+p_umap_disease <- dittoDimPlot(
+  spe,
+  var = "disease_state",
+  reduction.use = "UMAP_harmony",
+  size = 0.5
+) + ggtitle("UMAP (Harmony): Disease State")
+
+print(p_umap_disease)
+```
+
+```{r umap-broad-celltype, fig.width=8, fig.height=6}
+# useful for comparing broad vs final annotation side by side
+p_umap_broad <- dittoDimPlot(
+  spe,
+  var = "broad_celltype",
+  reduction.use = "UMAP_harmony",
+  size = 0.5,
+  do.label = TRUE,
+  labels.size = 3
+) + ggtitle("UMAP (Harmony): Broad Cell Type Annotation")
+
+print(p_umap_broad)
+```
+
+```{r}
+print(table(colData(spe)$final_celltype))
+```
+

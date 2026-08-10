@@ -25,6 +25,9 @@ suppressPackageStartupMessages({
   library(pheatmap)
   library(janitor)
   library(kableExtra)
+  library(RColorBrewer)
+  library(scales)
+  library(tidytext)  # reorder_within() / scale_x_reordered() for per-facet sorting in 8a-facet
 })
 ```
 ---
@@ -37,7 +40,6 @@ spatial_graph_path <- file.path(analysis_path, "spe_spatial_graph_r3.rds")
 niche_path         <- file.path(analysis_path, "niche_k50_thresh20")
 
 niche_spe_path      <- file.path(niche_path, "spe_niche.rds")
-sccomp_nstatus_path <- file.path(niche_path, "sccomp_nstatus.rds")
 sccomp_stage_path   <- file.path(niche_path, "sccomp_stage.rds")
 
 composition_out_path   <- file.path(niche_path, "niche_avg_composition.csv")
@@ -50,8 +52,7 @@ top_celltypes_out_path <- file.path(niche_path, "niche_top_celltypes.csv")
 
 ```{r load}
 spe <- readRDS(niche_spe_path)
-sccomp_niche_nstatus <- readRDS(sccomp_nstatus_path)
-sccomp_niche_stage   <- readRDS(sccomp_stage_path)
+sccomp_niche_stage <- readRDS(sccomp_stage_path)
 ```
 
 ---
@@ -100,24 +101,15 @@ if (length(setdiff_raw_clean) == 0 && length(setdiff_clean_raw) == 0) {
 
 ## 3. Identify significant niches
 
-Significant niches (FDR < 0.05) from each model, unioned.
+Significant niches (FDR < 0.05) from the Stage model.
 
 ```{r significant-niches}
-sig_nstatus <- sccomp_niche_nstatus |>
-  filter(factor == "N_status", c_FDR < 0.05) |>
-  pull(Niche) |>
-  unique()
-
-sig_stage <- sccomp_niche_stage |>
+sig_niches <- sccomp_niche_stage |>
   filter(factor == "Stage", c_FDR < 0.05) |>
   pull(Niche) |>
   unique()
 
-sig_niches <- union(sig_nstatus, sig_stage)
-
-cat("Significant niches (N-status):", length(sig_nstatus), "\n")
-cat("Significant niches (Stage):", length(sig_stage), "\n")
-cat("Significant niches (union):", length(sig_niches), "\n")
+cat("Significant niches (Stage):", length(sig_niches), "\n")
 print(sort(as.numeric(as.character(sig_niches))))
 ```
 
@@ -125,27 +117,20 @@ print(sort(as.numeric(as.character(sig_niches))))
 
 ## 3a. Significant niches: effect size and FDR
 
-Table of every niche x contrast pair that cleared FDR < 0.05 in either
-model, showing which factor (N-status vs. Stage) each significant
-niche was found under, sorted by FDR, with MCMC convergence
-diagnostics (`c_rhat`, `c_ess_bulk`, `c_ess_tail`) and `c_pH0`
-included for reference.
+Table of every niche x contrast pair that cleared FDR < 0.05 under the
+Stage model, sorted by FDR, with MCMC convergence diagnostics
+(`c_rhat`, `c_ess_bulk`, `c_ess_tail`) and `c_pH0` included for
+reference.
 
 ```{r significant-niches-table}
-sig_nstatus_table <- sccomp_niche_nstatus |>
-  filter(factor == "N_status", c_FDR < 0.05) |>
-  select(Niche, factor, parameter, c_effect, c_FDR, c_pH0, c_rhat, c_ess_bulk, c_ess_tail)
-
-sig_stage_table <- sccomp_niche_stage |>
+sig_niches_table <- sccomp_niche_stage |>
   filter(factor == "Stage", c_FDR < 0.05) |>
-  select(Niche, factor, parameter, c_effect, c_FDR, c_pH0, c_rhat, c_ess_bulk, c_ess_tail)
-
-sig_niches_table <- bind_rows(sig_nstatus_table, sig_stage_table) |>
+  select(Niche, factor, parameter, c_effect, c_FDR, c_pH0, c_rhat, c_ess_bulk, c_ess_tail) |>
   arrange(c_FDR)
 
 sig_niches_table |>
   as.data.frame() |>
-  knitr::kable(digits = 3, caption = "Significant niches: effect size and FDR (N-status and Stage models)")
+  knitr::kable(digits = 3, caption = "Significant niches: effect size and FDR (Stage model)")
 ```
 
 ---
@@ -250,8 +235,8 @@ niche_max_dominance <- niche_patient_dominance |>
     max_patient_share = round(pct_of_niche, 1)
   )
 
-# Niche + FDR only (not the full 3a table) -- lowest FDR per niche across
-# both models, since a niche can appear under both N_status and Stage
+# Niche + FDR only (not the full 3a table) -- lowest FDR per niche under
+# the Stage model
 niche_min_fdr <- sig_niches_table |>
   mutate(Niche = as.character(Niche)) |>
   group_by(Niche) |>
@@ -320,7 +305,7 @@ niche_composition <- neighbor_mat |>
   summarise(across(everything(), mean), .groups = "drop")
 
 # Sanity check: confirm no mangling crept in before this gets used
-# downstream in 4b, 5, and 6.
+# downstream in 4b, 5, 6, and 8.
 mangled_check <- grepl("\\.", setdiff(colnames(niche_composition), "Niche"))
 cat("niche_composition mangled column check -- any TRUE below means trouble:\n")
 print(any(mangled_check))
@@ -393,10 +378,6 @@ ggplot(niche_long, aes(x = Niche, y = cell_type, size = mean_fraction, color = m
 Displayed inline only -- not saved to disk.
 
 ```{r heatmap}
-suppressPackageStartupMessages({
-  library(RColorBrewer)
-})
-
 niche_composition_sig <- niche_composition |>
   filter(Niche %in% sig_niches)
 
@@ -439,9 +420,19 @@ heat_colors <- colorRampPalette(rev(brewer.pal(11, "RdBu")))(100)
 cell_w <- 14   # points per column (cell type)
 cell_h <- 14   # points per row (niche)
 
-# silent = TRUE builds the heatmap grob without drawing it anywhere yet,
-# so it can be drawn inline in the next chunk.
-ph <- pheatmap(
+# IMPORTANT: call pheatmap::pheatmap() explicitly with the namespace.
+# ComplexHeatmap (loaded elsewhere in this pipeline) also exports a
+# function called pheatmap() that wraps its own S4 Heatmap class -- if
+# it's loaded after the pheatmap package, it masks pheatmap::pheatmap()
+# and silently returns an S4 object instead of the expected list with a
+# $gtable slot, causing "$ operator not defined for this S4 class" when
+# drawn below. Namespacing the call sidesteps the masking entirely.
+#
+# angle_col must also be passed as a character string from pheatmap's
+# fixed set ("0", "45", "90", "270", "315") -- it's matched internally
+# via match.arg(), so a bare numeric 45 fails with "'arg' must be NULL
+# or a character vector".
+ph <- pheatmap::pheatmap(
   niche_mat_scaled,
   scale = "none",
   color = heat_colors,
@@ -452,22 +443,31 @@ ph <- pheatmap(
   cellheight = cell_h,
   labels_col = colnames(niche_mat_scaled),
   border_color = NA,
-  angle_col = 45,
-  main = "Average neighborhood composition: significant niches only",
+  angle_col = "45",
+  main = "Average neighborhood composition: significant niches only (Stage)",
   silent = TRUE
 )
 
 cat("Heatmap grid size:", nrow(niche_mat_scaled), "rows x", ncol(niche_mat_scaled), "cols\n")
+cat("Class of ph:", paste(class(ph), collapse = ", "), "\n")
 ```
 
 ```{r heatmap-inline, fig.width=12, fig.height=10}
 # Draw directly from the grob rather than relying on print.pheatmap()
 # dispatch, which isn't guaranteed to call grid.draw() consistently
 # across pheatmap versions -- this is what actually renders the plot.
+# Defensive branch: if ph still comes back as an S4 object (e.g. some
+# other masking path), fall back to ComplexHeatmap::draw() instead of
+# erroring on $gtable.
 grid::grid.newpage()
-grid::grid.draw(ph$gtable)
-grid::grid.text("Z-score", x = 0.98, y = 0.5, rot = 270,
-                 gp = grid::gpar(fontsize = 10))
+
+if (isS4(ph)) {
+  ComplexHeatmap::draw(ph)
+} else {
+  grid::grid.draw(ph$gtable)
+  grid::grid.text("Z-score", x = 0.98, y = 0.5, rot = 270,
+                   gp = grid::gpar(fontsize = 10))
+}
 ```
 
 ---
@@ -534,15 +534,19 @@ Assembles a `#Niche N: ...` comment per significant niche in the
 convention used for cluster annotation, combining:
 
 - **Composition** (Section 6) -- the dominant cell type and its %
-- **Statistical context** (Section 3a) -- which factor(s) flagged it,
-  effect direction, and FDR
+- **Statistical context** (Section 3a) -- effect direction and FDR
+  under the Stage model
 - **Patient-dominance flag** (Section 3c) -- whether the dominant
   cell type is one of the six flagged annotations, and how much of
   the niche's total cells that single patient represents
 
 These are drafts, not final annotations -- review each one, especially
 any flagged for patient dominance, before committing it to the
-pipeline.
+pipeline. Note that Benign, IB, and IIA stage contrasts each rest on a
+single patient, so any "significant" effect for those specific
+contrasts reflects a within-patient ROI comparison rather than a
+population-level signal -- flag this explicitly when reviewing drafts
+for those stages.
 
 ```{r auto-annotation-drafts}
 # Effect direction per niche: take the same lowest-FDR row used in 3c
@@ -598,4 +602,280 @@ writeLines(niche_annotation_drafts$draft_comment, annotation_drafts_out_path)
 cat("Saved draft annotation comments to:", annotation_drafts_out_path, "\n\n")
 
 cat(paste(niche_annotation_drafts$draft_comment, collapse = "\n\n"))
+```
+
+---
+
+## 8. Stacked bar plot: cell type composition per significant niche
+
+Color encodes cell type annotation; bar segment size (within each
+niche's stacked column) encodes the mean proportion of that cell type
+in that niche. Uses the unfiltered `niche_composition_sig` (not the
+range-filtered version from Section 5), so each niche's stack sums to
+~100%.
+
+---
+
+## 8a. Stacked bar plot: top 5 cell types per niche (collapsed to "Other")
+
+Same stacked-by-niche layout as before, but each niche's bar only
+breaks out its own top 5 cell types individually; everything else is
+collapsed into a single "Other" segment. Kept cell types are the
+*union* of each niche's top 5 (so the legend is still fewer than the
+full ~38 annotations, but a type that's top-5 in one niche keeps its
+own color everywhere it appears). Stack order and legend order are
+fixed by overall abundance (most abundant first) so segments line up
+consistently across niches, with "Other" always pinned to the bottom.
+Stack still sums to ~100% per niche.
+
+Colors come from Kelly's 22 colors of maximum contrast (public-domain
+reference palette; white/black dropped since they clash with the plot
+background/gridlines) rather than an HCL hue sweep -- varying hue
+*and* chroma/luminance together gives much better separation between
+adjacent legend entries than evenly-spaced hues at fixed chroma/
+luminance, which still put similarly-toned colors next to each other.
+Falls back to hue-swept HCL only if `n_kept` exceeds the 20-color pool.
+
+```{r stacked-bar-top5, fig.width=14, fig.height=8}
+top_n_stack <- 5
+
+# Global top 5 cell types by overall mean abundance across significant
+# niches (not a per-niche union) -- this caps the legend at
+# top_n_stack + 1 ("Other") entries total, rather than the ~20 that
+# resulted from unioning each niche's own top 5. Every niche's bar is
+# still built from the same fixed 5 categories, so segment colors are
+# directly comparable niche-to-niche, and "Other" now absorbs a niche's
+# own dominant cell type whenever that type isn't in the global top 5.
+keep_celltypes_top5 <- niche_composition_sig |>
+  pivot_longer(-Niche, names_to = "cell_type", values_to = "mean_fraction") |>
+  group_by(cell_type) |>
+  summarise(overall_mean = mean(mean_fraction), .groups = "drop") |>
+  slice_max(overall_mean, n = top_n_stack, with_ties = FALSE) |>
+  arrange(desc(overall_mean)) |>
+  pull(cell_type)
+
+celltype_rank_top5 <- keep_celltypes_top5  # already ranked by overall_mean above
+
+celltype_levels_top5 <- c(celltype_rank_top5, "Other")
+
+niche_long_sig_top5 <- niche_composition_sig |>
+  pivot_longer(-Niche, names_to = "cell_type", values_to = "mean_fraction") |>
+  mutate(cell_type = ifelse(cell_type %in% keep_celltypes_top5, cell_type, "Other")) |>
+  group_by(Niche, cell_type) |>
+  summarise(mean_fraction = sum(mean_fraction), .groups = "drop") |>
+  mutate(
+    cell_type = factor(cell_type, levels = celltype_levels_top5),
+    Niche = factor(as.character(Niche),
+                    levels = as.character(sort(as.numeric(as.character(sig_niches)))))
+  )
+
+cat("Cell types kept (global top", top_n_stack, "by overall abundance):",
+    length(keep_celltypes_top5), "+ Other\n")
+print(keep_celltypes_top5)
+
+# Kelly's colors of maximum contrast (public domain reference palette),
+# minus white/black since those clash with the plot background and grid
+# lines. With only top_n_stack (5) categories now, this comfortably fits
+# within the pool -- no HCL fallback needed at this scale, but kept for
+# robustness if top_n_stack is increased later.
+kelly_colors <- c(
+  "#F3C300", "#875692", "#F38400", "#A1CAF1", "#BE0032",
+  "#C2B280", "#848482", "#008856", "#E68FAC", "#0067A5",
+  "#F99379", "#604E97", "#F6A600", "#B3446C", "#DCD300",
+  "#882D17", "#8DB600", "#654522", "#E25822", "#2B3D26"
+)
+
+n_kept <- length(celltype_rank_top5)
+
+if (n_kept <= length(kelly_colors)) {
+  celltype_colors_top5 <- kelly_colors[seq_len(n_kept)]
+} else {
+  n_extra <- n_kept - length(kelly_colors)
+  hues <- seq(15, 375, length.out = n_extra + 1)[seq_len(n_extra)]
+  extra_colors <- grDevices::hcl(h = hues, c = 90, l = 45)
+  celltype_colors_top5 <- c(kelly_colors, extra_colors)
+}
+
+names(celltype_colors_top5) <- celltype_rank_top5
+celltype_colors_top5["Other"] <- "grey85"
+
+
+ggplot(niche_long_sig_top5, aes(x = Niche, y = mean_fraction, fill = cell_type)) +
+  geom_col(position = "stack", color = "white", linewidth = 0.15) +
+  scale_fill_manual(values = celltype_colors_top5, breaks = celltype_levels_top5) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                      expand = expansion(mult = c(0, 0.02))) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 8),
+    legend.position = "right",
+    legend.key.size = unit(0.35, "cm"),
+    legend.text = element_text(size = 8),
+    panel.grid.major.x = element_blank(),
+    plot.margin = margin(t = 10, r = 10, b = 10, l = 10)
+  ) +
+  guides(fill = guide_legend(ncol = 1)) +
+  labs(x = "Niche", y = "Proportion of cells", fill = "Cell type",
+       title = "Cell type composition per significant niche (Stage)",
+       subtitle = sprintf("Top %d cell types overall shown individually; remainder collapsed to Other", top_n_stack))
+```
+
+---
+
+## 8a-facet. Faceted small multiples: top 5 cell types per niche
+
+Same underlying data as 8a (`niche_long_sig_top5`), but laid out as
+one horizontal bar panel per niche instead of one stacked column per
+niche. Every bar starts at a shared zero baseline, so comparing
+proportions within a niche -- and roughly across niches -- is a length
+comparison rather than a segment-position comparison, which is what
+made 8a hard to read once a niche's top cell type wasn't the first
+segment in the stack.
+
+Bars are sorted within each panel (highest proportion at top) via
+`tidytext::reorder_within()`; cell type names are wrapped at 25
+characters since they now appear directly as axis text in every
+panel rather than only once in a shared legend, and long strings
+(e.g. "Plasma Cell, TIM3+ (CD138+TIM3+CD45RO-)") would otherwise
+overflow narrow facet columns.
+
+Trade-off vs. 8a: no shared legend and no "Other" segment, since each
+panel is self-contained and every one of its top-5 bars is already
+labeled by name -- there is no unlabeled remainder to fold in the way
+a stacked column has room for. If tracking one specific cell type's
+presence across niches at a glance matters more than within-niche
+readability, the dot plot in Section 4b (filtered to `sig_niches`)
+does that job better; this plot and 8a's stacked version aren't built
+for it.
+
+```{r stacked-bar-top5-facet-setup}
+niche_long_sig_top5_facet <- niche_long_sig_top5 |>
+  mutate(cell_type_wrapped = str_wrap(as.character(cell_type), width = 25))
+```
+
+```{r stacked-bar-top5-facet, fig.width=14, fig.height=12}
+ggplot(niche_long_sig_top5_facet,
+       aes(x = reorder_within(cell_type_wrapped, mean_fraction, Niche),
+           y = mean_fraction, fill = cell_type)) +
+  geom_col(color = "white", linewidth = 0.1, show.legend = FALSE) +
+  scale_fill_manual(values = celltype_colors_top5) +
+  scale_x_reordered() +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  coord_flip() +
+  facet_wrap(~ Niche, scales = "free_y", ncol = 5) +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(size = 6),
+    strip.text = element_text(size = 8, face = "bold"),
+    plot.margin = margin(t = 10, r = 10, b = 10, l = 10)
+  ) +
+  labs(x = NULL, y = "Proportion of cells",
+       title = "Cell type composition per significant niche (Stage)",
+       subtitle = sprintf("Top %d cell types per niche shown; sorted within each panel", top_n_stack))
+```
+
+---
+
+## 8b. Bar plot: top 10 cell types overall, grouped by niche
+
+Instead of stacking every cell type per niche, this restricts to the
+10 annotations with the highest peak proportion in any significant
+niche, then shows each one's proportion across niches as grouped bars.
+Complementary to 8a: 8a shows what each niche is made of, 8b shows how
+a given annotation's presence varies across niches.
+
+Niche colors also draw from the Kelly palette (same rationale as 8a)
+instead of `hcl.colors(..., "Dark 3")`, since niches are the encoded
+category here and benefit from the same separation. Facet fallback
+(`use_facet`) still applies when there are too many niches to dodge
+readably, in which case per-niche color doesn't matter since each
+facet panel is colored by cell type instead.
+
+```{r stacked-bar-top10annot-setup}
+top_n_annot <- 10
+
+# Rank cell types by their single highest proportion in any significant niche
+top_celltypes_overall <- niche_composition_sig |>
+  pivot_longer(-Niche, names_to = "cell_type", values_to = "mean_fraction") |>
+  group_by(cell_type) |>
+  summarise(max_fraction = max(mean_fraction), .groups = "drop") |>
+  slice_max(max_fraction, n = top_n_annot, with_ties = FALSE) |>
+  pull(cell_type)
+
+niche_long_sig_top10annot <- niche_composition_sig |>
+  pivot_longer(-Niche, names_to = "cell_type", values_to = "mean_fraction") |>
+  filter(cell_type %in% top_celltypes_overall) |>
+  mutate(
+    cell_type = factor(cell_type, levels = rev(top_celltypes_overall)),
+    Niche = factor(as.character(Niche),
+                    levels = as.character(sort(as.numeric(as.character(sig_niches)))))
+  )
+
+n_niches_bar <- n_distinct(niche_long_sig_top10annot$Niche)
+cat("Significant niches shown:", n_niches_bar, "\n")
+
+# Same Kelly's colors of maximum contrast used in 8a -- reused here so
+# both figures share one distinct-color source instead of two different
+# palette strategies.
+kelly_colors <- c(
+  "#F3C300", "#875692", "#F38400", "#A1CAF1", "#BE0032",
+  "#C2B280", "#848482", "#008856", "#E68FAC", "#0067A5",
+  "#F99379", "#604E97", "#F6A600", "#B3446C", "#DCD300",
+  "#882D17", "#8DB600", "#654522", "#E25822", "#2B3D26"
+)
+
+if (n_niches_bar <= length(kelly_colors)) {
+  niche_colors <- kelly_colors[seq_len(n_niches_bar)]
+} else {
+  n_extra <- n_niches_bar - length(kelly_colors)
+  hues <- seq(15, 375, length.out = n_extra + 1)[seq_len(n_extra)]
+  niche_colors <- c(kelly_colors, grDevices::hcl(h = hues, c = 90, l = 45))
+}
+names(niche_colors) <- levels(niche_long_sig_top10annot$Niche)
+
+# If there are too many significant niches for dodge to stay readable,
+# fall back to faceting by niche instead of coloring by it.
+use_facet <- n_niches_bar > 15
+cat("Using facet layout instead of dodge:", use_facet, "\n")
+```
+
+```{r stacked-bar-top10annot, fig.width=14, fig.height=8}
+if (!use_facet) {
+  ggplot(niche_long_sig_top10annot, aes(x = cell_type, y = mean_fraction, fill = Niche)) +
+    geom_col(position = "dodge", color = "white", linewidth = 0.1) +
+    scale_fill_manual(values = niche_colors) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    coord_flip() +
+    theme_minimal() +
+    theme(
+      legend.position = "right",
+      legend.key.size = unit(0.35, "cm"),
+      legend.text = element_text(size = 7),
+      plot.margin = margin(t = 10, r = 10, b = 10, l = 10)
+    ) +
+    guides(fill = guide_legend(ncol = 1)) +
+    labs(x = "Cell type", y = "Proportion of cells", fill = "Niche",
+         title = sprintf("Top %d cell type annotations across significant niches (Stage)", top_n_annot),
+         subtitle = "Proportion of each annotation within each significant niche")
+} else {
+  ggplot(niche_long_sig_top10annot, aes(x = cell_type, y = mean_fraction, fill = cell_type)) +
+    geom_col(color = "white", linewidth = 0.1, show.legend = FALSE) +
+    scale_fill_manual(values = setNames(
+      if (top_n_annot <= length(kelly_colors)) kelly_colors[seq_len(top_n_annot)]
+      else c(kelly_colors, grDevices::hcl.colors(top_n_annot - length(kelly_colors), palette = "Dark 3")),
+      levels(niche_long_sig_top10annot$cell_type)
+    )) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    coord_flip() +
+    facet_wrap(~ Niche, ncol = 5) +
+    theme_minimal() +
+    theme(
+      axis.text.y = element_text(size = 6),
+      strip.text = element_text(size = 8),
+      plot.margin = margin(t = 10, r = 10, b = 10, l = 10)
+    ) +
+    labs(x = "Cell type", y = "Proportion of cells",
+         title = sprintf("Top %d cell type annotations across significant niches (Stage)", top_n_annot),
+         subtitle = "Faceted by niche -- proportion of each annotation within each niche")
+}
 ```

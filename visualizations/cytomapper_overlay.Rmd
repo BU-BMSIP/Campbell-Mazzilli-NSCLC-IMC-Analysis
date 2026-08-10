@@ -1,5 +1,5 @@
 ---
-title: "Images of Cell Populations - Patient13, ROI 1"
+title: "Images of Cell Populations - Patient18, ROI 1"
 author: "Tazein Shah"
 date: "`r Sys.Date()`"
 output:
@@ -28,10 +28,10 @@ library(tidyverse)
 
 ```{r load-data}
 base_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/steinbock"
-patient13_path <- file.path(base_path, "p13_results")
+patient18_path <- file.path(base_path, "p18_results")
 
-images <- loadImages(file.path(patient13_path, "img/"))
-masks  <- loadImages(file.path(patient13_path, "masks_deepcell/"), as.is = TRUE)
+images <- loadImages(file.path(patient18_path, "img/"))
+masks  <- loadImages(file.path(patient18_path, "masks_deepcell/"), as.is = TRUE)
 
 # plotCells needs img_id metadata on both images and masks to match against spe$sample_id
 mcols(images)$sample_id <- names(images)
@@ -94,12 +94,12 @@ metadata(spe)$color_vectors <- color_vectors
 
 # Level 1 Populations
 
-## Patient 13, ROI 1
+## Patient 18, ROI 1
 
 ### All cells
 
-```{r all-cells-patient13-roi1}
-img_ids <- "Patient_13T_ROI_001_1"
+```{r all-cells-patient18-roi1}
+img_ids <- "Patient_18T_ROI_001_1"
 
 cur_images <- images[img_ids]
 cur_images <- cytomapper::normalize(cur_images, separateImages = TRUE)
@@ -123,8 +123,8 @@ plotCells(
 Each section below highlights one broad cell type (gold) against all
 other cells (gray) for this ROI.
 
-```{r level1-overlays-patient13-roi1}
-img_ids <- "Patient_13T_ROI_001_1"
+```{r level1-overlays-patient18-roi1}
+img_ids <- "Patient_18T_ROI_001_1"
 
 cur_images <- images[img_ids]
 cur_images <- cytomapper::normalize(cur_images, separateImages = TRUE)

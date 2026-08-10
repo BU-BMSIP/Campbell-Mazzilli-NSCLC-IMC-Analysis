@@ -1,0 +1,209 @@
+---
+title: "Final Annotation Violin Plots by Cell Type Category"
+author: "Tazein Shah"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## 1. Load Libraries
+
+```{r libraries}
+library(SpatialExperiment)
+library(tidyverse)
+```
+
+## 2. Paths
+
+```{r paths}
+analysis_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/final_cell_annotation"
+
+spe_path <- file.path(analysis_path, "r3_annotation", "spe_final_celltype_r3.rds")
+```
+
+## 3. Load Final Annotated SPE
+
+```{r load-data}
+spe <- readRDS(spe_path)
+
+print(table(spe$final_celltype))
+```
+
+## 4. Group Final Cell Types into Broad Categories
+
+```{r categories}
+celltype_category <- c(
+  "B Cell (CD19+)"                                       = "B Cell/Plasma Cell",
+  "B Cell, Weak (CD19+)"                                 = "B Cell/Plasma Cell",
+  "B Cell/Plasma Cell, HLADRB-high (CD19+CD138+HLADRB+)" = "B Cell/Plasma Cell",
+  "Plasma Cell, Memory-like (Weak) (CD45RO+)"            = "B Cell/Plasma Cell",
+  "Plasma Cell, TIM3+ (CD138+TIM3+CD45RO-)"              = "B Cell/Plasma Cell",
+  "Plasmablast, Strongly Activated (CD38++)"             = "B Cell/Plasma Cell",
+  "Plasmablast/Activated B Cell (CD38+)"                 = "B Cell/Plasma Cell",
+  "Transitional B Cell/Plasmablast (CD19+CD138+HLADRB+)" = "B Cell/Plasma Cell",
+
+  "CD4+ Memory T Cell, Exhaustion-leaning"                = "T Cell",
+  "CD4+ Memory T Cell, Partial-exhausion"                 = "T Cell",
+  "CD8+ Memory T Cell"                                     = "T Cell",
+  "CD8+ Naive T Cell"                                      = "T Cell",
+  "Memory T Cell (Unresolved)"                             = "T Cell",
+  "Treg, Memory"                                            = "T Cell",
+  "Treg, Naive"                                             = "T Cell",
+
+  "cDC1"                                                  = "Myeloid",
+  "DC/mregDC"                                             = "Myeloid",
+  "DC/mregDC (Epi Adj)"                                   = "Myeloid",
+  "DC/mregDC (LAMP3-)"                                    = "Myeloid",
+  "DC/mregDC Weak"                                         = "Myeloid",
+  "Dendritic Cell (CD11c+)"                               = "Myeloid",
+  "Macrophage (CD68+)"                                    = "Myeloid",
+  "Macrophage, Antigen-Presenting (HLADRB+)"              = "Myeloid",
+  "Macrophage, M2-like (CD163+)"                          = "Myeloid",
+  "Macrophage, Mixed Signal (PDL1+)"                      = "Myeloid",
+  "Macrophage, Proliferating (HLADRB+)"                   = "Myeloid",
+  "Macrophage, Proliferating (MKI67+)"                    = "Myeloid",
+  "Monocyte (Generic)"                                    = "Myeloid",
+  "Monocyte (PD1+)"                                       = "Myeloid",
+  "Monocyte-Macrophage Transitional (CD14+)"              = "Myeloid",
+  "Monocyte-Macrophage, Unresolved"                       = "Myeloid",
+  "Monocyte, Unresolved"                                  = "Myeloid",
+  "PMN-MDSC"                                               = "Myeloid",
+
+  "Epithelial (EpCAM+)"                                   = "Epithelial/Stroma",
+  "Fibroblast/Stroma"                                     = "Epithelial/Stroma",
+  "Tumor Epithelial (Neuroendocrine)"                     = "Epithelial/Stroma",
+  "Tumor Epithelial (TTF1++)"                             = "Epithelial/Stroma",
+
+  "Mast Cell"                                             = "Other",
+  "Proliferating Cells"                                   = "Other"
+)
+
+spe$celltype_category <- celltype_category[as.character(spe$final_celltype)]
+```
+
+Flag anything that didn't map (hard stop, since NAs here silently break downstream subsetting):
+
+```{r check-unmapped}
+unmapped <- setdiff(unique(as.character(spe$final_celltype)), names(celltype_category))
+if (length(unmapped) > 0) {
+  stop("Unmapped final_celltype labels -- add these to celltype_category:\n",
+       paste(unmapped, collapse = "\n"))
+} else {
+  cat("All final_celltype labels mapped to a category.\n")
+}
+```
+
+## 5. Cell Counts by Category and Final Cell Type
+
+```{r counts-category}
+cat("Cell count by broad category:\n")
+print(table(spe$celltype_category, useNA = "ifany"))
+```
+
+## 6. Panel Markers (Excluding DNA/Membrane)
+
+```{r markers}
+exclude_channels <- c("DNA191", "DNA193", "Membrane")
+panel_markers <- setdiff(rownames(spe), exclude_channels)
+
+cat("Markers used for violin plots:", paste(panel_markers, collapse = ", "), "\n")
+```
+
+## 7. Violin Plot Function (One Plot Per Marker)
+
+```{r make-violinplot}
+make_violinplot_single_marker <- function(spe, assay_name, cluster_col, marker, title) {
+  expr_vec   <- assay(spe, assay_name)[marker, ]
+  cluster_id <- factor(spe[[cluster_col]])
+
+  plot_df <- data.frame(cluster = cluster_id, expr = expr_vec)
+
+  ggplot(plot_df, aes(x = cluster, y = expr, fill = cluster)) +
+    geom_violin(scale = "width", trim = TRUE, linewidth = 0.2) +
+    stat_summary(fun = median, geom = "point", size = 0.8, color = "black") +
+    labs(title = title, x = "Cell Type", y = "Z-score expression") +
+    theme_bw(base_size = 11) +
+    theme(
+      axis.text.x       = element_text(angle = 45, hjust = 1, size = 9),
+      panel.grid.major.x = element_blank(),
+      legend.position    = "none"
+    )
+}
+```
+
+## 8. Violin Plots per Category (One Plot per Marker)
+
+### B Cell/Plasma Cell
+
+```{r violin-bcell, fig.width=10, fig.height=5, results='asis'}
+spe_bcell_group <- spe[, spe$celltype_category == "B Cell/Plasma Cell"]
+spe_bcell_group$final_celltype <- droplevels(factor(spe_bcell_group$final_celltype))
+
+for (m in panel_markers) {
+  p <- make_violinplot_single_marker(spe_bcell_group, "scaled_0100", "final_celltype", m,
+                                     paste("B Cell/Plasma Cell:", m))
+  print(p)
+}
+```
+
+### T Cell
+
+```{r violin-tcell, fig.width=10, fig.height=5, results='asis'}
+spe_tcell_group <- spe[, spe$celltype_category == "T Cell"]
+spe_tcell_group$final_celltype <- droplevels(factor(spe_tcell_group$final_celltype))
+
+for (m in panel_markers) {
+  p <- make_violinplot_single_marker(spe_tcell_group, "scaled_0100", "final_celltype", m,
+                                     paste("T Cell:", m))
+  print(p)
+}
+```
+
+### Myeloid
+
+```{r violin-myeloid, fig.width=10, fig.height=5, results='asis'}
+spe_myeloid_group <- spe[, spe$celltype_category == "Myeloid"]
+spe_myeloid_group$final_celltype <- droplevels(factor(spe_myeloid_group$final_celltype))
+
+for (m in panel_markers) {
+  p <- make_violinplot_single_marker(spe_myeloid_group, "scaled_0100", "final_celltype", m,
+                                     paste("Myeloid:", m))
+  print(p)
+}
+```
+
+### Epithelial/Stroma
+
+```{r violin-epi-stroma, fig.width=10, fig.height=5, results='asis'}
+spe_epi_group <- spe[, spe$celltype_category == "Epithelial/Stroma"]
+spe_epi_group$final_celltype <- droplevels(factor(spe_epi_group$final_celltype))
+
+for (m in panel_markers) {
+  p <- make_violinplot_single_marker(spe_epi_group, "scaled_0100", "final_celltype", m,
+                                     paste("Epithelial/Stroma:", m))
+  print(p)
+}
+```
+
+### Other
+
+```{r violin-other, fig.width=10, fig.height=5, results='asis'}
+spe_other_group <- spe[, spe$celltype_category == "Other"]
+spe_other_group$final_celltype <- droplevels(factor(spe_other_group$final_celltype))
+
+for (m in panel_markers) {
+  p <- make_violinplot_single_marker(spe_other_group, "scaled_0100", "final_celltype", m,
+                                     paste("Other:", m))
+  print(p)
+}
+```

@@ -1,0 +1,93 @@
+---
+title: "Update Master Annotation: T Cell Subcluster Relabeling (r2 -> r3)"
+author: "Vaidehi Gupta"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+---
+
+Recodes the T cell subcluster labels in the master annotated object
+following PI feedback on naive/memory/exhaustion naming
+(`tcell_subclustering_2.Rmd`). No cell IDs or subcluster boundaries
+change here -- only the label text for cells already carrying the old
+T cell subcluster names.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+```
+
+# 1. Load Libraries
+
+```{r libraries}
+#.libPaths(c("/restricted/projectnb/camplab/home/vgupta7/R_libs", .libPaths()))
+
+library(tidyverse)
+library(SpatialExperiment)
+```
+
+# 2. Paths
+
+```{r paths}
+analysis_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis"
+
+r2_path <- file.path(analysis_path, "final_cell_annotation", "r2_annotation", "spe_final_celltype_r2.rds")
+r3_dir  <- file.path(analysis_path, "final_cell_annotation", "r3_annotation")
+r3_path <- file.path(r3_dir, "spe_final_celltype_r3.rds")
+```
+
+# 3. Load and Recode
+
+```{r recode}
+spe_final <- readRDS(r2_path)
+spe_final$final_celltype <- as.character(spe_final$final_celltype)
+
+cat("Cell counts before recoding (T cell labels only):\n")
+print(table(spe_final$final_celltype)[c(
+  "CD4+ T Cell, Exhaustion-leaning", "CD4+ T Cell, Activated", "Treg, Activated",
+  "Memory T Cell", "CD8+ T Cell, Activated", "Treg, Resting", "CD8+ T Cell, Resting"
+)])
+
+# old label (as currently stored) -> new label
+label_recode <- c(
+  "CD4+ T Cell, Exhaustion-leaning"  = "CD4+ Memory T Cell, Exhaustion-leaning",
+  "CD4+ T Cell, Activated"           = "CD4+ Memory T Cell, Partial-exhausion",
+  "Treg, Activated"                  = "Treg, Memory",
+  "Memory T Cell"                    = "Memory T Cell (Unresolved)",
+  "CD8+ T Cell, Activated"           = "CD8+ Memory T Cell",
+  "Treg, Resting"                    = "Treg, Naive",
+  "CD8+ T Cell, Resting"             = "CD8+ Naive T Cell"
+)
+
+still_present <- setdiff(names(label_recode), unique(spe_final$final_celltype))
+if (length(still_present) > 0) {
+  cat("\nWARNING -- these old labels weren't found, check spelling:\n")
+  print(still_present)
+}
+
+recode_hits <- spe_final$final_celltype %in% names(label_recode)
+spe_final$final_celltype[recode_hits] <- label_recode[spe_final$final_celltype[recode_hits]]
+spe_final$final_celltype <- factor(spe_final$final_celltype)
+
+cat("\nCells relabeled:", sum(recode_hits), "\n")
+cat("\nCell counts after recoding (new T cell labels only):\n")
+print(table(spe_final$final_celltype)[unname(label_recode)])
+```
+
+# 4. Save Updated Object
+
+```{r save}
+dir.create(r3_dir, recursive = TRUE, showWarnings = FALSE)
+saveRDS(spe_final, r3_path)
+cat("Saved updated object to:", r3_path, "\n")
+```
+
+# Notes
+
+- Only the 7 T cell subcluster labels are recoded here (see
+  `tcell_subclustering_2.Rmd` for the analysis behind the naming). All
+  other cell type labels are untouched.
+- `metadata(spe_final)$color_vectors`, if present, won't have entries for
+  the new label strings -- downstream scripts with auto-fill logic (e.g.
+  the cytomapper overlay Rmd) handle this gracefully, but anything with a
+  hardcoded color vector keyed to the old T cell names will need updating.
