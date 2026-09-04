@@ -1,0 +1,526 @@
+---
+title: "Niche Annotation: Composition Summary — Threshold 30"
+author: "Tazein Shah"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    code_folding: show
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 8)
+
+suppressPackageStartupMessages({
+  library(SpatialExperiment)
+  library(tidyverse)
+  library(pheatmap)
+  library(janitor)
+  library(kableExtra)
+  library(RColorBrewer)
+  library(scales)
+  library(tidytext)
+})
+```
+---
+
+## 1. Paths
+
+Threshold selected as 30 based on the expansion-threshold sweep
+(niche_sweep.Rmd): strongest ARI stability with neighboring thresholds
+and competitive significant-contrast counts. All objects here are
+loaded from the sweep's output -- nothing from niche generation or the
+Stage sccomp model is recomputed.
+
+```{r paths}
+analysis_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/spatial_analysis/run_3"
+sweep_path    <- file.path(analysis_path, "niche_sweep")
+niche_path    <- file.path(sweep_path, "k50_thresh30")
+
+niche_spe_path    <- file.path(niche_path, "spe_niche.rds")
+sccomp_stage_path <- file.path(niche_path, "sccomp_stage.rds")
+
+composition_out_path   <- file.path(niche_path, "niche_avg_composition.csv")
+top_celltypes_out_path <- file.path(niche_path, "niche_top_celltypes.csv")
+```
+
+---
+
+## 2. Load objects
+
+```{r load}
+spe <- readRDS(niche_spe_path)
+sccomp_niche_stage <- readRDS(sccomp_stage_path)
+
+cat("Cells:", ncol(spe), "\n")
+cat("Cell types:", nlevels(spe$final_celltype), "\n")
+cat("Niches:", nlevels(spe$Niche), "\n")
+```
+
+---
+
+## 2b. Diagnose cell type naming
+
+```{r diagnose-names}
+raw_names   <- colnames(spe$aggregatedNeighbors)
+clean_names <- levels(spe$final_celltype)
+
+cat("Raw column names (n =", length(raw_names), "):\n")
+print(raw_names)
+
+cat("\nClean cell type levels (n =", length(clean_names), "):\n")
+print(clean_names)
+
+cat("\nRaw names identical to clean levels (same set, same order):",
+    identical(raw_names, clean_names), "\n")
+
+setdiff_raw_clean <- setdiff(raw_names, clean_names)
+setdiff_clean_raw <- setdiff(clean_names, raw_names)
+
+if (length(setdiff_raw_clean) == 0 && length(setdiff_clean_raw) == 0) {
+  cat("Confirmed: no mismatch. spe$aggregatedNeighbors column names are clean.\n")
+} else {
+  cat("Mismatch found:\n")
+  cat("  In raw but not in clean levels:\n"); print(setdiff_raw_clean)
+  cat("  In clean levels but not in raw:\n"); print(setdiff_clean_raw)
+}
+```
+
+---
+
+## 3. Identify significant niches
+
+```{r significant-niches}
+sig_niches <- sccomp_niche_stage |>
+  filter(factor == "Stage", c_FDR < 0.05) |>
+  pull(Niche) |>
+  unique()
+
+cat("Significant niches (Stage):", length(sig_niches), "\n")
+print(sort(as.numeric(as.character(sig_niches))))
+```
+
+---
+
+## 3a. Significant niches: effect size and FDR
+
+```{r significant-niches-table}
+sig_niches_table <- sccomp_niche_stage |>
+  filter(factor == "Stage", c_FDR < 0.05) |>
+  select(Niche, factor, parameter, c_effect, c_FDR, c_pH0, c_rhat, c_ess_bulk, c_ess_tail) |>
+  arrange(c_FDR)
+
+sig_niches_table |>
+  as.data.frame() |>
+  knitr::kable(digits = 3, caption = "Significant niches: effect size and FDR (Stage model, threshold = 30)")
+```
+
+---
+
+## 3b. Patient-dominance check across flagged annotations
+
+```{r patient-dominance-check}
+flagged_annotations <- tribble(
+  ~celltype_label,                                           ~dominant_patient,
+  "Monocyte (PD1+)",                                         "Patient10",
+  "Macrophage, Proliferating (MKI67+)",                      "Patient10",
+  "Tumor Epithelial (Neuroendocrine)",                        "Patient17",
+  "B Cell (CD19+)",                                           "Patient20_519",
+  "Plasma Cell, TIM3+ (CD138+TIM3+CD45RO-)",                  "Patient10",
+  "DC/mregDC (Epi Adj)",                                      "Patient10"
+)
+
+niche_patient_dominance <- purrr::map2_dfr(
+  flagged_annotations$celltype_label,
+  flagged_annotations$dominant_patient,
+  function(label, dom_patient) {
+    idx <- which(spe$final_celltype == label)
+
+    if (length(idx) == 0) {
+      warning("No cells found for annotation: ", label)
+      return(tibble())
+    }
+
+    data.frame(
+      Niche = spe$Niche[idx],
+      Patient = spe$patient_id[idx]
+    ) |>
+      group_by(Niche) |>
+      summarise(
+        n_cells = n(),
+        pct_dominant_patient = mean(Patient == dom_patient) * 100,
+        .groups = "drop"
+      ) |>
+      mutate(celltype_label = label, dominant_patient = dom_patient)
+  }
+)
+```
+
+---
+
+## 3c. Significant niches: FDR with patient-dominance flag
+
+```{r significant-niches-table-with-dominance}
+dominance_out_path <- file.path(niche_path, "niche_patient_dominance_full.csv")
+write_csv(niche_patient_dominance, dominance_out_path)
+cat("Saved full patient-dominance diagnostic to:", dominance_out_path, "\n")
+
+niche_total_cells <- data.frame(Niche = spe$Niche) |>
+  group_by(Niche) |>
+  summarise(n_total_niche_cells = n(), .groups = "drop") |>
+  mutate(Niche = as.character(Niche))
+
+niche_max_dominance <- niche_patient_dominance |>
+  mutate(Niche = as.character(Niche)) |>
+  left_join(niche_total_cells, by = "Niche") |>
+  mutate(pct_of_niche = n_cells / n_total_niche_cells * 100) |>
+  group_by(Niche) |>
+  slice_max(pct_of_niche, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  transmute(
+    Niche,
+    n_cells,
+    n_total_niche_cells,
+    max_share_annotation = celltype_label,
+    max_share_patient = dominant_patient,
+    max_patient_share = round(pct_of_niche, 1)
+  )
+
+niche_min_fdr <- sig_niches_table |>
+  mutate(Niche = as.character(Niche)) |>
+  group_by(Niche) |>
+  slice_min(c_FDR, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  select(Niche, c_FDR)
+
+niche_dominance_summary <- niche_min_fdr |>
+  left_join(niche_max_dominance, by = "Niche") |>
+  mutate(
+    n_cells = replace_na(n_cells, 0),
+    n_total_niche_cells = replace_na(n_total_niche_cells, 0),
+    max_share_annotation = replace_na(max_share_annotation, "none"),
+    max_share_patient = replace_na(max_share_patient, "-"),
+    max_patient_share = replace_na(max_patient_share, 0)
+  ) |>
+  arrange(c_FDR)
+
+niche_dominance_summary |>
+  as.data.frame() |>
+  knitr::kable(digits = 3, format = "simple")
+```
+
+---
+
+## 4. Average neighborhood composition per niche
+
+```{r composition}
+raw_neighbors <- spe$aggregatedNeighbors
+neighbor_mat  <- as.data.frame(as.matrix(raw_neighbors))
+colnames(neighbor_mat) <- colnames(raw_neighbors)
+neighbor_mat$Niche <- spe$Niche
+
+niche_composition <- neighbor_mat |>
+  group_by(Niche) |>
+  summarise(across(everything(), mean), .groups = "drop")
+
+mangled_check <- grepl("\\.", setdiff(colnames(niche_composition), "Niche"))
+cat("niche_composition mangled column check -- any TRUE below means trouble:\n")
+print(any(mangled_check))
+if (any(mangled_check)) {
+  cat("Mangled columns:\n")
+  print(colnames(niche_composition)[-1][mangled_check])
+} else {
+  cat("niche_composition column names look clean.\n")
+}
+
+write_csv(niche_composition, composition_out_path)
+cat("Saved full niche composition table to:", composition_out_path, "\n")
+```
+
+---
+
+## 5. Heatmap (significant niches only)
+
+```{r heatmap}
+niche_composition_sig <- niche_composition |>
+  filter(Niche %in% sig_niches)
+
+range_cutoff_sig <- 0.05
+
+celltype_range_sig <- niche_composition_sig |>
+  select(-Niche) |>
+  summarise(across(everything(), ~ max(.x) - min(.x))) |>
+  pivot_longer(everything(), names_to = "cell_type", values_to = "range")
+
+keep_celltypes_sig <- celltype_range_sig |>
+  filter(range > range_cutoff_sig) |>
+  pull(cell_type)
+
+cat("Keeping", length(keep_celltypes_sig), "of", ncol(niche_composition_sig) - 1,
+    "cell types (range >", range_cutoff_sig, ")\n")
+
+niche_composition_sig_filtered <- niche_composition_sig |>
+  select(Niche, all_of(keep_celltypes_sig))
+
+niche_mat_sig <- niche_composition_sig_filtered |> select(-Niche) |> as.matrix()
+rownames(niche_mat_sig) <- niche_composition_sig_filtered$Niche
+
+niche_mat_scaled <- scale(niche_mat_sig)
+max_abs <- max(abs(niche_mat_scaled), na.rm = TRUE)
+breaks <- seq(-max_abs, max_abs, length.out = 101)
+heat_colors <- colorRampPalette(rev(brewer.pal(11, "RdBu")))(100)
+
+cell_w <- 14
+cell_h <- 14
+
+ph <- pheatmap::pheatmap(
+  niche_mat_scaled,
+  scale = "none",
+  color = heat_colors,
+  breaks = breaks,
+  fontsize_row = 9,
+  fontsize_col = 9,
+  cellwidth = cell_w,
+  cellheight = cell_h,
+  labels_col = colnames(niche_mat_scaled),
+  border_color = NA,
+  angle_col = "45",
+  main = "Average neighborhood composition: significant niches only (Stage, threshold = 30)",
+  silent = TRUE
+)
+
+cat("Heatmap grid size:", nrow(niche_mat_scaled), "rows x", ncol(niche_mat_scaled), "cols\n")
+cat("Class of ph:", paste(class(ph), collapse = ", "), "\n")
+```
+
+```{r heatmap-inline, fig.width=12, fig.height=10}
+grid::grid.newpage()
+
+if (isS4(ph)) {
+  ComplexHeatmap::draw(ph)
+} else {
+  grid::grid.draw(ph$gtable)
+  grid::grid.text("Z-score", x = 0.98, y = 0.5, rot = 270,
+                   gp = grid::gpar(fontsize = 10))
+}
+```
+
+---
+
+## 6. Top dominant cell types per significant niche
+
+```{r top-celltypes}
+top_n <- 8
+
+niche_top_celltypes <- niche_composition_sig |>
+  pivot_longer(-Niche, names_to = "cell_type", values_to = "mean_fraction") |>
+  group_by(Niche) |>
+  slice_max(mean_fraction, n = top_n) |>
+  arrange(Niche, desc(mean_fraction))
+
+niche_top_celltypes_wide <- niche_top_celltypes |>
+  mutate(label = sprintf("%s (%.0f%%)", cell_type, mean_fraction * 100)) |>
+  group_by(Niche) |>
+  summarise(top_celltypes = paste(label, collapse = "; "), .groups = "drop") |>
+  arrange(as.numeric(as.character(Niche)))
+
+write_csv(niche_top_celltypes_wide, top_celltypes_out_path)
+cat("Saved top-", top_n, " cell types per significant niche to:", top_celltypes_out_path, "\n")
+
+niche_kable <- niche_top_celltypes_wide |>
+  as.data.frame() |>
+  knitr::kable(caption = "Top dominant cell types per significant niche (collapsed for annotation, threshold = 30)",
+               booktabs = knitr::is_latex_output())
+
+if (knitr::is_latex_output()) {
+  niche_kable |>
+    kableExtra::kable_styling(latex_options = c("hold_position"), font_size = 9) |>
+    kableExtra::column_spec(1, width = "2cm") |>
+    kableExtra::column_spec(2, width = "16cm")
+} else {
+  niche_kable
+}
+```
+
+---
+
+## 7. Auto-drafted annotation comments
+
+```{r auto-annotation-drafts}
+niche_effect_direction <- sig_niches_table |>
+  mutate(Niche = as.character(Niche)) |>
+  group_by(Niche) |>
+  slice_min(c_FDR, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  transmute(
+    Niche,
+    factor,
+    c_FDR,
+    direction = ifelse(c_effect > 0, "enriched", "depleted")
+  )
+
+niche_top1 <- niche_composition_sig |>
+  pivot_longer(-Niche, names_to = "cell_type", values_to = "mean_fraction") |>
+  group_by(Niche) |>
+  slice_max(mean_fraction, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  transmute(
+    Niche = as.character(Niche),
+    top_celltype = cell_type,
+    top_pct = round(mean_fraction * 100)
+  )
+
+niche_annotation_drafts <- niche_effect_direction |>
+  left_join(niche_top1, by = "Niche") |>
+  left_join(
+    niche_dominance_summary |> select(Niche, max_share_annotation, max_share_patient, max_patient_share),
+    by = "Niche"
+  ) |>
+  mutate(
+    is_flagged = !is.na(max_share_annotation) & max_share_annotation == top_celltype,
+    draft_comment = case_when(
+      is_flagged ~ sprintf(
+        "#Niche %s: %s (%d%%): %s in %s (FDR = %.3f) -- CAUTION: dominant cell type is patient-dominance flagged, %s accounts for %.1f%% of this niche's total cells. Review before finalizing.",
+        Niche, top_celltype, top_pct, direction, factor, c_FDR, max_share_patient, max_patient_share
+      ),
+      TRUE ~ sprintf(
+        "#Niche %s: %s (%d%%): %s in %s (FDR = %.3f)",
+        Niche, top_celltype, top_pct, direction, factor, c_FDR
+      )
+    )
+  ) |>
+  arrange(as.numeric(Niche))
+
+annotation_drafts_out_path <- file.path(niche_path, "niche_annotation_drafts.txt")
+writeLines(niche_annotation_drafts$draft_comment, annotation_drafts_out_path)
+cat("Saved draft annotation comments to:", annotation_drafts_out_path, "\n\n")
+
+cat(paste(niche_annotation_drafts$draft_comment, collapse = "\n\n"))
+```
+
+---
+
+## 8. Faceted bar charts: top cell types per niche
+
+Master color palette is built here from the full set of cell types
+across all significant niches (not just each niche's own top N), so
+a given cell type keeps the same color across this plot, 8a, and 8b.
+
+```{r stacked-bar-top5, fig.width=14, fig.height=12}
+top_n_per_niche <- 8
+top_n_stack <- 8  # used again in 8a below
+
+all_celltype_ranking <- niche_composition_sig |>
+  pivot_longer(-Niche, names_to = "cell_type", values_to = "mean_fraction") |>
+  group_by(cell_type) |>
+  summarise(overall_mean = mean(mean_fraction), .groups = "drop") |>
+  arrange(desc(overall_mean)) |>
+  pull(cell_type)
+
+kelly_colors <- c(
+  "#F3C300", "#875692", "#F38400", "#A1CAF1", "#BE0032",
+  "#C2B280", "#848482", "#008856", "#E68FAC", "#0067A5",
+  "#F99379", "#604E97", "#F6A600", "#B3446C", "#DCD300",
+  "#882D17", "#8DB600", "#654522", "#E25822", "#2B3D26"
+)
+
+n_all <- length(all_celltype_ranking)
+cat("Total distinct cell types across all significant niches:", n_all, "\n")
+
+if (n_all <= length(kelly_colors)) {
+  master_colors <- kelly_colors[seq_len(n_all)]
+} else {
+  n_extra <- n_all - length(kelly_colors)
+  hues <- seq(15, 375, length.out = n_extra + 1)[seq_len(n_extra)]
+  master_colors <- c(kelly_colors, grDevices::hcl(h = hues, c = 90, l = 45))
+}
+names(master_colors) <- all_celltype_ranking
+master_colors["Other"] <- "grey85"
+
+niche_top_per_niche <- niche_composition_sig |>
+  pivot_longer(-Niche, names_to = "cell_type", values_to = "mean_fraction") |>
+  group_by(Niche) |>
+  slice_max(mean_fraction, n = top_n_per_niche, with_ties = FALSE) |>
+  ungroup() |>
+  mutate(
+    cell_type_wrapped = str_wrap(cell_type, width = 25),
+    cell_type = factor(cell_type, levels = all_celltype_ranking),
+    Niche = factor(as.character(Niche),
+                    levels = as.character(sort(as.numeric(as.character(sig_niches)))))
+  )
+
+ggplot(niche_top_per_niche,
+       aes(x = reorder_within(cell_type_wrapped, mean_fraction, Niche),
+           y = mean_fraction, fill = cell_type)) +
+  geom_col(color = "white", linewidth = 0.1, show.legend = FALSE) +
+  scale_fill_manual(values = master_colors, drop = TRUE) +
+  scale_x_reordered() +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  coord_flip() +
+  facet_wrap(~ Niche, scales = "free_y", ncol = 5) +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(size = 6),
+    strip.text = element_text(size = 8, face = "bold"),
+    plot.margin = margin(t = 10, r = 10, b = 10, l = 10)
+  ) +
+  labs(x = NULL, y = "Proportion of cells",
+       title = "Cell type composition per significant niche (Stage, threshold = 30)",
+       subtitle = sprintf("Top %d cell types per niche, sorted independently within each panel", top_n_per_niche))
+```
+
+---
+
+## 8a. Stacked bar plot: cell type composition per significant niche
+
+Same master color palette as Section 8, so a given cell type carries
+the same color in both views. Global top 8 cell types (by overall mean
+abundance across significant niches) are shown individually; everything
+else is collapsed into "Other". Each niche's column sums to ~100%.
+
+```{r stacked-bar-collapsed, fig.width=14, fig.height=8}
+keep_celltypes_top5 <- all_celltype_ranking[seq_len(min(top_n_stack, length(all_celltype_ranking)))]
+celltype_levels_top5 <- c(keep_celltypes_top5, "Other")
+
+niche_long_sig_top5 <- niche_composition_sig |>
+  pivot_longer(-Niche, names_to = "cell_type", values_to = "mean_fraction") |>
+  mutate(cell_type = ifelse(cell_type %in% keep_celltypes_top5, cell_type, "Other")) |>
+  group_by(Niche, cell_type) |>
+  summarise(mean_fraction = sum(mean_fraction), .groups = "drop") |>
+  mutate(
+    cell_type = factor(cell_type, levels = celltype_levels_top5),
+    Niche = factor(as.character(Niche),
+                    levels = as.character(sort(as.numeric(as.character(sig_niches)))))
+  )
+
+cat("Cell types kept (global top", top_n_stack, "by overall abundance):",
+    length(keep_celltypes_top5), "+ Other\n")
+print(keep_celltypes_top5)
+
+ggplot(niche_long_sig_top5, aes(x = Niche, y = mean_fraction, fill = cell_type)) +
+  geom_col(position = "stack", color = "white", linewidth = 0.15) +
+  scale_fill_manual(values = master_colors, breaks = celltype_levels_top5) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                      expand = expansion(mult = c(0, 0.02))) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 8),
+    legend.position = "right",
+    legend.key.size = unit(0.35, "cm"),
+    legend.text = element_text(size = 8),
+    panel.grid.major.x = element_blank(),
+    plot.margin = margin(t = 10, r = 10, b = 10, l = 10)
+  ) +
+  guides(fill = guide_legend(ncol = 1)) +
+  labs(x = "Niche", y = "Proportion of cells", fill = "Cell type",
+       title = "Cell type composition per significant niche (Stage, threshold = 30)",
+       subtitle = sprintf("Top %d cell types overall shown individually; remainder collapsed to Other", top_n_stack))
+```

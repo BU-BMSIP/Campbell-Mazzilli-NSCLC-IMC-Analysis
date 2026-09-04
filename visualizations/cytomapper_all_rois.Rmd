@@ -1,0 +1,196 @@
+---
+title: "Tumor IMC - Full Cohort Cytomapper Catalog (All Cells)"
+author: "Vaidehi Gupta"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: false
+    theme: cosmo
+    code_folding: hide
+---
+
+Cytomapper "All cells" overlays for every ROI in the cohort, organized as
+Patient tabs. Colored by the same curated 13-category display grouping
+used throughout the poster figures.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, echo = FALSE)
+```
+
+```{r libraries}
+#.libPaths(c("/restricted/projectnb/camplab/home/vgupta7/R_libs", .libPaths()))
+
+suppressPackageStartupMessages({
+    library(imcRtools)
+    library(cytomapper)
+    library(SpatialExperiment)
+    library(tidyverse)
+    library(scales)
+})
+
+set.seed(12345)
+```
+
+```{r paths}
+analysis_path  <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis"
+steinbock_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/steinbock"
+
+final_celltype_path <- file.path(analysis_path, "final_cell_annotation",
+                                  "r3_annotation", "spe_final_celltype_r3.rds")
+
+# TEST_MODE: set TRUE to run on just the first 2 patients, to sanity-check
+# paths/labels/rendering before committing to the full cohort.
+TEST_MODE <- FALSE
+```
+
+```{r load-spe}
+spe <- readRDS(final_celltype_path)
+cat("Cells:", ncol(spe), "\n")
+cat("Patients:", n_distinct(spe$patient_id), "\n")
+cat("ROIs:", n_distinct(spe$sample_id), "\n")
+```
+
+# Build ROI -> file lookup
+
+```{r build-file-lookup}
+result_dirs <- list.dirs(steinbock_path, recursive = FALSE)
+result_dirs <- result_dirs[grepl("^p[0-9]+(_[0-9]+_[0-9]+)?_results$", basename(result_dirs))]
+
+cat("Steinbock result folders found:\n")
+print(basename(result_dirs))
+
+img_files  <- list.files(file.path(result_dirs, "img"), pattern = "\\.tiff?$",
+                          full.names = TRUE, recursive = FALSE)
+mask_files <- list.files(file.path(result_dirs, "masks_deepcell"), pattern = "\\.tiff?$",
+                          full.names = TRUE, recursive = FALSE)
+
+names(img_files)  <- tools::file_path_sans_ext(basename(img_files))
+names(mask_files) <- tools::file_path_sans_ext(basename(mask_files))
+
+missing_img  <- setdiff(unique(spe$sample_id), names(img_files))
+missing_mask <- setdiff(unique(spe$sample_id), names(mask_files))
+
+if (length(missing_img) > 0) {
+  cat("WARNING -- sample_ids with no matching image file:\n")
+  print(missing_img)
+}
+if (length(missing_mask) > 0) {
+  cat("WARNING -- sample_ids with no matching mask file:\n")
+  print(missing_mask)
+}
+if (length(missing_img) == 0 && length(missing_mask) == 0) {
+  cat("All sample_ids matched to an image and mask file.\n")
+}
+```
+
+# Build curated display grouping
+
+```{r derive-display-celltype}
+spe$CellTypeLabel_display <- case_when(
+  spe$final_celltype == "Epithelial (EpCAM+)" ~ "Epithelial",
+  str_detect(spe$final_celltype, "Tumor Epithelial") ~ "Lung Epithelial",
+  spe$final_celltype == "Proliferating Cells" ~ "Proliferating Cells",
+  str_detect(spe$final_celltype, "^CD8") ~ "CD8+ T Cell",
+  str_detect(spe$final_celltype, "^CD4") ~ "CD4+ T Cell",
+  str_detect(spe$final_celltype, "^Treg") ~ "Treg",
+  str_detect(spe$final_celltype, "^cDC|DC/mregDC|Dendritic Cell") ~ "Dendritic Cell",
+  spe$final_celltype == "Macrophage, Proliferating (MKI67+)" ~ "Other",  # Patient10-driven artifact
+  str_detect(spe$final_celltype, "^Macrophage") ~ "Macrophage",
+  str_detect(spe$final_celltype, "^Monocyte") ~ "Monocyte",
+  str_detect(spe$final_celltype, "B Cell|Plasma") ~ "B Cell/Plasmablast",
+  spe$final_celltype == "Fibroblast/Stroma" ~ "Fibroblast",
+  spe$final_celltype == "Mast Cell" ~ "Mast Cell",
+  TRUE ~ "Other"
+)
+
+display_levels <- c("Epithelial", "Lung Epithelial", "Proliferating Cells",
+                     "CD8+ T Cell", "CD4+ T Cell", "Treg", "Dendritic Cell",
+                     "Macrophage", "Monocyte", "B Cell/Plasmablast",
+                     "Fibroblast", "Mast Cell", "Other")
+spe$CellTypeLabel_display <- factor(spe$CellTypeLabel_display, levels = display_levels)
+
+display_cols <- c(
+  "Epithelial"          = "red",
+  "Lung Epithelial"     = "darkorange",
+  "Proliferating Cells"  = "yellow",
+  "CD8+ T Cell"          = "forestgreen",
+  "CD4+ T Cell"          = "yellowgreen",
+  "Treg"                 = "purple",
+  "Dendritic Cell"       = "lightblue",
+  "Macrophage"           = "dodgerblue",
+  "Monocyte"             = "navy",
+  "B Cell/Plasmablast"   = "pink",
+  "Fibroblast"           = "violet",
+  "Mast Cell"            = "deeppink",
+  "Other"                = "gray85"
+)
+
+table(spe$CellTypeLabel_display)
+```
+
+# Cohort catalog {.tabset}
+
+```{r roi-list}
+patients <- sort(unique(spe$patient_id))
+if (TEST_MODE) {
+  patients <- head(patients, 2)
+  cat("TEST_MODE active -- rendering only:", paste(patients, collapse = ", "), "\n")
+}
+```
+
+```{r render-catalog, results="asis", fig.width=14, fig.height=10}
+for (pt in patients) {
+
+  cat("\n\n## ", pt, " {.tabset}\n\n")
+
+  pt_rois <- sort(unique(spe$sample_id[spe$patient_id == pt]))
+
+  for (roi in pt_rois) {
+
+    if (!(roi %in% names(img_files)) || !(roi %in% names(mask_files))) {
+      cat("\n\n### ", roi, " {-}\n\n")
+      cat("Skipped -- no matching image/mask file found (see lookup warnings above).\n\n")
+      next
+    }
+
+    cat("\n\n### ", roi, " {-}\n\n")
+
+    cur_image <- loadImages(img_files[roi])
+    cur_mask  <- loadImages(mask_files[roi], as.is = TRUE)
+    names(cur_image) <- roi
+    names(cur_mask)  <- roi
+    mcols(cur_image)$sample_id <- roi
+    mcols(cur_mask)$sample_id  <- roi
+
+    tryCatch({
+      plotCells(
+        mask = cur_mask,
+        object = spe,
+        cell_id = "ObjectNumber",
+        img_id = "sample_id",
+        colour_by = "CellTypeLabel_display",
+        outline_by = NULL,
+        exprs_values = "counts",
+        colour = list(CellTypeLabel_display = display_cols),
+        image_title = NULL,
+        legend = list(colour_by.title.cex = 1, colour_by.labels.cex = 0.9,
+                       colour_by.legend.cex = 1)
+      )
+    }, error = function(e) cat("Plot failed for", roi, ":", conditionMessage(e), "\n"))
+    cat("\n\n")
+  }
+}
+```
+
+# Notes
+
+- Same file-lookup and 13-category display grouping (12 curated lineages
+  + Other, including the Patient10-driven macrophage artifact exclusion
+  and "Lung Epithelial" rename) as the full breakdown version -- only the
+  per-lineage highlight loop has been removed.
+- ~54 ROIs total, one plot each -- much faster to knit than the full
+  breakdown version (~700 plots).
+- `TEST_MODE <- TRUE` restricts to 2 patients for a quick sanity check;
+  switch to `FALSE` for the full cohort once that looks correct.

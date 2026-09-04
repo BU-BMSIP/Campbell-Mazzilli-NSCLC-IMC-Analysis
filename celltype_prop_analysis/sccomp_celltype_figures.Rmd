@@ -254,19 +254,29 @@ smallMultiplesPlot
 ---
 
 ```{r, fig.width=10, fig.height=8}
-# Order panels to match the forest plot's effect-size ranking
-forest_order <- plotDF |> arrange(c_effect) |> pull(CellType) |> as.character()
+increasing_types <- c("Proliferating Cells", "Macrophage, M2-like (CD163+)",
+                       "Treg, Memory")
+decreasing_types_raw <- c("DC/mregDC (Epi Adj)", "Tumor Epithelial (TTF1++)",
+                          "Plasmablast/Activated B Cell (CD38+)")
 
-# Trim to a smaller, poster-appropriate subset -- adjust this list as you like
-poster_subset <- c(
-  "Proliferating Cells", "Macrophage, M2-like (CD163+)",
-  "Treg, Memory", "CD4+ Memory T Cell, Exhaustion-leaning",
-  "DC/mregDC (Epi Adj)", "Mast Cell"
-)
+poster_subset <- c(increasing_types, decreasing_types_raw)
+
+# plotDF already has the Lung Epithelial rename applied -- match on that version for ordering
+decreasing_types_display <- recode(decreasing_types_raw,
+                                    "Tumor Epithelial (TTF1++)" = "Lung Epithelial (TTF1+)")
+
+increasing_order <- plotDF |> filter(CellType %in% increasing_types) |>
+  arrange(desc(c_effect)) |> pull(CellType) |> as.character()
+decreasing_order <- plotDF |> filter(CellType %in% decreasing_types_display) |>
+  arrange(c_effect) |> pull(CellType) |> as.character()
+
+panel_order <- c(increasing_order, decreasing_order)
 
 propDFPoster <- propDFSub |>
   filter(CellType %in% poster_subset) |>
-  mutate(CellType = factor(CellType, levels = intersect(forest_order, poster_subset)))
+  mutate(CellType = recode(as.character(CellType),
+                            "Tumor Epithelial (TTF1++)" = "Lung Epithelial (TTF1+)")) |>
+  mutate(CellType = factor(CellType, levels = panel_order))
 
 smallMultiplesPosterPlot <- ggplot(propDFPoster, aes(x = DiseaseState, y = Proportion)) +
   geom_boxplot(outlier.shape = NA, width = 0.5, fill = "gray95") +
@@ -285,8 +295,8 @@ smallMultiplesPosterPlot <- ggplot(propDFPoster, aes(x = DiseaseState, y = Propo
   )
 
 smallMultiplesPosterPlot
-
 ```
+
 ```{r, fig.width=10, fig.height=14}
 # Build proportion data for every significant cell type, not just the curated subset
 forest_order_full <- plotDF_full |> arrange(c_effect) |> pull(CellType) |> as.character()

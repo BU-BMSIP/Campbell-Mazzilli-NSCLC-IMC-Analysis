@@ -1,0 +1,466 @@
+---
+title: "Niche Generation and Differential Abundance — Threshold Sweep"
+author: "Tazein Shah"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    code_folding: show
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 12, fig.height = 8)
+
+suppressPackageStartupMessages({
+  library(imcRtools)
+  library(tidyverse)
+  library(SingleCellExperiment)
+  library(SpatialExperiment)
+  library(sccomp)
+  library(ggrepel)
+  library(mclust)   # adjustedRandIndex
+})
+
+set.seed(12345)
+```
+
+---
+
+## 1. Paths
+
+```{r paths}
+analysis_path <- "/restricted/projectnb/camplab/projects/20220504_Suzuki_LN/TumorIMC/analysis/spatial_analysis/run_3"
+spatial_graph_path <- file.path(analysis_path, "spe_spatial_graph_r3.rds")
+
+spe_graph <- readRDS(spatial_graph_path)
+
+thresholds  <- c(10, 20, 30, 40)
+kmeansClust <- 50
+
+# All sweep output lives under its own subdirectory, separate from the
+# existing production niche_k50_thresh20/ folder -- this sweep never
+# reads from or writes to that folder.
+sweep_path <- file.path(analysis_path, "niche_sweep")
+dir.create(sweep_path, recursive = TRUE, showWarnings = FALSE)
+
+cat("Cells:", ncol(spe_graph), "\n")
+cat("Levels in spatial graph object:\n")
+print(levels(spe_graph$final_celltype))
+```
+
+---
+
+## 2. Load spatial graph object
+
+```{r load}
+spe <- spe_graph
+
+cat("Cells:", ncol(spe), "\n")
+cat("Cell types:", nlevels(spe$final_celltype), "\n")
+```
+
+---
+
+## 3. Threshold sweep: build graph, aggregate neighbors, generate niches
+
+For each threshold, rebuild the expansion graph from scratch, aggregate
+neighbor composition, and run kmeans. Each threshold gets its own
+output folder under `sweep_path`.
+
+```{r covariate-fn}
+# Patient-level covariates are threshold-invariant -- factored out so
+# they're computed identically for every spe_t below.
+add_covariates <- function(spe_t) {
+  spe_t$stage_group <- sapply(spe_t$patient_id, function(x) {
+    if (x %in% c("Patient12", "Patient15")) return("IIB")
+    else if (x == "Patient13") return("IIIA")
+    else if (x == "Patient19") return("IB")
+    else if (x == "Patient11" || grepl("^Patient20", x)) return("IA3")
+    else if (x %in% c("Patient14", "Patient16", "Patient17", "Patient18")) return("IA2")
+    else if (x == "Patient10") return("Benign")
+    else return(NA)
+  })
+  spe_t$stage_group <- factor(spe_t$stage_group,
+                              levels = c("Benign", "IA2", "IA3", "IB", "IIIA", "IIB"))
+
+  spe_t$disease_state <- sapply(spe_t$patient_id, function(x) {
+    if (x == "Patient10") return("Benign")
+    else if (x %in% c("Patient11", "Patient14", "Patient16", "Patient17", "Patient18") || grepl("^Patient20", x)) return("Lower")
+    else if (x %in% c("Patient12", "Patient13", "Patient15", "Patient19")) return("Higher")
+    else return(NA)
+  })
+  spe_t$disease_state <- factor(spe_t$disease_state, levels = c("Benign", "Lower", "Higher"))
+
+  spe_t
+}
+```
+
+```{r threshold-sweep}
+niche_list <- list()
+
+for (t in thresholds) {
+
+  cat("\n=== Building niches at threshold =", t, "===\n")
+
+  thresh_path <- file.path(sweep_path, paste0("k", kmeansClust, "_thresh", t))
+  dir.create(thresh_path, recursive = TRUE, showWarnings = FALSE)
+  niche_spe_out_path <- file.path(thresh_path, "spe_niche.rds")
+
+  if (file.exists(niche_spe_out_path)) {
+    cat("Found existing niche object, loading:", niche_spe_out_path, "\n")
+    spe_t <- readRDS(niche_spe_out_path)
+  } else {
+    spe_t <- buildSpatialGraph(spe, img_id = "sample_id", type = "expansion", threshold = t)
+
+    spe_t <- aggregateNeighbors(spe_t,
+                                colPairName = "expansion_interaction_graph",
+                                aggregate_by = "metadata",
+                                count_by = "final_celltype")
+
+    cn <- kmeans(spe_t$aggregatedNeighbors, centers = kmeansClust, iter.max = 10000)
+    spe_t$Niche <- as.factor(cn$cluster)
+
+    spe_t <- add_covariates(spe_t)
+
+    saveRDS(spe_t, niche_spe_out_path)
+    cat("Saved:", niche_spe_out_path, "\n")
+  }
+
+  niche_list[[as.character(t)]] <- spe_t
+}
+```
+
+---
+
+## 4. Sweep diagnostics: niche size and stability across thresholds
+
+```{r niche-size-comparison, fig.width = 10, fig.height = 6}
+niche_sizes <- purrr::imap_dfr(niche_list, function(spe_t, t) {
+  as.data.frame(table(spe_t$Niche)) |>
+    setNames(c("Niche", "n_cells")) |>
+    mutate(threshold = as.numeric(t))
+})
+
+ggplot(niche_sizes, aes(x = factor(threshold), y = n_cells)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15, size = 0.8, alpha = 0.4) +
+  theme_classic() +
+  labs(x = "Expansion threshold (µm)", y = "Cells per niche",
+       title = "Niche size distribution by threshold")
+```
+
+```{r ari-comparison}
+# Niche assignments are only comparable cell-to-cell if cell order is
+# identical across thresholds -- true here since all four spe_t objects
+# derive from the same spe_graph without any row/column reordering.
+ari_mat <- outer(thresholds, thresholds, Vectorize(function(a, b) {
+  adjustedRandIndex(niche_list[[as.character(a)]]$Niche,
+                    niche_list[[as.character(b)]]$Niche)
+}))
+rownames(ari_mat) <- colnames(ari_mat) <- thresholds
+cat("Pairwise ARI between threshold niche assignments:\n")
+print(round(ari_mat, 3))
+```
+
+---
+
+## 5. Differential niche abundance across thresholds (sccomp)
+
+Stage model only, fit separately per threshold. `.sample = Patient`
+reasoning unchanged (stage constant within patient, not ROI).
+
+```{r sccomp-sweep}
+sccomp_stage_list <- list()
+
+for (t in thresholds) {
+
+  cat("\n=== sccomp Stage model at threshold =", t, "===\n")
+
+  spe_t <- niche_list[[as.character(t)]]
+  thresh_path <- file.path(sweep_path, paste0("k", kmeansClust, "_thresh", t))
+
+  sccomp_stage_out_path <- file.path(thresh_path, "sccomp_stage.rds")
+
+  sceIMC <- SingleCellExperiment(list(counts = assay(spe_t, "counts")))
+  sceIMC$Patient <- factor(spe_t$patient_id)
+  sceIMC$Sample  <- factor(spe_t$sample_id)
+  sceIMC$Niche   <- factor(spe_t$Niche)
+  sceIMC$Stage   <- factor(spe_t$stage_group,
+                           levels = c("Benign", "IA2", "IA3", "IB", "IIIA", "IIB"))
+
+  if (file.exists(sccomp_stage_out_path)) {
+    cat("Found existing Stage output, loading\n")
+    sccomp_s <- readRDS(sccomp_stage_out_path)
+  } else {
+    sccomp_s <-
+      sceIMC |>
+      sccomp_estimate(
+        formula_composition = ~ Stage + (1 | Patient),
+        .sample = Sample,
+        .cell_group = Niche,
+        bimodal_mean_variability_association = FALSE,
+        variational_inference = FALSE,
+        output_directory = file.path(thresh_path, "sccomp_draws_stage"),
+        cores = 8
+      ) |>
+      sccomp_test()
+    saveRDS(sccomp_s, sccomp_stage_out_path)
+  }
+
+  sccomp_stage_list[[as.character(t)]] <- sccomp_s |>
+    as.data.frame() |>
+    filter(factor == "Stage") |>
+    mutate(Niche = as.character(Niche), threshold = t)
+}
+
+sccomp_stage_all <- bind_rows(sccomp_stage_list)
+```
+
+---
+
+## 6. Significant niche counts by threshold
+
+```{r sig-counts-table}
+sig_counts <- sccomp_stage_all |>
+  group_by(threshold) |>
+  summarise(
+    n_fdr10 = sum(c_FDR < 0.1, na.rm = TRUE),
+    n_fdr05 = sum(c_FDR < 0.05, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(threshold)
+
+sig_counts |>
+  knitr::kable(caption = "Number of significant Stage niche-contrasts by threshold (out of up to 250 rows: 50 niches x 5 contrasts)")
+```
+
+```{r sig-counts-plot, fig.width = 8, fig.height = 5}
+ggplot(sig_counts, aes(x = factor(threshold), y = n_fdr10)) +
+  geom_col(fill = "steelblue") +
+  theme_classic() +
+  labs(x = "Expansion threshold (µm)", y = "Significant niches (FDR < 0.1)",
+       title = "Significant Stage niche-contrast counts across thresholds")
+```
+
+---
+
+## 7. Volcano plots by threshold {.tabset}
+
+```{r volcano-sweep, results = "asis", fig.width = 7, fig.height = 5.5}
+for (t in thresholds) {
+  cat("\n\n### Threshold", t, "\n\n")
+
+  df_sub <- sccomp_stage_all |>
+    filter(threshold == t, !is.nan(c_FDR), c_FDR < 0.1) |>
+    mutate(
+      LogFDR = -log(c_FDR),
+      Significant = ifelse(c_FDR < 0.05, "FDR < 0.05", "Not significant")
+    )
+
+  print(
+    ggplot(df_sub, aes(x = c_effect, y = LogFDR, color = Significant)) +
+      geom_point(size = 2) +
+      geom_text_repel(aes(label = Niche), size = 3, show.legend = FALSE) +
+      scale_color_manual(values = c("FDR < 0.05" = "firebrick", "Not significant" = "grey70")) +
+      theme_classic() +
+      labs(x = "Effect size", y = "-log(FDR)",
+           title = paste0("Stage, threshold = ", t))
+  )
+  cat("\n\n")
+}
+```
+
+---
+## 8. Choosing among candidate thresholds
+
+Threshold 10 is excluded from here on — it showed a 70,000-cell outlier
+niche (Section 4 size plot) and the weakest ARI agreement with every
+other threshold (Section 4 stability matrix), both signs the
+neighborhood radius is too small to produce stable niches. Thresholds
+20, 30, and 40 all show comparable significant-contrast counts and
+clean volcano plots (Sections 6-7), so the tiebreaker here is
+composition: whether each threshold's significant niches have cell
+type profiles that make biological sense, not just low FDR.
+
+### 8a. Composition-based ranking across candidate thresholds {.tabset}
+
+```{r composition-ranking, results = "asis"}
+candidate_thresholds <- c(20, 30, 40)
+
+patient_driven_clusters <- tibble::tribble(
+  ~cluster,                                                ~dominant_patient,
+  "Monocyte (PD1+)",                                       "Patient10",
+  "Macrophage, Proliferating (MKI67+)",                    "Patient10",
+  "Tumor Epithelial (Neuroendocrine)",                     "Patient17",
+  "B Cell (CD19+)",                                        "Patient20_519",
+  "Plasma Cell, TIM3+ (CD138+TIM3+CD45RO-)",               "Patient10",
+  "DC/mregDC (Epi Adj)",                                   "Patient10"
+)
+
+# Built once per candidate threshold and kept for reuse in 8b/8c/8d
+# below, so the composition/risk logic isn't computed twice.
+niche_patient_driven_by_t <- list()
+niche_ranking_by_t <- list()
+
+for (t in candidate_thresholds) {
+
+  cat("\n\n#### Threshold", t, "\n\n")
+
+  spe_t <- niche_list[[as.character(t)]]
+  sccomp_t <- sccomp_stage_list[[as.character(t)]]
+
+  # Niche composition: proportion of each cell type within each niche
+  niche_composition_t <- as.data.frame(prop.table(table(spe_t$Niche, spe_t$final_celltype), margin = 1))
+  colnames(niche_composition_t) <- c("Niche", "CellType", "Proportion")
+
+  niche_top_celltypes_t <- niche_composition_t |>
+    group_by(Niche) |>
+    slice_max(Proportion, n = 3) |>
+    summarise(top_celltypes = paste0(CellType, " (", round(Proportion * 100, 1), "%)", collapse = "; "),
+              .groups = "drop")
+
+  # Patient-driven risk, specific to this threshold's niche assignments
+  niche_patient_driven_t <- purrr::pmap_dfr(
+    patient_driven_clusters,
+    function(cluster, dominant_patient) {
+      idx <- which(spe_t$final_celltype == cluster)
+      data.frame(
+        Niche = spe_t$Niche[idx],
+        Patient = spe_t$patient_id[idx]
+      ) |>
+        group_by(Niche) |>
+        summarise(
+          n_cells = n(),
+          pct_dominant_patient = mean(Patient == dominant_patient) * 100,
+          .groups = "drop"
+        ) |>
+        mutate(cluster = cluster, dominant_patient = dominant_patient)
+    }
+  )
+  niche_patient_driven_by_t[[as.character(t)]] <- niche_patient_driven_t
+
+  niche_risk_flag_t <- niche_patient_driven_t |>
+    mutate(Niche = as.character(Niche)) |>
+    group_by(Niche) |>
+    summarise(max_dominant_pct = max(pct_dominant_patient), .groups = "drop") |>
+    mutate(patient_risk = ifelse(max_dominant_pct >= 50, "HIGH", "low"))
+
+  niche_ranking_t <- sccomp_t |>
+    filter(c_FDR < 0.05) |>
+    mutate(Niche = as.character(Niche)) |>
+    left_join(niche_top_celltypes_t, by = "Niche") |>
+    left_join(niche_risk_flag_t, by = "Niche") |>
+    mutate(patient_risk = replace_na(patient_risk, "low")) |>
+    arrange(c_FDR) |>
+    select(Niche, parameter, c_effect, c_FDR, patient_risk, top_celltypes)
+
+  niche_ranking_by_t[[as.character(t)]] <- niche_ranking_t
+
+  print(
+    niche_ranking_t |>
+      knitr::kable(digits = 4, caption = paste0("Ranked significant niches, threshold = ", t))
+  )
+  cat("\n\n")
+}
+```
+
+### 8b. Select final threshold
+
+Review the ranked tables above (skip any niche flagged `patient_risk =
+"HIGH"`) and set the threshold whose top non-flagged niches have the
+most coherent cell type composition.
+
+```{r select-threshold}
+selected_threshold <- 40
+
+spe <- niche_list[[as.character(selected_threshold)]]
+sccomp_niche_stage_sub <- sccomp_stage_list[[as.character(selected_threshold)]]
+niche_patient_driven <- niche_patient_driven_by_t[[as.character(selected_threshold)]]
+
+cat("Using threshold:", selected_threshold, "\n")
+```
+
+### 8c. Patient-driven clusters, per niche — plot
+
+```{r patient-driven-plot, fig.width = 12, fig.height = 8}
+ggplot(niche_patient_driven, aes(x = factor(Niche, levels = sort(unique(as.numeric(as.character(Niche))))),
+                                  y = pct_dominant_patient)) +
+  geom_col(fill = "steelblue") +
+  facet_wrap(~ paste0(cluster, "\n(", dominant_patient, ")"), scales = "free_x", ncol = 2) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 6)) +
+  labs(x = "Niche", y = "% of cluster's cells in niche from dominant patient",
+       title = paste0("Patient-driven cluster composition across niches (threshold = ", selected_threshold, ")"))
+```
+```{r}
+niche_patient_driven_by_t[["40"]] |>
+  filter(Niche %in% c(11, 23, 30)) |>
+  arrange(Niche, desc(pct_dominant_patient))
+```
+
+### 8d. High-risk niche x cluster combinations
+
+```{r high-risk-table}
+sig_niches_fdr01 <- sccomp_niche_stage_sub |> filter(c_FDR < 0.1) |> pull(Niche)
+
+n_show <- 15
+risk_threshold_pct <- 50
+risk_threshold_n    <- 5
+
+high_risk_tbl <- niche_patient_driven |>
+  mutate(Niche = as.character(Niche)) |>
+  filter(pct_dominant_patient >= risk_threshold_pct,
+         n_cells >= risk_threshold_n,
+         Niche %in% sig_niches_fdr01) |>
+  arrange(desc(pct_dominant_patient))
+
+high_risk_tbl |>
+  slice_head(n = n_show) |>
+  select(Niche, Cluster = cluster, Patient = dominant_patient,
+         `% Dominant` = pct_dominant_patient, `N Cells` = n_cells) |>
+  knitr::kable(digits = 1, caption = paste0("Top ", n_show, " highest-risk niche x cluster combinations, threshold = ", selected_threshold))
+```
+
+### 8e. Boxplots per significant niche {.tabset}
+
+```{r boxplots, results = "asis", fig.width = 5, fig.height = 5.5}
+sig_niches <- sccomp_niche_stage_sub |>
+  filter(c_FDR < 0.05) |>
+  pull(Niche) |>
+  as.character() |>
+  unique()
+sig_niches <- as.character(sort(as.numeric(sig_niches)))
+
+cat("Niches significant (FDR < 0.05), threshold =", selected_threshold, ":", length(sig_niches), "\n")
+
+niche_prop <- table(spe$sample_id, spe$Niche) |>
+  prop.table(margin = 1) |>
+  as.data.frame()
+colnames(niche_prop) <- c("Sample", "Niche", "Value")
+
+niche_prop$Patient <- spe$patient_id[match(niche_prop$Sample, spe$sample_id)]
+niche_prop$Stage <- spe$stage_group[match(niche_prop$Patient, spe$patient_id)]
+
+for (n in sig_niches) {
+  cat("\n\n#### Niche", n, "\n\n")
+  df_sub <- niche_prop[niche_prop$Niche == n, ]
+  df_sub$Value <- df_sub$Value * 100
+  print(
+    ggplot(df_sub, aes(x = Stage, y = Value)) +
+      geom_boxplot(outlier.shape = NA) +
+      geom_jitter(aes(color = Patient), width = 0.1, size = 1.5) +
+      theme_classic() +
+      ylab("% within sample") +
+      ggtitle(paste0("Niche ", n))
+  )
+  cat("\n\n")
+}
+```
